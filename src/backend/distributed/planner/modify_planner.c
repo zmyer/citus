@@ -255,6 +255,7 @@ ErrorIfQueryNotSupported(Query *queryTree)
 				continue;
 			}
 
+			/* TODO: does setting VARCHAR columns break this? */
 			if (!IsA(targetEntry->expr, Const))
 			{
 				hasNonConstTargetEntryExprs = true;
@@ -567,6 +568,7 @@ QueryRestrictList(Query *query)
 		Oid distributedTableId = ExtractFirstDistributedTableId(query);
 		uint32 rangeTableId = 1;
 		Var *partitionColumn = PartitionColumn(distributedTableId, rangeTableId);
+		/* TODO: is this ever a RelabelType? */
 		Const *partitionValue = ExtractPartitionValue(query, partitionColumn);
 
 		OpExpr *equalityExpr = MakeOpExpression(partitionColumn, BTEqualStrategyNumber);

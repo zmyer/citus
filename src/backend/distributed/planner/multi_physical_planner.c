@@ -3472,10 +3472,10 @@ CheckJoinBetweenColumns(OpExpr *joinClause)
 	Node *leftArgument = (Node *) linitial(argumentList);
 	Node *rightArgument = (Node *) lsecond(argumentList);
 
-	NodeTag leftArgumentType = nodeTag(leftArgument);
-	NodeTag rightArgumentType = nodeTag(rightArgument);
+	leftArgument = strip_implicit_coercions(leftArgument);
+	rightArgument = strip_implicit_coercions(rightArgument);
 
-	if (leftArgumentType != T_Var || rightArgumentType != T_Var)
+	if (!IsA(leftArgument, Var) || !IsA(rightArgument, Var))
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot perform local joins that involve expressions"),

@@ -1155,6 +1155,7 @@ TransformSubqueryNode(MultiTable *subqueryNode)
 	 * result type of the function expression, and set other fields of column to
 	 * default values.
 	 */
+	/* TODO: Group by VARCHAR? */
 	if (IsA(groupByExpression, Var))
 	{
 		partitionNode->partitionColumn = (Var *) groupByExpression;
@@ -1695,6 +1696,7 @@ WorkerAggregateWalker(Node *node, List **newExpressionList)
 
 		(*newExpressionList) = list_concat(*newExpressionList, workerAggregateList);
 	}
+	/* TODO: try ORDER BY VARCHAR and aggregates of VARCHAR */
 	else if (IsA(node, Var))
 	{
 		Var *originalColumn = (Var *) node;
@@ -2246,6 +2248,7 @@ AggregateDistinctColumn(Aggref *aggregateExpression)
 		return NULL;
 	}
 
+	/* TODO: Trigger this with VARCHAR */
 	aggregateColumn = (Var *) aggregateTargetEntry->expr;
 	return aggregateColumn;
 }
@@ -2335,6 +2338,7 @@ GroupedByColumn(List *groupClauseList, List *targetList, Var *column)
 		Expr *groupExpression = (Expr *) groupTargetEntry->expr;
 		if (IsA(groupExpression, Var))
 		{
+			/* TODO: Check whether we can push down VARCHAR groupings */
 			Var *groupColumn = (Var *) groupExpression;
 			if (groupColumn->varno == column->varno &&
 				groupColumn->varattno == column->varattno)
@@ -2883,6 +2887,7 @@ IsPartitionColumnRecursive(Expr *columnExpression, Query *query)
 	Index rangeTableEntryIndex = 0;
 	RangeTblEntry *rangeTableEntry = NULL;
 
+	/* TODO: Joins on varchar */
 	if (IsA(columnExpression, Var))
 	{
 		candidateColumn = (Var *) columnExpression;
@@ -3719,6 +3724,7 @@ PartitionColumnOpExpressionList(Query *query)
 		leftArgument = (Node *) linitial(argumentList);
 		rightArgument = (Node *) lsecond(argumentList);
 
+		/* TODO: Another place to strip implicit casts? */
 		if (IsA(leftArgument, Var) && IsA(rightArgument, Const))
 		{
 			candidatePartitionColumn = (Var *) leftArgument;
