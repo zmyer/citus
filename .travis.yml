@@ -7,9 +7,17 @@ env:
     - PGVERSION=9.5
     - PGVERSION=9.4
 before_install:
-  - git clone --depth 1 https://github.com/citusdata/tools.git
+  - git clone --branch v0.1.0 --depth 1 https://github.com/citusdata/tools.git
+  - wget https://github.com/bengardner/uncrustify/archive/uncrustify-0.62.tar.gz
+  - mkdir uncrustify
+  - tar xzf uncrustify-0.62.tar.gz -C uncrustify --strip-components=1
+  - cd uncrustify && ./configure && cd ..
+  - sudo make -C uncrustify install
+  - sudo make -C tools install
   - tools/travis/setup_apt.sh
   - tools/travis/nuke_pg.sh
 install:
   - tools/travis/install_pg.sh
-script: tools/travis/pg_travis_multi_test.sh
+script:
+  - citus_indent --quiet --check
+  - tools/travis/pg_travis_multi_test.sh
