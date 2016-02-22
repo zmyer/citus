@@ -24,30 +24,20 @@ test: multi_stage_data
 # ----------
 # Miscellaneous tests to check our query planning behavior
 # ----------
-test: multi_basic_queries multi_complex_expressions multi_verify_no_subquery
-test: multi_subquery
-test: multi_single_relation_subquery
-test: multi_agg_distinct multi_limit_clause multi_limit_clause_approximate
-test: multi_average_expression multi_working_columns
-test: multi_array_agg
-test: multi_agg_type_conversion multi_count_type_conversion
-test: multi_partition_pruning
-test: multi_join_pruning multi_hash_pruning
-test: multi_null_minmax_value_pruning
+test: multi_basic_queries multi_complex_expressions multi_verify_no_subquery multi_binary_master_copy_format multi_subquery
+test: multi_single_relation_subquery multi_prepare_sql multi_prepare_plsql
+test: multi_agg_distinct multi_limit_clause multi_limit_clause_approximate multi_average_expression
+test: multi_working_columns multi_array_agg multi_agg_type_conversion multi_count_type_conversion multi_partition_pruning
+test: multi_join_pruning multi_hash_pruning 
+test: multi_null_minmax_value_pruning multi_utility_statements multi_dropped_column_aliases multi_verify_no_join_with_alias
 test: multi_query_directory_cleanup
 test: multi_task_assignment_policy
-test: multi_utility_statements
-test: multi_dropped_column_aliases
-test: multi_verify_no_join_with_alias
-test: multi_binary_master_copy_format
-test: multi_prepare_sql multi_prepare_plsql
 
 # ----------
 # Parallel TPC-H tests to check our distributed execution behavior
 # ----------
-test: multi_tpch_query1 multi_tpch_query3 multi_tpch_query6 multi_tpch_query10
-test: multi_tpch_query12 multi_tpch_query14 multi_tpch_query19
-test: multi_tpch_query7 multi_tpch_query7_nested
+test: multi_tpch_query1 multi_tpch_query3 multi_tpch_query6 multi_tpch_query7 multi_tpch_query7_nested
+test: multi_tpch_query10 multi_tpch_query12 multi_tpch_query14 multi_tpch_query19 
 
 # ----------
 # Parallel tests to check our join order planning logic. Note that we stage data
