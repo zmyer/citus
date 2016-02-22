@@ -14,11 +14,8 @@ test: worker_copy
 # ----------
 # Range and hash re-partitioning related regression tests
 # ----------
-test: worker_range_partition worker_range_partition_complex
-test: worker_hash_partition worker_hash_partition_complex
-test: worker_merge_range_files worker_merge_hash_files
-test: worker_binary_data_partition worker_null_data_partition
-test: worker_check_invalid_arguments
+test: worker_range_partition worker_range_partition_complex worker_hash_partition worker_hash_partition_complex
+test: worker_merge_range_files worker_merge_hash_files worker_binary_data_partition worker_null_data_partition worker_check_invalid_arguments
 
 # ----------
 # All task tracker tests use the following tables

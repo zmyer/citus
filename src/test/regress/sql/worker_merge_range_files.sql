@@ -24,10 +24,10 @@ SELECT worker_merge_files_into_table(:JobId, :TaskId,
 -- partitioned. We then compute the difference of these two tables.
 
 SELECT COUNT(*) FROM :Task_Table_Name;
-SELECT COUNT(*) FROM lineitem;
+SELECT COUNT(*) FROM lineitem_worker;
 
 SELECT COUNT(*) AS diff_lhs FROM ( :Select_All FROM :Task_Table_Name EXCEPT ALL
-       		   	    	   :Select_All FROM lineitem ) diff;
+       		   	    	   :Select_All FROM lineitem_worker ) diff;
 
-SELECT COUNT(*) AS diff_rhs FROM ( :Select_All FROM lineitem EXCEPT ALL
+SELECT COUNT(*) AS diff_rhs FROM ( :Select_All FROM lineitem_worker EXCEPT ALL
        		   	    	   :Select_All FROM :Task_Table_Name ) diff;

@@ -8,7 +8,7 @@
 \set Partition_Column_Text '\'l_orderkey\''
 \set Partition_Column_Type 20
 
-\set Select_Query_Text '\'SELECT * FROM lineitem\''
+\set Select_Query_Text '\'SELECT * FROM lineitem_worker\''
 \set Select_All 'SELECT *'
 
 \set Table_Part_00 lineitem_range_part_00
@@ -41,30 +41,30 @@ SELECT COUNT(*) FROM :Table_Part_03;
 
 SELECT COUNT(*) AS diff_lhs_00 FROM (
        :Select_All FROM :Table_Part_00 EXCEPT ALL
-       :Select_All FROM lineitem WHERE :Partition_Column < 1 ) diff;
+       :Select_All FROM lineitem_worker WHERE :Partition_Column < 1 ) diff;
 SELECT COUNT(*) AS diff_lhs_01 FROM (
        :Select_All FROM :Table_Part_01 EXCEPT ALL
-       :Select_All FROM lineitem WHERE :Partition_Column >= 1 AND
+       :Select_All FROM lineitem_worker WHERE :Partition_Column >= 1 AND
        		   		       :Partition_Column < 3000 ) diff;
 SELECT COUNT(*) AS diff_lhs_02 FROM (
        :Select_All FROM :Table_Part_02 EXCEPT ALL
-       :Select_All FROM lineitem WHERE :Partition_Column >= 3000 AND
+       :Select_All FROM lineitem_worker WHERE :Partition_Column >= 3000 AND
        		   		       :Partition_Column < 12000 ) diff;
 SELECT COUNT(*) AS diff_lhs_03 FROM (
        :Select_All FROM :Table_Part_03 EXCEPT ALL
-       :Select_All FROM lineitem WHERE :Partition_Column >= 12000 ) diff;
+       :Select_All FROM lineitem_worker WHERE :Partition_Column >= 12000 ) diff;
 
 SELECT COUNT(*) AS diff_rhs_00 FROM (
-       :Select_All FROM lineitem WHERE :Partition_Column < 1 EXCEPT ALL
+       :Select_All FROM lineitem_worker WHERE :Partition_Column < 1 EXCEPT ALL
        :Select_All FROM :Table_Part_00 ) diff;
 SELECT COUNT(*) AS diff_rhs_01 FROM (
-       :Select_All FROM lineitem WHERE :Partition_Column >= 1 AND
+       :Select_All FROM lineitem_worker WHERE :Partition_Column >= 1 AND
        		   		       :Partition_Column < 3000 EXCEPT ALL
        :Select_All FROM :Table_Part_01 ) diff;
 SELECT COUNT(*) AS diff_rhs_02 FROM (
-       :Select_All FROM lineitem WHERE :Partition_Column >= 3000 AND
+       :Select_All FROM lineitem_worker WHERE :Partition_Column >= 3000 AND
        		   		       :Partition_Column < 12000 EXCEPT ALL
        :Select_All FROM :Table_Part_02 ) diff;
 SELECT COUNT(*) AS diff_rhs_03 FROM (
-       :Select_All FROM lineitem WHERE :Partition_Column >= 12000 EXCEPT ALL
+       :Select_All FROM lineitem_worker WHERE :Partition_Column >= 12000 EXCEPT ALL
        :Select_All FROM :Table_Part_03 ) diff;

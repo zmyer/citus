@@ -8,7 +8,7 @@
 \set Partition_Column_Text '\'s_nationkey\''
 \set Partition_Column_Type 23
 
-\set Select_Query_Text '\'SELECT * FROM supplier\''
+\set Select_Query_Text '\'SELECT * FROM supplier_worker\''
 \set Select_All 'SELECT *'
 
 \set Range_Table_Part_00 supplier_range_part_00
@@ -38,26 +38,26 @@ SELECT COUNT(*) FROM :Range_Table_Part_02;
 
 SELECT COUNT(*) AS diff_lhs_00 FROM (
        :Select_All FROM :Range_Table_Part_00 EXCEPT ALL
-       (:Select_All FROM supplier WHERE :Partition_Column < 0 OR
+       (:Select_All FROM supplier_worker WHERE :Partition_Column < 0 OR
                                        	:Partition_Column IS NULL) ) diff;
 SELECT COUNT(*) AS diff_lhs_01 FROM (
        :Select_All FROM :Range_Table_Part_01 EXCEPT ALL
-       :Select_All FROM supplier WHERE :Partition_Column >= 0 AND
+       :Select_All FROM supplier_worker WHERE :Partition_Column >= 0 AND
        		   		       :Partition_Column < 10 ) diff;
 SELECT COUNT(*) AS diff_rhs_02 FROM (
-       :Select_All FROM supplier WHERE :Partition_Column >= 10 EXCEPT ALL
+       :Select_All FROM supplier_worker WHERE :Partition_Column >= 10 EXCEPT ALL
        :Select_All FROM :Range_Table_Part_02 ) diff;
 
 SELECT COUNT(*) AS diff_rhs_00 FROM (
-       (:Select_All FROM supplier WHERE :Partition_Column < 0 OR
+       (:Select_All FROM supplier_worker WHERE :Partition_Column < 0 OR
                                         :Partition_Column IS NULL) EXCEPT ALL
        :Select_All FROM :Range_Table_Part_00 ) diff;
 SELECT COUNT(*) AS diff_rhs_01 FROM (
-       :Select_All FROM supplier WHERE :Partition_Column >= 0 AND
+       :Select_All FROM supplier_worker WHERE :Partition_Column >= 0 AND
        		   		       :Partition_Column < 10 EXCEPT ALL
        :Select_All FROM :Range_Table_Part_01 ) diff;
 SELECT COUNT(*) AS diff_rhs_02 FROM (
-       :Select_All FROM supplier WHERE :Partition_Column >= 10 EXCEPT ALL
+       :Select_All FROM supplier_worker WHERE :Partition_Column >= 10 EXCEPT ALL
        :Select_All FROM :Range_Table_Part_02 ) diff;
 
 
@@ -91,22 +91,22 @@ SELECT COUNT(*) FROM :Hash_Table_Part_02;
 
 SELECT COUNT(*) AS diff_lhs_00 FROM (
        :Select_All FROM :Hash_Table_Part_00 EXCEPT ALL
-       (:Select_All FROM supplier WHERE (:Hash_Mod_Function = 0) OR
+       (:Select_All FROM supplier_worker WHERE (:Hash_Mod_Function = 0) OR
                                        	 :Partition_Column IS NULL) ) diff;
 SELECT COUNT(*) AS diff_lhs_01 FROM (
        :Select_All FROM :Hash_Table_Part_01 EXCEPT ALL
-       :Select_All FROM supplier WHERE (:Hash_Mod_Function = 1) ) diff;
+       :Select_All FROM supplier_worker WHERE (:Hash_Mod_Function = 1) ) diff;
 SELECT COUNT(*) AS diff_lhs_02 FROM (
        :Select_All FROM :Hash_Table_Part_02 EXCEPT ALL
-       :Select_All FROM supplier WHERE (:Hash_Mod_Function = 2) ) diff;
+       :Select_All FROM supplier_worker WHERE (:Hash_Mod_Function = 2) ) diff;
 
 SELECT COUNT(*) AS diff_rhs_00 FROM (
-       (:Select_All FROM supplier WHERE (:Hash_Mod_Function = 0) OR
+       (:Select_All FROM supplier_worker WHERE (:Hash_Mod_Function = 0) OR
                                        	 :Partition_Column IS NULL) EXCEPT ALL
        :Select_All FROM :Hash_Table_Part_00 ) diff;
 SELECT COUNT(*) AS diff_rhs_01 FROM (
-       :Select_All FROM supplier WHERE (:Hash_Mod_Function = 1) EXCEPT ALL
+       :Select_All FROM supplier_worker WHERE (:Hash_Mod_Function = 1) EXCEPT ALL
        :Select_All FROM :Hash_Table_Part_01 ) diff;
 SELECT COUNT(*) AS diff_rhs_02 FROM (
-       :Select_All FROM supplier WHERE (:Hash_Mod_Function = 2) EXCEPT ALL
+       :Select_All FROM supplier_worker WHERE (:Hash_Mod_Function = 2) EXCEPT ALL
        :Select_All FROM :Hash_Table_Part_02 ) diff;

@@ -21,7 +21,7 @@
 
 SELECT worker_range_partition_table(:JobId, :TaskId,
 				    'SELECT l_partkey, l_discount, l_shipdate, l_comment'
-				    ' FROM lineitem '
+				    ' FROM lineitem_worker '
 				    ' WHERE l_shipdate >= date ''1992-01-15'''
 				    ' AND l_discount between 0.02 AND 0.08',
 				    :Partition_Column_Text, :Partition_Column_Type,
@@ -42,39 +42,39 @@ SELECT COUNT(*) FROM :Table_Part_03;
 
 SELECT COUNT(*) AS diff_lhs_00 FROM (
        :Select_Columns FROM :Table_Part_00 EXCEPT ALL
-       :Select_Columns FROM lineitem WHERE :Select_Filters AND
+       :Select_Columns FROM lineitem_worker WHERE :Select_Filters AND
        		       	    	     	   :Partition_Column < 101 ) diff;
 SELECT COUNT(*) AS diff_lhs_01 FROM (
        :Select_Columns FROM :Table_Part_01 EXCEPT ALL
-       :Select_Columns FROM lineitem WHERE :Select_Filters AND
+       :Select_Columns FROM lineitem_worker WHERE :Select_Filters AND
        			    	     	   :Partition_Column >= 101 AND
 					   :Partition_Column < 12000 ) diff;
 SELECT COUNT(*) AS diff_lhs_02 FROM (
        :Select_Columns FROM :Table_Part_02 EXCEPT ALL
-       :Select_Columns FROM lineitem WHERE :Select_Filters AND
+       :Select_Columns FROM lineitem_worker WHERE :Select_Filters AND
        			    	 	   :Partition_Column >= 12000 AND
 					   :Partition_Column < 18000 ) diff;
 SELECT COUNT(*) AS diff_lhs_03 FROM (
        :Select_Columns FROM :Table_Part_03 EXCEPT ALL
-       :Select_Columns FROM lineitem WHERE :Select_Filters AND
+       :Select_Columns FROM lineitem_worker WHERE :Select_Filters AND
        			    	 	   :Partition_Column >= 18000 ) diff;
 
 SELECT COUNT(*) AS diff_rhs_00 FROM (
-       :Select_Columns FROM lineitem WHERE :Select_Filters AND
+       :Select_Columns FROM lineitem_worker WHERE :Select_Filters AND
        			    	 	   :Partition_Column < 101 EXCEPT ALL
        :Select_Columns FROM :Table_Part_00 ) diff;
 SELECT COUNT(*) AS diff_rhs_01 FROM (
-       :Select_Columns FROM lineitem WHERE :Select_Filters AND
+       :Select_Columns FROM lineitem_worker WHERE :Select_Filters AND
        			    	 	   :Partition_Column >= 101 AND
 					   :Partition_Column < 12000 EXCEPT ALL
        :Select_Columns FROM :Table_Part_01 ) diff;
 SELECT COUNT(*) AS diff_rhs_02 FROM (
-       :Select_Columns FROM lineitem WHERE :Select_Filters AND
+       :Select_Columns FROM lineitem_worker WHERE :Select_Filters AND
        			    	 	   :Partition_Column >= 12000 AND
 					   :Partition_Column < 18000 EXCEPT ALL
        :Select_Columns FROM :Table_Part_02 ) diff;
 SELECT COUNT(*) AS diff_rhs_03 FROM (
-       :Select_Columns FROM lineitem WHERE :Select_Filters AND
+       :Select_Columns FROM lineitem_worker WHERE :Select_Filters AND
        			    	 	   :Partition_Column >= 18000 EXCEPT ALL
        :Select_Columns FROM :Table_Part_03 ) diff;
 

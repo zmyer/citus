@@ -7,7 +7,7 @@
 \set Partition_Column_Text '\'l_orderkey\''
 \set Partition_Column_Type 20
 \set Partition_Count 4
-\set Select_Query_Text '\'SELECT * FROM lineitem\''
+\set Select_Query_Text '\'SELECT * FROM lineitem_worker\''
 \set Select_All 'SELECT *'
 -- Hash functions internally return unsigned 32-bit integers. However, when
 -- called externally, the return value becomes a signed 32-bit integer. We hack
@@ -49,7 +49,7 @@ SELECT COUNT(*) FROM :Table_Part_03;
 -- Then, we compute the difference of the base table against partitioned tables.
 SELECT COUNT(*) AS diff_lhs_00 FROM (
        :Select_All FROM :Table_Part_00 EXCEPT ALL
-       :Select_All FROM lineitem WHERE (:Hash_Mod_Function = 0) ) diff;
+       :Select_All FROM lineitem_worker WHERE (:Hash_Mod_Function = 0) ) diff;
  diff_lhs_00 
 -------------
            0
@@ -57,7 +57,7 @@ SELECT COUNT(*) AS diff_lhs_00 FROM (
 
 SELECT COUNT(*) AS diff_lhs_01 FROM (
        :Select_All FROM :Table_Part_01 EXCEPT ALL
-       :Select_All FROM lineitem WHERE (:Hash_Mod_Function = 1) ) diff;
+       :Select_All FROM lineitem_worker WHERE (:Hash_Mod_Function = 1) ) diff;
  diff_lhs_01 
 -------------
            0
@@ -65,7 +65,7 @@ SELECT COUNT(*) AS diff_lhs_01 FROM (
 
 SELECT COUNT(*) AS diff_lhs_02 FROM (
        :Select_All FROM :Table_Part_02 EXCEPT ALL
-       :Select_All FROM lineitem WHERE (:Hash_Mod_Function = 2) ) diff;
+       :Select_All FROM lineitem_worker WHERE (:Hash_Mod_Function = 2) ) diff;
  diff_lhs_02 
 -------------
            0
@@ -73,14 +73,14 @@ SELECT COUNT(*) AS diff_lhs_02 FROM (
 
 SELECT COUNT(*) AS diff_lhs_03 FROM (
        :Select_All FROM :Table_Part_03 EXCEPT ALL
-       :Select_All FROM lineitem WHERE (:Hash_Mod_Function = 3) ) diff;
+       :Select_All FROM lineitem_worker WHERE (:Hash_Mod_Function = 3) ) diff;
  diff_lhs_03 
 -------------
            0
 (1 row)
 
 SELECT COUNT(*) AS diff_rhs_00 FROM (
-       :Select_All FROM lineitem WHERE (:Hash_Mod_Function = 0) EXCEPT ALL
+       :Select_All FROM lineitem_worker WHERE (:Hash_Mod_Function = 0) EXCEPT ALL
        :Select_All FROM :Table_Part_00 ) diff;
  diff_rhs_00 
 -------------
@@ -88,7 +88,7 @@ SELECT COUNT(*) AS diff_rhs_00 FROM (
 (1 row)
 
 SELECT COUNT(*) AS diff_rhs_01 FROM (
-       :Select_All FROM lineitem WHERE (:Hash_Mod_Function = 1) EXCEPT ALL
+       :Select_All FROM lineitem_worker WHERE (:Hash_Mod_Function = 1) EXCEPT ALL
        :Select_All FROM :Table_Part_01 ) diff;
  diff_rhs_01 
 -------------
@@ -96,7 +96,7 @@ SELECT COUNT(*) AS diff_rhs_01 FROM (
 (1 row)
 
 SELECT COUNT(*) AS diff_rhs_02 FROM (
-       :Select_All FROM lineitem WHERE (:Hash_Mod_Function = 2) EXCEPT ALL
+       :Select_All FROM lineitem_worker WHERE (:Hash_Mod_Function = 2) EXCEPT ALL
        :Select_All FROM :Table_Part_02 ) diff;
  diff_rhs_02 
 -------------
@@ -104,7 +104,7 @@ SELECT COUNT(*) AS diff_rhs_02 FROM (
 (1 row)
 
 SELECT COUNT(*) AS diff_rhs_03 FROM (
-       :Select_All FROM lineitem WHERE (:Hash_Mod_Function = 3) EXCEPT ALL
+       :Select_All FROM lineitem_worker WHERE (:Hash_Mod_Function = 3) EXCEPT ALL
        :Select_All FROM :Table_Part_03 ) diff;
  diff_rhs_03 
 -------------

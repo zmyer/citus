@@ -10,7 +10,7 @@
 -- the second task should continue to keep running.
 
 SELECT task_tracker_assign_task(:JobId, :CompletedTaskId,
-				'COPY (SELECT * FROM lineitem) TO '
+				'COPY (SELECT * FROM lineitem_worker) TO '
 				'''base/pgsql_job_cache/job_401010/task_801107''');
 
 SELECT task_tracker_assign_task(:JobId, :RunningTaskId,

@@ -6,7 +6,7 @@
 -- node execution logic. For now,the tests include range and hash partitioning
 -- of existing tables.
 
-CREATE TABLE lineitem (
+CREATE TABLE lineitem_worker (
 	l_orderkey bigint not null,
 	l_partkey integer not null,
 	l_suppkey integer not null,
@@ -33,10 +33,10 @@ CREATE TABLE lineitem_complex (
 
 -- Range partitioned lineitem data are inserted into these four tables
 
-CREATE TABLE lineitem_range_part_00 ( LIKE lineitem );
-CREATE TABLE lineitem_range_part_01 ( LIKE lineitem );
-CREATE TABLE lineitem_range_part_02 ( LIKE lineitem );
-CREATE TABLE lineitem_range_part_03 ( LIKE lineitem );
+CREATE TABLE lineitem_range_part_00 ( LIKE lineitem_worker );
+CREATE TABLE lineitem_range_part_01 ( LIKE lineitem_worker );
+CREATE TABLE lineitem_range_part_02 ( LIKE lineitem_worker );
+CREATE TABLE lineitem_range_part_03 ( LIKE lineitem_worker );
 
 -- Complex range partitioned lineitem data are inserted into these four tables
 
@@ -47,10 +47,10 @@ CREATE TABLE lineitem_range_complex_part_03 ( LIKE lineitem_complex );
 
 -- Hash partitioned lineitem data are inserted into these four tables
 
-CREATE TABLE lineitem_hash_part_00 ( LIKE lineitem );
-CREATE TABLE lineitem_hash_part_01 ( LIKE lineitem );
-CREATE TABLE lineitem_hash_part_02 ( LIKE lineitem );
-CREATE TABLE lineitem_hash_part_03 ( LIKE lineitem );
+CREATE TABLE lineitem_hash_part_00 ( LIKE lineitem_worker );
+CREATE TABLE lineitem_hash_part_01 ( LIKE lineitem_worker );
+CREATE TABLE lineitem_hash_part_02 ( LIKE lineitem_worker );
+CREATE TABLE lineitem_hash_part_03 ( LIKE lineitem_worker );
 
 -- Complex hash partitioned lineitem data are inserted into these four tables
 
@@ -63,7 +63,7 @@ CREATE TABLE lineitem_hash_complex_part_03 ( LIKE lineitem_complex );
 -- Now create a supplier table to test repartitioning the data on the nation key
 -- column, where the column's values can be null or zero.
 
-CREATE TABLE SUPPLIER
+CREATE TABLE supplier_worker
 (
 	s_suppkey integer not null,
 	s_name char(25) not null,
@@ -76,12 +76,12 @@ CREATE TABLE SUPPLIER
 
 -- Range partitioned supplier data are inserted into three tables
 
-CREATE TABLE supplier_range_part_00 ( LIKE supplier );
-CREATE TABLE supplier_range_part_01 ( LIKE supplier );
-CREATE TABLE supplier_range_part_02 ( LIKE supplier );
+CREATE TABLE supplier_range_part_00 ( LIKE supplier_worker );
+CREATE TABLE supplier_range_part_01 ( LIKE supplier_worker );
+CREATE TABLE supplier_range_part_02 ( LIKE supplier_worker );
 
 -- Hash partitioned supplier data are inserted into three tables
 
-CREATE TABLE supplier_hash_part_00 ( LIKE supplier );
-CREATE TABLE supplier_hash_part_01 ( LIKE supplier );
-CREATE TABLE supplier_hash_part_02 ( LIKE supplier );
+CREATE TABLE supplier_hash_part_00 ( LIKE supplier_worker );
+CREATE TABLE supplier_hash_part_01 ( LIKE supplier_worker );
+CREATE TABLE supplier_hash_part_02 ( LIKE supplier_worker );

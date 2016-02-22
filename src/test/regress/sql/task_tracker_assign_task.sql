@@ -8,7 +8,7 @@
 
 \set SimpleTaskTable lineitem_simple_task
 \set BadQueryString '\'SELECT COUNT(*) FROM bad_table_name\''
-\set GoodQueryString '\'SELECT COUNT(*) FROM lineitem\''
+\set GoodQueryString '\'SELECT COUNT(*) FROM lineitem_worker\''
 \set SelectAll 'SELECT *'
 
 -- We assign two tasks to the task tracker. The first task simply executes. The
@@ -16,7 +16,7 @@
 -- task tracker stops retrying the recoverable task.
 
 SELECT task_tracker_assign_task(:JobId, :SimpleTaskId,
-				'COPY (SELECT * FROM lineitem) TO '
+				'COPY (SELECT * FROM lineitem_worker) TO '
 				'''base/pgsql_job_cache/job_401010/task_101101''');
 
 SELECT task_tracker_assign_task(:JobId, :RecoverableTaskId, :BadQueryString);
@@ -35,8 +35,8 @@ COPY :SimpleTaskTable FROM 'base/pgsql_job_cache/job_401010/task_101101';
 SELECT COUNT(*) FROM :SimpleTaskTable;
 
 SELECT COUNT(*) AS diff_lhs FROM ( :SelectAll FROM :SimpleTaskTable EXCEPT ALL
-       		   	    	   :SelectAll FROM lineitem ) diff;
-SELECT COUNT(*) As diff_rhs FROM ( :SelectAll FROM lineitem EXCEPT ALL
+       		   	    	   :SelectAll FROM lineitem_worker ) diff;
+SELECT COUNT(*) As diff_rhs FROM ( :SelectAll FROM lineitem_worker EXCEPT ALL
        		   	    	   :SelectAll FROM :SimpleTaskTable ) diff;
 
 -- We now reassign the recoverable task with a good query string. This updates

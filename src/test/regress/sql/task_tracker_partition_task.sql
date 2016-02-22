@@ -20,7 +20,7 @@
 
 SELECT task_tracker_assign_task(:JobId, :PartitionTaskId,
        				'SELECT worker_range_partition_table('
-				'401010, 801106, ''SELECT * FROM lineitem'', '
+				'401010, 801106, ''SELECT * FROM lineitem_worker'', '
 				'''l_orderkey'', 20, ARRAY[1000, 3000]::_int8)');
 
 SELECT pg_sleep(4.0);
@@ -39,22 +39,22 @@ SELECT COUNT(*) FROM :TablePart02;
 
 SELECT COUNT(*) AS diff_lhs_00 FROM (
        :SelectAll FROM :TablePart00 EXCEPT ALL
-       :SelectAll FROM lineitem WHERE :PartitionColumn < 1000 ) diff;
+       :SelectAll FROM lineitem_worker WHERE :PartitionColumn < 1000 ) diff;
 SELECT COUNT(*) AS diff_lhs_01 FROM (
        :SelectAll FROM :TablePart01 EXCEPT ALL
-       :SelectAll FROM lineitem WHERE :PartitionColumn >= 1000 AND
+       :SelectAll FROM lineitem_worker WHERE :PartitionColumn >= 1000 AND
        		   		      :PartitionColumn < 3000 ) diff;
 SELECT COUNT(*) AS diff_lhs_02 FROM (
        :SelectAll FROM :TablePart02 EXCEPT ALL
-       :SelectAll FROM lineitem WHERE :PartitionColumn >= 3000 ) diff;
+       :SelectAll FROM lineitem_worker WHERE :PartitionColumn >= 3000 ) diff;
 
 SELECT COUNT(*) AS diff_rhs_00 FROM (
-       :SelectAll FROM lineitem WHERE :PartitionColumn < 1000 EXCEPT ALL
+       :SelectAll FROM lineitem_worker WHERE :PartitionColumn < 1000 EXCEPT ALL
        :SelectAll FROM :TablePart00 ) diff;
 SELECT COUNT(*) AS diff_rhs_01 FROM (
-       :SelectAll FROM lineitem WHERE :PartitionColumn >= 1000 AND
+       :SelectAll FROM lineitem_worker WHERE :PartitionColumn >= 1000 AND
        		   		      :PartitionColumn < 3000 EXCEPT ALL
        :SelectAll FROM :TablePart01 ) diff;
 SELECT COUNT(*) AS diff_rhs_02 FROM (
-       :SelectAll FROM lineitem WHERE :PartitionColumn >= 3000 EXCEPT ALL
+       :SelectAll FROM lineitem_worker WHERE :PartitionColumn >= 3000 EXCEPT ALL
        :SelectAll FROM :TablePart02 ) diff;
