@@ -20,7 +20,8 @@
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
-#include "distributed/modify_planner.h"
+#include "distributed/multi_router_planner.h"
+#include "distributed/multi_server_executor.h"
 
 #include "executor/executor.h"
 
@@ -80,25 +81,41 @@ CreatePhysicalPlan(Query *parse)
 		commandType == CMD_DELETE)
 	{
 		/* modifications go directly from a query to a physical plan */
-		physicalPlan = MultiModifyPlanCreate(parse);
+		physicalPlan = MultiRouterPlanCreate(parse);
 	}
 	else
 	{
-		/* Create and optimize logical plan */
-		MultiTreeRoot *logicalPlan = MultiLogicalPlanCreate(parseCopy);
-		MultiLogicalPlanOptimize(logicalPlan);
+		bool routerPlannable = false;
 
-		/*
-		 * This check is here to make it likely that all node types used in
-		 * Citus are dumpable. Explain can dump logical and physical plans
-		 * using the extended outfuncs infrastructure, but it's infeasible to
-		 * test most plans. MultiQueryContainerNode always serializes the
-		 * physical plan, so there's no need to check that separately.
-		 */
-		CheckNodeIsDumpable((Node *) logicalPlan);
+		if (TaskExecutorType == MULTI_EXECUTOR_REAL_TIME ||
+			TaskExecutorType == MULTI_EXECUTOR_ROUTER)
+		{
+			routerPlannable = MultiRouterPlannableQuery(parseCopy);
+		}
 
-		/* Create the physical plan */
-		physicalPlan = MultiPhysicalPlanCreate(logicalPlan);
+		if (routerPlannable)
+		{
+			ereport(DEBUG2, (errmsg("Creating router plan")));
+			physicalPlan = MultiRouterPlanCreate(parseCopy);
+		}
+		else
+		{
+			/* Create and optimize logical plan */
+			MultiTreeRoot *logicalPlan = MultiLogicalPlanCreate(parseCopy);
+			MultiLogicalPlanOptimize(logicalPlan);
+
+			/*
+			 * This check is here to make it likely that all node types used in
+			 * Citus are dumpable. Explain can dump logical and physical plans
+			 * using the extended outfuncs infrastructure, but it's infeasible to
+			 * test most plans. MultiQueryContainerNode always serializes the
+			 * physical plan, so there's no need to check that separately.
+			 */
+			CheckNodeIsDumpable((Node *) logicalPlan);
+
+			/* Create the physical plan */
+			physicalPlan = MultiPhysicalPlanCreate(logicalPlan);
+		}
 	}
 
 	return physicalPlan;
