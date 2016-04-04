@@ -53,6 +53,10 @@ int LimitClauseRowFetchCount = -1; /* number of rows to fetch from each task */
 double CountDistinctErrorRate = 0.0; /* precision of count(distinct) approximate */
 
 
+/* XXX Bad coding practice */
+#define BASE_SORT_GROUP_REF 100
+static bool IsSubquery = false;
+
 /* Local functions forward declarations */
 static MultiSelect * AndSelectNode(MultiSelect *selectNode);
 static MultiSelect * OrSelectNode(MultiSelect *selectNode);
@@ -1125,6 +1129,55 @@ ApplyExtendedOpNodes(MultiExtendedOp *originalNode, MultiExtendedOp *masterNode,
 }
 
 
+static bool
+CountDistinctAggregateWalker(Node *node, List **distinctGroupByList)
+{
+	bool walkerResult = false;
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, Aggref))
+	{
+		Aggref *aggregate = (Aggref *) node;
+		AggregateType aggregateType = GetAggregateType(aggregate->aggfnoid);
+
+		if (aggregateType == AGGREGATE_COUNT && aggregate->aggdistinct)
+		{
+			List *aggTargetEntryList = aggregate->args;
+			TargetEntry *distinctTargetEntry = linitial(aggTargetEntryList);
+
+			List *aggDistinctList = aggregate->aggdistinct;
+			SortGroupClause *distinctGroupBy = linitial(aggDistinctList);
+
+			int32 distinctColumnCount = list_length(*distinctGroupByList);
+			Index distinctColumnSortGroupRefIndex =
+					BASE_SORT_GROUP_REF + distinctColumnCount;
+
+			distinctTargetEntry->ressortgroupref = distinctColumnSortGroupRefIndex;
+			distinctGroupBy->tleSortGroupRef = distinctColumnSortGroupRefIndex;
+
+			(*distinctGroupByList) = lappend(*distinctGroupByList, distinctGroupBy);
+			walkerResult = expression_tree_walker(node, CountDistinctAggregateWalker,
+												  (void *) distinctGroupByList);
+		}
+		else
+		{
+			walkerResult = expression_tree_walker(node, CountDistinctAggregateWalker,
+												  (void *) distinctGroupByList);
+		}
+	}
+	else
+	{
+		walkerResult = expression_tree_walker(node, CountDistinctAggregateWalker,
+											  (void *) distinctGroupByList);
+	}
+
+	return walkerResult;
+}
+
+
 /*
  * TransformSubqueryNode splits the extended operator node under subquery
  * multi table node into its equivalent master and worker operator nodes, and
@@ -1141,14 +1194,25 @@ TransformSubqueryNode(MultiTable *subqueryNode)
 	MultiNode *collectNode = ChildNode((MultiUnaryNode *) extendedOpNode);
 	MultiNode *collectChildNode = ChildNode((MultiUnaryNode *) collectNode);
 	MultiExtendedOp *masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode);
-	MultiExtendedOp *workerExtendedOpNode = WorkerExtendedOpNode(extendedOpNode);
 	MultiPartition *partitionNode = CitusMakeNode(MultiPartition);
 
-	List *groupClauseList = extendedOpNode->groupClauseList;
+	MultiExtendedOp *workerExtendedOpNode = NULL;
+	List *groupTargetEntryList = NIL;
+	TargetEntry *groupByTargetEntry = NULL;
+	Expr *groupByExpression = NULL;
+
 	List *targetEntryList = extendedOpNode->targetList;
-	List *groupTargetEntryList = GroupTargetEntryList(groupClauseList, targetEntryList);
-	TargetEntry *groupByTargetEntry = (TargetEntry *) linitial(groupTargetEntryList);
-	Expr *groupByExpression = groupByTargetEntry->expr;
+	List *groupClauseList = extendedOpNode->groupClauseList;
+	List *distinctGroupByList = NIL;
+
+	CountDistinctAggregateWalker((Node *) targetEntryList, &distinctGroupByList);
+	groupClauseList = list_concat(groupClauseList, distinctGroupByList);
+
+	workerExtendedOpNode = WorkerExtendedOpNode(extendedOpNode);
+
+	groupTargetEntryList = GroupTargetEntryList(groupClauseList, workerExtendedOpNode->targetList);
+	groupByTargetEntry = (TargetEntry *) linitial(groupTargetEntryList);
+	groupByExpression = groupByTargetEntry->expr;
 
 	/*
 	 * If group by is on a function expression, then we create a new column from
@@ -1248,10 +1312,10 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
 	}
 
 	masterExtendedOpNode = CitusMakeNode(MultiExtendedOp);
-	masterExtendedOpNode->targetList = newTargetEntryList;
-	masterExtendedOpNode->groupClauseList = originalOpNode->groupClauseList;
-	masterExtendedOpNode->sortClauseList = originalOpNode->sortClauseList;
-	masterExtendedOpNode->limitCount = originalOpNode->limitCount;
+	masterExtendedOpNode->targetList = copyObject(newTargetEntryList);
+	masterExtendedOpNode->groupClauseList = copyObject(originalOpNode->groupClauseList);
+	masterExtendedOpNode->sortClauseList = copyObject(originalOpNode->sortClauseList);
+	masterExtendedOpNode->limitCount = copyObject(originalOpNode->limitCount);
 
 	return masterExtendedOpNode;
 }
@@ -1325,6 +1389,20 @@ MasterAggregateExpression(Aggref *originalAggregate, AttrNumber *columnId)
 	const AttrNumber argumentId = 1; /* our aggregates have single arguments */
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
+		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION && IsSubquery)
+	{
+		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
+		List *aggTargetEntryList = aggregate->args;
+		TargetEntry *distinctTargetEntry = linitial(aggTargetEntryList);
+		Var *distinctColumn = (Var *) distinctTargetEntry->expr;
+		distinctColumn->varattno = (*columnId);
+		distinctColumn->varoattno =  (*columnId);
+
+		newMasterExpression = (Expr *) aggregate;
+
+		(*columnId)++;
+	}
+	else if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate != DISABLE_DISTINCT_APPROXIMATION)
 	{
 		/*
@@ -1654,6 +1732,15 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 				newTargetEntry->resname = columnNameString->data;
 			}
 
+			if (IsA(newExpression, TargetEntry))
+			{
+				TargetEntry *distinctTargetEntry = (TargetEntry *) newExpression;
+				Var *distinctColumn = (Var *) copyObject(distinctTargetEntry->expr);
+
+				newTargetEntry->expr = (Expr *) distinctColumn;
+				newTargetEntry->ressortgroupref = distinctTargetEntry->ressortgroupref;
+			}
+
 			/* force resjunk to false as we may need this on the master */
 			newTargetEntry->resjunk = false;
 			newTargetEntry->resno = targetProjectionNumber;
@@ -1725,6 +1812,15 @@ WorkerAggregateExpressionList(Aggref *originalAggregate)
 	List *workerAggregateList = NIL;
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
+		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION && IsSubquery)
+	{
+		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
+		List *aggTargetEntryList = aggregate->args;
+		TargetEntry *distinctTargetEntry = (TargetEntry *) linitial(aggTargetEntryList);
+
+		workerAggregateList = lappend(workerAggregateList, distinctTargetEntry);
+	}
+	else if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate != DISABLE_DISTINCT_APPROXIMATION)
 	{
 		/*
@@ -2146,9 +2242,8 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 	bool distinctSupported = true;
 	List *repartitionNodeList = NIL;
 	Var *distinctColumn = NULL;
-	List *multiTableNodeList = NIL;
-	ListCell *multiTableNodeCell = NULL;
-	AggregateType aggregateType = AGGREGATE_INVALID_FIRST;
+
+	AggregateType aggregateType = GetAggregateType(aggregateExpression->aggfnoid);
 
 	/* check if logical plan includes a subquery */
 	List *subqueryMultiTableList = SubqueryMultiTableList(logicalPlanNode);
@@ -2159,20 +2254,7 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 						errdetail("distinct in the outermost query is unsupported")));
 	}
 
-	multiTableNodeList = FindNodesOfType(logicalPlanNode, T_MultiTable);
-	foreach(multiTableNodeCell, multiTableNodeList)
-	{
-		MultiTable *multiTable = (MultiTable *) lfirst(multiTableNodeCell);
-		if (multiTable->relationId == SUBQUERY_RELATION_ID)
-		{
-			ereport(ERROR, (errmsg("cannot compute count (distinct)"),
-							errdetail("Subqueries with aggregate (distinct) are "
-									  "not supported yet")));
-		}
-	}
-
 	/* if we have a count(distinct), and distinct approximation is enabled */
-	aggregateType = GetAggregateType(aggregateExpression->aggfnoid);
 	if (aggregateType == AGGREGATE_COUNT &&
 		CountDistinctErrorRate != DISABLE_DISTINCT_APPROXIMATION)
 	{
@@ -2289,6 +2371,7 @@ TablePartitioningSupportsDistinct(List *tableNodeList, MultiExtendedOp *opNode,
 {
 	bool distinctSupported = true;
 	ListCell *tableNodeCell = NULL;
+	IsSubquery = false;
 
 	foreach(tableNodeCell, tableNodeList)
 	{
@@ -2296,6 +2379,12 @@ TablePartitioningSupportsDistinct(List *tableNodeList, MultiExtendedOp *opNode,
 		Oid relationId = tableNode->relationId;
 		bool tableDistinctSupported = false;
 		char partitionMethod = 0;
+
+		if (relationId == SUBQUERY_RELATION_ID)
+		{
+			IsSubquery = true;
+			return true;
+		}
 
 		/* if table has one shard, task results don't overlap */
 		List *shardList = LoadShardList(relationId);
