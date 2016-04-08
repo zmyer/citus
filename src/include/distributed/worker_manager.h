@@ -70,6 +70,7 @@ extern List * ResponsiveWorkerNodeList(void);
 /* Function declarations for loading into shared hash tables */
 extern void WorkerNodeRegister(void);
 extern void LoadWorkerNodeList(const char *workerFilename);
+extern List * ParseWorkerNodeFile(const char *workerNodeFilename);
 
 /* Function declarations for worker node utilities */
 extern int CompareWorkerNodes(const void *leftElement, const void *rightElement);

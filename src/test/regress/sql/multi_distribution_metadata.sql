@@ -32,10 +32,10 @@ CREATE FUNCTION is_distributed_table(regclass)
 	AS 'citus'
 	LANGUAGE C STRICT;
 
-CREATE FUNCTION column_name_to_column_id(regclass, cstring)
-	RETURNS smallint
-	AS 'citus'
-	LANGUAGE C STRICT;
+--CREATE FUNCTION column_name_to_column_id(regclass, cstring)
+--	RETURNS smallint
+--	AS 'citus'
+--	LANGUAGE C STRICT;
 
 CREATE FUNCTION create_monolithic_shard_row(regclass)
 	RETURNS bigint

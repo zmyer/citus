@@ -52,9 +52,8 @@ static List * ShardsMatchingDeleteCriteria(Oid relationId, List *shardList,
 										   Node *deleteCriteria);
 static int DropShards(Oid relationId, char *schemaName, char *relationName,
 					  List *deletableShardIntervalList);
-static bool ExecuteRemoteCommand(const char *nodeName, uint32 nodePort,
-								 StringInfo queryString);
-
+static bool
+ExecuteRemoteCommand(const char *nodeName, uint32 nodePort, StringInfo queryString);
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_apply_delete_command);

@@ -25,11 +25,18 @@ CREATE TYPE citus.distribution_type AS ENUM (
 );
 
 
+-- a type to represent a host on pg_worker_list.conf
+CREATE TYPE citus.citus_host AS (
+    node_name text,
+    node_port text
+);
+
+
 /*****************************************************************************
  * Citus tables & corresponding indexes
  *****************************************************************************/
 CREATE TABLE citus.pg_dist_partition(
-    logicalrelid Oid NOT NULL,
+    logicalrelid regclass NOT NULL,
     partmethod "char" NOT NULL,
     partkey text NOT NULL
 );
@@ -90,6 +97,344 @@ CREATE SEQUENCE citus.pg_dist_jobid_seq
     MAXVALUE 4294967296;
 ALTER SEQUENCE  citus.pg_dist_jobid_seq SET SCHEMA pg_catalog;
 
+CREATE SEQUENCE citus.transaction_id_sequence MINVALUE 0 MAXVALUE 1023 CYCLE;
+ALTER SEQUENCE  citus.transaction_id_sequence SET SCHEMA pg_catalog;
+
+
+CREATE TYPE citus.xact_status AS ENUM ('ABORT', 'COMMIT');
+
+CREATE FUNCTION pg_catalog.next_global_xid() RETURNS text AS $ngx$
+DECLARE
+    coordinator_xid CONSTANT bigint := nextval('citus.coordinator_xid_sequence');
+    own_machine_id CONSTANT int := get_psudo_id();
+    coordinator_xid_text CONSTANT text := lpad(to_hex(coordinator_xid), 16, '0');
+    machine_id_text CONSTANT text := lpad(to_hex(own_machine_id), 8, '0');
+    new_global_xid CONSTANT text := coordinator_xid_text || ':' || machine_id_text;
+BEGIN
+    RETURN new_global_xid;
+END;
+$ngx$ LANGUAGE plpgsql;
+
+CREATE TABLE citus.global_transactions (
+    id text PRIMARY KEY CHECK (octet_length(id) < 200) DEFAULT next_global_xid(),
+    status citus.xact_status NOT NULL DEFAULT 'ABORT'
+);
+
+
+CREATE FUNCTION column_name_to_column(regclass, text)
+    RETURNS text
+    AS 'MODULE_PATHNAME'
+    LANGUAGE C STRICT;
+
+CREATE SEQUENCE citus.coordinator_xid_sequence NO CYCLE;
+
+
+CREATE FUNCTION table_ddl_command_array(regclass)
+    RETURNS text[]
+    AS 'citus'
+    LANGUAGE C STRICT;
+
+CREATE FUNCTION get_worker_list()
+    RETURNS text
+    AS 'citus'
+    LANGUAGE C STRICT;
+    
+CREATE FUNCTION get_host_name()
+    RETURNS text
+    AS 'citus'
+    LANGUAGE C STRICT;  
+
+
+-- get_psudo_id finds the relative order of the node in the pg_worker_list.conf.
+-- The return value can be used as a unique id of the node in the cluster. Note that
+-- this function assumes that pg_worker_list.conf file is exactly the same on all nodes.
+CREATE FUNCTION get_psudo_id()
+RETURNS int
+AS $get_psudo_id$
+    DECLARE
+        psudo_id int := 0;
+        local_host_name text := '';
+        local_host_port int := 0;
+        all_hosts citus.citus_host[] := '{}';
+        host_element citus.citus_host;
+        id_counter int := 0;
+    BEGIN   
+        SELECT get_host_name() INTO local_host_name;
+        SELECT setting INTO local_host_port FROM pg_settings WHERE name = 'port'; 
+        SELECT get_worker_list_array() INTO all_hosts; 
+        
+        FOREACH host_element IN ARRAY all_hosts
+        LOOP
+            IF (host_element).node_name = local_host_name AND ((host_element).node_port)::int = local_host_port THEN
+                psudo_id = id_counter;
+            END IF;
+            id_counter = id_counter + 1;
+        END LOOP;
+        
+        RETURN psudo_id;
+    END;
+$get_psudo_id$ LANGUAGE plpgsql;
+
+
+-- get_worker_list_array returns an array of hosts
+-- in the cluster. Element type of the array is citus.citus_host,
+-- which consists of node_name and node_port.
+CREATE OR REPLACE FUNCTION get_worker_list_array()
+RETURNS citus.citus_host[]
+AS $get_worker_list$
+    DECLARE
+        all_hosts text := '';
+        host_delimiter text := E'\\|';
+        hosts citus.citus_host[];
+        single_host citus.citus_host;
+        port_delimiter text := ':';
+        host_name text := '';
+        host_port text := '';
+        host_element text := '';
+        hosts_array text[] := '{}';
+
+    BEGIN
+        SELECT get_worker_list() INTO all_hosts; 
+        SELECT regexp_split_to_array(all_hosts, host_delimiter) INTO hosts_array; 
+
+        FOREACH host_element IN ARRAY hosts_array
+        LOOP
+            SELECT split_part(host_element, port_delimiter, 1) INTO host_name;
+            SELECT split_part(host_element, port_delimiter, 2) INTO host_port;
+            single_host := (host_name, host_port)::citus.citus_host;
+                    
+            hosts = hosts || single_host;
+        END LOOP;
+        
+        RETURN hosts; 
+    END;
+$get_worker_list$ LANGUAGE plpgsql;
+
+
+
+
+
+-- cluster_create_distributed_table creates the shell table and inserts the table and partition 
+-- column information into the partition metadata table on all nodes. During this operation, each node 
+-- updates its own metadata and shell table is not created on the coordinator node. Note that
+-- all of the operations are done in a two-phase commit transaction across all the
+-- nodes, which provides all-or-nothing behavior for table distribution.
+CREATE FUNCTION cluster_create_distributed_table(table_name regclass,
+                                                 partition_column text)
+RETURNS boolean
+AS $cluster_create_distributed_table$
+    DECLARE
+        create_table_ddls text[] := '{}';
+        create_table_ddl text := '';
+        create_table_ddls_text text := '';
+        commit_result boolean := false;
+        host_psudo_id int := 0;
+        shard_ids int[] DEFAULT '{}';
+        remote_args text[];
+    BEGIN
+        SELECT table_ddl_command_array(table_name) INTO create_table_ddls;
+        SELECT get_psudo_id() INTO host_psudo_id;
+
+        create_table_ddls_text := array_to_string(create_table_ddls, '; ');
+
+        remote_args = ARRAY[create_table_ddls_text, table_name::text, partition_column,
+                            host_psudo_id::text];
+        SELECT perform_2pc('worker_create_distributed_table', remote_args) INTO commit_result;
+
+        RETURN commit_result;
+    END;
+$cluster_create_distributed_table$ LANGUAGE plpgsql;
+
+
+-- worker_create_distributed_table is called on all nodes after cluster_create_distributed_table
+-- is issued by a user. The function is responsible for creating the shell table and updating the
+-- metdata on the node that it is running. Note that since the coordinator node already has the shell table,
+-- the function does not create it on the coordinator node.
+CREATE OR REPLACE FUNCTION worker_create_distributed_table(ddl_commands text, table_name text,
+                                                            partition_column text, coordinator_host_id int)
+RETURNS boolean
+AS $worker_create_distributed_table$
+    DECLARE
+        local_psudo_id int := 0;
+    BEGIN
+        SELECT get_psudo_id() INTO local_psudo_id;
+
+            -- don't create the shell table on the coordinator host
+            IF local_psudo_id != coordinator_host_id THEN
+                EXECUTE ddl_commands;
+            END IF;
+
+            -- update the metadata
+            INSERT INTO pg_dist_partition 
+            VALUES (table_name::regclass, 'h', column_name_to_column(table_name::regclass, partition_column));
+        RETURN true;
+    END;
+$worker_create_distributed_table$ LANGUAGE plpgsql;
+
+
+-- cluster_create_worker_shards creates empty shards for the given table based
+-- on the specified number of initial shards. During shard creation, each node 
+-- updates its own metadata and each shards is created on a single node. Note that
+-- all of the operations are done in a two-phase commit transaction across all the
+-- nodes, which provides all-or-nothing behavior for shard creation operation.
+CREATE FUNCTION cluster_create_worker_shards(table_name regclass, shard_count int)
+RETURNS boolean
+AS $cluster_create_worker_shards$
+    DECLARE
+        create_table_ddls text[] := '{}';
+        create_table_ddl text := '';
+        create_table_ddls_text text := '';
+        commit_result boolean := false;
+        host_psudo_id int := 0;
+        shard_ids int[] DEFAULT '{}';
+        partition_col text := '';
+        remote_args text[];
+    BEGIN
+        SELECT table_ddl_command_array(table_name) INTO create_table_ddls;
+        SELECT get_psudo_id() INTO host_psudo_id;
+        SELECT generate_shard_ids(shard_count) INTO shard_ids;
+
+        remote_args = ARRAY[table_name::text, shard_ids::text];
+        SELECT perform_2pc('worker_create_worker_shards', remote_args) INTO commit_result ;
+
+        RETURN commit_result;
+    END;
+$cluster_create_worker_shards$ LANGUAGE plpgsql;
+
+
+
+
+-- worker_create_worker_shards is called on all nodes after cluster_create_worker_shards is 
+-- issued by a user. For each shard id in shard_ids array, the function creates the shard tables
+-- which needs to be created on the worker it is running. The function updates the shard/shard
+-- placement metadata for all shards. Note that the function assumes the table is hash partitioned
+-- and calculates the min/max hash token ranges for each shard, giving them an equal split of 
+-- the hash space.
+CREATE FUNCTION worker_create_worker_shards(table_name regclass, shard_ids int[])
+RETURNS boolean
+AS $worker_create_worker_shards$
+    DECLARE
+        host_psudo_id int := 0;
+        shard_counter int := 0;
+        shard_count int := 0;
+        workerCount int := 0;
+        all_hosts citus.citus_host[];
+        shard_id int := 0;
+        shard_index int := 0;
+        host_element citus.citus_host;
+        shard_min_hash_token bigint := 0;
+        shard_max_hash_token bigint := 0;
+        hash_token_increment bigint := 0;
+    BEGIN   
+        SELECT get_psudo_id() INTO host_psudo_id;
+        SELECT array_length(shard_ids, 1) INTO shard_count;
+        SELECT get_worker_list_array() INTO all_hosts; 
+        SELECT array_length(all_hosts, 1) INTO workerCount;
+        
+        hash_token_increment = ((2^32) / shard_count)::int;
+
+        -- iterate shard_count times
+        LOOP            
+            IF shard_counter = shard_count THEN
+                EXIT;
+            END IF;
+            
+            shard_id = shard_ids[shard_counter + 1];
+            shard_index = shard_counter % workerCount;
+            
+            -- Each shard is created only on a single node whose order in the hosts
+            -- file equals to the shard index. Basically, first shard is created on worker_1,
+            -- second shard is created on worker_2, ...., nth shard is created on worker_(n % workerCount)
+            IF shard_index = host_psudo_id THEN
+                EXECUTE 'CREATE TABLE ' || table_name || '_' || shard_id || ' (LIKE ' || table_name || ' INCLUDING ALL)';
+            end if;
+            
+            -- calculate hash range for this shard
+            shard_min_hash_token := -(2^31) + 1 + (shard_counter * hash_token_increment);
+            shard_max_hash_token := shard_min_hash_token + hash_token_increment - 1;
+            
+            IF shard_counter = (shard_count - 1) THEN
+                shard_max_hash_token = (2^31) - 1;
+            END IF;
+            
+            -- arrays start from 1 in plpgsql, that's why +1 is used
+            host_element = all_hosts[shard_index + 1];
+            
+            -- all nodes add shard and shard_placement on its own metadata 
+            INSERT INTO pg_dist_shard
+            (shardid, logicalrelid, shardstorage, shardminvalue, shardmaxvalue) VALUES
+            (shard_id, table_name::regclass::oid, 't', shard_min_hash_token, shard_max_hash_token);
+            INSERT INTO pg_dist_shard_placement
+            (shardid, shardstate, nodename, nodeport, shardlength) VALUES
+            (shard_id, 1 , (host_element).node_name, (host_element).node_port::integer, 0);
+            shard_counter = shard_counter + 1;
+        END LOOP;
+                
+        RETURN true;
+    END;
+$worker_create_worker_shards$ LANGUAGE plpgsql;
+
+
+-- generate_shard_ids function returns shard_count number of 
+-- unique shard ids. 
+CREATE FUNCTION generate_shard_ids(shard_count int)
+RETURNS int[]
+AS $generate_shard_ids$
+    DECLARE
+        id_counter int := 0;
+        next_shard_id int := 0;
+        shard_ids int[] DEFAULT '{}';
+    BEGIN
+        LOOP
+            IF id_counter = shard_count THEN
+                EXIT;
+            END IF;
+
+            next_shard_id := get_next_shard_id();
+            shard_ids := array_append(shard_ids, next_shard_id);
+
+            id_counter = id_counter + 1;
+        END LOOP;
+
+        RETURN shard_ids;
+    END;
+$generate_shard_ids$ LANGUAGE plpgsql;
+
+-- get_next_shard_id returns the next shard id. The next shard id is 
+-- bitwise OR of host id (shifted by 16) and the next sequence number.
+-- The sequence that is used to generate the next sequence number
+-- depends on whether CitusDB installed or not.  
+CREATE FUNCTION get_next_shard_id()
+RETURNS int
+AS $get_next_shard_id$
+    DECLARE
+        use_citus_metadata boolean := false;
+        next_shard_id int := 0;
+        next_sequence_value int := 0;
+        host_psudo_id int := 0;
+    BEGIN
+        SELECT get_psudo_id() INTO host_psudo_id;
+    
+        BEGIN
+            PERFORM 'pg_catalog.pg_dist_partition'::regclass;
+            use_citus_metadata = true;
+        EXCEPTION
+            WHEN undefined_table THEN
+                use_citus_metadata = false;
+        END;
+    
+        IF use_citus_metadata = true THEN
+                SELECT nextVal('pg_dist_shardid_seq') INTO next_sequence_value;
+        ELSE
+                SELECT nextVal('citus.shard_id_sequence')
+                INTO next_sequence_value;
+        END IF;
+    
+        next_shard_id = (host_psudo_id << 20) | (next_sequence_value);
+        
+        RETURN next_shard_id;
+    END;
+$get_next_shard_id$ LANGUAGE plpgsql;
 
 /*****************************************************************************
  * Citus functions
@@ -493,5 +838,18 @@ CREATE FUNCTION master_copy_shard_placement(shard_id bigint,
 RETURNS void
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
+
+CREATE FUNCTION get_own_machine_id()
+RETURNS int
+AS 'MODULE_PATHNAME'
+LANGUAGE C IMMUTABLE STRICT;
+
+CREATE FUNCTION perform_2pc(function regproc, args text[])
+RETURNS bool
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+
+
 
 RESET search_path;

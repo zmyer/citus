@@ -70,6 +70,13 @@ typedef enum
 	SHARD_PLACEMENT_ROUND_ROBIN = 2
 } ShardPlacementPolicyType;
 
+typedef enum
+{
+	XACT_STATUS_INVALID_FIRST = 0,
+	XACT_STATUS_ABORT = 1,
+	XACT_STATUS_COMMIT = 2
+} TransactionStatus;
+
 
 /* Config variables managed via guc.c */
 extern int ShardReplicationFactor;
@@ -105,5 +112,10 @@ extern Datum master_create_worker_shards(PG_FUNCTION_ARGS);
 
 /* function declarations for shard repair functionality */
 extern Datum master_copy_shard_placement(PG_FUNCTION_ARGS);
+
+/* helper functions for 2pc */
+extern Datum perform_2pc(PG_FUNCTION_ARGS);
+extern Datum get_own_machine_id(PG_FUNCTION_ARGS);
+extern Datum get_worker_list(PG_FUNCTION_ARGS);
 
 #endif   /* MASTER_PROTOCOL_H */

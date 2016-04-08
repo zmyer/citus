@@ -44,7 +44,6 @@ static Size WorkerNodeShmemSize(void);
 static void WorkerNodeShmemAndWorkerListInit(void);
 static uint32 WorkerNodeHashCode(const void *key, Size keySize);
 static int WorkerNodeCompare(const void *lhsKey, const void *rhsKey, Size keySize);
-static List * ParseWorkerNodeFile(const char *workerNodeFilename);
 static void ResetWorkerNodesHash(HTAB *WorkerNodesHash);
 static bool WorkerNodeResponsive(const char *workerName, uint32 workerPort);
 
@@ -599,7 +598,7 @@ LoadWorkerNodeList(const char *workerFilename)
  * ParseWorkerNodeFile opens and parses the node name and node port from the
  * specified configuration file.
  */
-static List *
+List *
 ParseWorkerNodeFile(const char *workerNodeFilename)
 {
 	FILE *workerFileStream = NULL;
