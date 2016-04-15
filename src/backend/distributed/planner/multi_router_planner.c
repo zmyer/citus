@@ -861,16 +861,6 @@ MultiRouterPlannableQuery(Query *query)
 		return false;
 	}
 
-	/*
-	 * Cursor queries are not router plannable. Opening a cursor creates a transaction,
-	 * we disallow cursor queries by rejecting queries inside transactions. These
-	 * queries can be served by regular planner/executor.
-	 */
-	inTransaction = IsInTransactionChain(true);
-	if (inTransaction)
-	{
-		return false;
-	}
 	return true;
 }
 

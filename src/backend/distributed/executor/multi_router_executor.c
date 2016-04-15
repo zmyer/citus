@@ -58,7 +58,6 @@ static bool StoreQueryResult(PGconn *connection, TupleDesc tupleDescriptor,
 void
 RouterExecutorStart(QueryDesc *queryDesc, int eflags, Task *task)
 {
-	bool topLevel = true;
 	LOCKMODE lockMode = NoLock;
 	EState *executorState = NULL;
 	CmdType commandType = queryDesc->operation;
@@ -67,8 +66,12 @@ RouterExecutorStart(QueryDesc *queryDesc, int eflags, Task *task)
 	Assert(task != NULL);
 
 	/* disallow transactions and triggers during distributed commands */
-	PreventTransactionChain(topLevel, "distributed commands");
-	eflags |= EXEC_FLAG_SKIP_TRIGGERS;
+	if (commandType != CMD_SELECT)
+	{
+		bool topLevel = true;
+		PreventTransactionChain(topLevel, "distributed commands");
+		eflags |= EXEC_FLAG_SKIP_TRIGGERS;
+	}
 
 	/* signal that it is a router execution */
 	eflags |= EXEC_FLAG_CITUS_ROUTER_EXECUTOR;
