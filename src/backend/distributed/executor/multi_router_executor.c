@@ -127,19 +127,13 @@ CommutativityRuleToLockMode(CmdType commandType, bool upsertQuery)
 {
 	LOCKMODE lockMode = NoLock;
 
-	/* bypass commutativity checks when flag enabled */
-	if (AllModificationsCommutative)
-	{
-		return ShareLock;
-	}
-
 	if (commandType == CMD_SELECT)
 	{
 		lockMode = NoLock;
 	}
 	else if (upsertQuery)
 	{
-		lockMode = ExclusiveLock;
+		lockMode = RowExclusiveLock;
 	}
 	else if (commandType == CMD_INSERT)
 	{
@@ -147,7 +141,7 @@ CommutativityRuleToLockMode(CmdType commandType, bool upsertQuery)
 	}
 	else if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
 	{
-		lockMode = NoLock;
+		lockMode = RowExclusiveLock;
 	}
 	else
 	{
@@ -200,12 +194,7 @@ RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count, Tas
 		InstrStartNode(queryDesc->totaltime);
 	}
 
-	if (operation == CMD_INSERT)
-	{
-		int32 affectedRowCount = ExecuteDistributedModify(task);
-		estate->es_processed = affectedRowCount;
-	}
-	else if (operation == CMD_UPDATE || operation == CMD_DELETE)
+	else if (task->upsertQuery || operation == CMD_UPDATE || operation == CMD_DELETE)
 	{
 		int32 affectedRowCount = -1;
 		char *originalQueryString = task->queryString;
@@ -220,6 +209,11 @@ RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count, Tas
 		task->queryString = "COMMIT";
 		ExecuteDistributedModify(task);
 
+		estate->es_processed = affectedRowCount;
+	}
+	else if (operation == CMD_INSERT)
+	{
+		int32 affectedRowCount = ExecuteDistributedModify(task);
 		estate->es_processed = affectedRowCount;
 	}
 	else if (operation == CMD_SELECT)
@@ -308,6 +302,7 @@ ExecuteDistributedModify(Task *task)
 									 currentAffectedTupleCount, affectedTupleCount),
 							  errdetail("modified placement on %s:%d",
 										nodeName, nodePort)));
+			failedPlacementList = lappend(failedPlacementList, taskPlacement);
 		}
 
 		PQclear(result);
