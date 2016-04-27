@@ -52,18 +52,93 @@ int ShardReplicationFactor = 2; /* desired replication factor for shards */
 int ShardMaxSize = 1048576;     /* maximum size in KB one shard can grow to */
 int ShardPlacementPolicy = SHARD_PLACEMENT_ROUND_ROBIN;
 
+static const int32 SHARD_UPDATE_COUNTS[] = {
+	2076672, 1576471, 1414580, 497004, 479279,
+	348381, 339114, 273558, 197576, 179541, 148762, 138105, 136925, 132620, 131022,
+	118169, 112066, 88313, 85849, 85102, 82773, 79192, 68525, 67877, 65960, 65783, 59656,
+	56486, 54919, 46969, 39323, 36039, 32999, 32988, 32837, 31652, 31425, 29956, 25948,
+	25647, 24253, 24175, 22768, 22190, 19410, 17123, 17095, 16945, 15630, 15232, 15123,
+	14473, 14078, 13336, 13327, 12838, 11005, 10924, 9953, 9523, 9110, 8895, 8546, 8116,
+	8056, 8028, 6667, 6653, 6496, 6323, 6225, 5761, 5344, 5317, 4762, 4724, 3737, 3693,
+	3552, 3497, 3182, 2833, 2800, 2762, 2258, 1455, 1298, 1266, 1193, 1179, 1160, 1122,
+	1101, 1017, 947, 810, 805, 735, 620, 464, 369, 364, 268, 251, 209, 161, 158, 119, 73,
+	24, 13, 11, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+static const int32 SHARD_ROW_COUNTS[] = {
+	2969401, 683298, 745898, 86249, 136518, 68242,
+	458425, 786666, 75606, 93700, 99927, 49291, 65451, 387764, 512445, 58566, 45750,
+	48763, 44145, 198192, 43177, 28081, 60424, 22554, 111978, 34895, 20249, 57472, 16059,
+	32058, 114403, 12341, 13465, 10269, 13347, 33017, 11012, 14088, 13165, 8502, 12857,
+	13206, 9017, 7024, 6694, 7462, 8480, 60740, 31174, 6321, 6946, 5027, 5614, 146681,
+	6404, 23509, 4739, 8025, 5922, 602934, 3908, 33438, 9253, 6792, 3771, 2736, 7431,
+	2388, 12391, 2735, 3467, 2307, 1787, 2107, 6541, 1434, 1213, 1542, 2114, 2294, 131984,
+	19241, 1936, 1272, 3741, 286276, 7594, 451, 490, 413, 1356, 1355, 346, 9606, 499, 346,
+	5844, 377, 347, 701, 730, 149, 148, 78, 15901, 57, 60, 808, 32, 12, 5, 410, 402,
+	120670, 11679, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 13, 1361
+};
+static const int32 SHARD_COUNT = sizeof(SHARD_UPDATE_COUNTS) /
+								 sizeof(SHARD_UPDATE_COUNTS[0]);
 
 static char * hostname_client_addr(void);
 static Datum WorkerNodeGetDatum(WorkerNode *workerNode, TupleDesc tupleDescriptor);
 
 
 /* exports for SQL callable functions */
+PG_FUNCTION_INFO_V1(master_get_shard_for_insert);
+PG_FUNCTION_INFO_V1(master_get_shard_for_update);
+PG_FUNCTION_INFO_V1(master_get_row_id_for_shard);
 PG_FUNCTION_INFO_V1(master_get_table_metadata);
 PG_FUNCTION_INFO_V1(master_get_table_ddl_events);
 PG_FUNCTION_INFO_V1(master_get_new_shardid);
 PG_FUNCTION_INFO_V1(master_get_local_first_candidate_nodes);
 PG_FUNCTION_INFO_V1(master_get_round_robin_candidate_nodes);
 PG_FUNCTION_INFO_V1(master_get_active_worker_nodes);
+
+
+Datum
+master_get_shard_for_insert(PG_FUNCTION_ARGS)
+{
+	int32 randomNumber = PG_GETARG_INT32(0);
+
+	int32 shardId = -1;
+	int32 boundary = 0;
+
+	while (randomNumber >= boundary && shardId < SHARD_COUNT)
+	{
+		boundary += SHARD_ROW_COUNTS[++shardId];
+	}
+
+	PG_RETURN_INT32(shardId);
+}
+
+
+Datum
+master_get_shard_for_update(PG_FUNCTION_ARGS)
+{
+	int32 randomNumber = PG_GETARG_INT32(0);
+
+	int32 shardId = -1;
+	int32 boundary = 0;
+
+	while (randomNumber >= boundary && shardId < SHARD_COUNT)
+	{
+		boundary += SHARD_UPDATE_COUNTS[++shardId];
+	}
+
+	PG_RETURN_INT32(shardId);
+}
+
+
+Datum
+master_get_row_id_for_shard(PG_FUNCTION_ARGS)
+{
+	int32 shardId = PG_GETARG_INT32(0);
+	int32 rowNumber = PG_GETARG_INT32(1);
+	int32 shardRowCount = SHARD_ROW_COUNTS[shardId];
+	int32 rowId = rowNumber % shardRowCount;
+
+	PG_RETURN_INT32(rowId);
+}
 
 
 /*

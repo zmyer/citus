@@ -88,6 +88,11 @@ extern void CreateShardPlacements(int64 shardId, List *ddlEventList,
 								  int replicationFactor);
 extern uint64 UpdateShardStatistics(Oid relationId, int64 shardId);
 
+/* Functions for testing */
+extern Datum master_get_shard_for_insert(PG_FUNCTION_ARGS);
+extern Datum master_get_shard_for_update(PG_FUNCTION_ARGS);
+extern Datum master_get_row_id_for_shard(PG_FUNCTION_ARGS);
+
 /* Function declarations for generating metadata for shard creation */
 extern Datum master_get_table_metadata(PG_FUNCTION_ARGS);
 extern Datum master_get_table_ddl_events(PG_FUNCTION_ARGS);

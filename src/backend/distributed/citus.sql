@@ -103,6 +103,21 @@ SET search_path = 'pg_catalog';
 
 /* master_* functions */
 
+CREATE FUNCTION master_get_shard_for_insert(random_number integer)
+    RETURNS integer
+    LANGUAGE C IMMUTABLE
+    AS 'MODULE_PATHNAME', $$master_get_shard_for_insert$$;
+
+CREATE FUNCTION master_get_shard_for_update(random_number integer)
+    RETURNS integer
+    LANGUAGE C IMMUTABLE
+    AS 'MODULE_PATHNAME', $$master_get_shard_for_update$$;
+
+CREATE OR REPLACE FUNCTION master_get_row_id_for_shard(shard_id integer, row_number integer)
+    RETURNS integer
+    LANGUAGE C IMMUTABLE
+    AS 'MODULE_PATHNAME', $$master_get_row_id_for_shard$$;
+
 CREATE FUNCTION master_get_table_metadata(relation_name text, OUT logical_relid oid,
                                           OUT part_storage_type "char",
                                           OUT part_method "char", OUT part_key text,
