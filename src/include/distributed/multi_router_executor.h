@@ -16,8 +16,7 @@ extern bool AllModificationsCommutative;
 
 
 extern void RouterExecutorStart(QueryDesc *queryDesc, int eflags, Task *task);
-extern void RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count,
-							  Task *task);
+extern void RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count);
 extern bool ExecuteTaskAndStoreResults(Task *task, TupleDesc tupleDescriptor,
 									   Tuplestorestate *tupleStore);
 extern void RouterExecutorFinish(QueryDesc *queryDesc);

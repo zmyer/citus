@@ -3,6 +3,7 @@ ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 750000;
 -- ===================================================================
 -- test end-to-end modification functionality
 -- ===================================================================
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 103066;
 CREATE TYPE order_side AS ENUM ('buy', 'sell');
 CREATE TABLE limit_orders (
 	id bigint PRIMARY KEY,
@@ -10,7 +11,8 @@ CREATE TABLE limit_orders (
 	bidder_id bigint NOT NULL,
 	placed_at timestamp NOT NULL,
 	kind order_side NOT NULL,
-	limit_price decimal NOT NULL DEFAULT 0.00 CHECK (limit_price >= 0.00)
+	limit_price decimal NOT NULL DEFAULT 0.00 CHECK (limit_price >= 0.00),
+	array_of_values integer[]
 );
 CREATE TABLE insufficient_shards ( LIKE limit_orders );
 CREATE TABLE range_partitioned ( LIKE limit_orders );
@@ -97,17 +99,17 @@ SET citus.task_executor_type TO 'real-time';
 SELECT * FROM range_partitioned WHERE id = 32743;
 DEBUG:  predicate pruning for shardId 750004
 DEBUG:  Plan is router executable
-  id   | symbol | bidder_id |        placed_at         | kind | limit_price 
--------+--------+-----------+--------------------------+------+-------------
- 32743 | AAPL   |      9580 | Tue Oct 19 10:23:54 2004 | buy  |       20.69
+  id   | symbol | bidder_id |        placed_at         | kind | limit_price | array_of_values 
+-------+--------+-----------+--------------------------+------+-------------+-----------------
+ 32743 | AAPL   |      9580 | Tue Oct 19 10:23:54 2004 | buy  |       20.69 | 
 (1 row)
 
 SELECT * FROM append_partitioned WHERE id = 414123;
 DEBUG:  predicate pruning for shardId 750006
 DEBUG:  Plan is router executable
-   id   | symbol | bidder_id |        placed_at         | kind | limit_price 
---------+--------+-----------+--------------------------+------+-------------
- 414123 | AAPL   |      9580 | Tue Oct 19 10:23:54 2004 | buy  |       20.69
+   id   | symbol | bidder_id |        placed_at         | kind | limit_price | array_of_values 
+--------+--------+-----------+--------------------------+------+-------------+-----------------
+ 414123 | AAPL   |      9580 | Tue Oct 19 10:23:54 2004 | buy  |       20.69 | 
 (1 row)
 
 SET client_min_messages TO DEFAULT;
@@ -161,16 +163,15 @@ SET client_min_messages TO DEFAULT;
 -- commands with non-constant partition values are unsupported
 INSERT INTO limit_orders VALUES (random() * 100, 'ORCL', 152, '2011-08-25 11:50:45',
 								 'sell', 0.58);
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
--- commands with expressions that cannot be collapsed are unsupported
+ERROR:  values given for the partition column must be constants or constant expressions
+-- values for other columns are totally fine
 INSERT INTO limit_orders VALUES (2036, 'GOOG', 5634, now(), 'buy', random());
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
 -- commands with mutable functions in their quals
 DELETE FROM limit_orders WHERE id = 246 AND bidder_id = (random() * 1000);
 ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
--- commands with mutable but non-volatilte functions(ie: stable func.) in their quals
-DELETE FROM limit_orders WHERE id = 246 AND placed_at = current_timestamp;
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
+-- commands with mutable but non-volatile functions(ie: stable func.) in their quals
+-- (the cast to timestamp is because the timestamp_eq_timestamptz operator is stable)
+DELETE FROM limit_orders WHERE id = 246 AND placed_at = current_timestamp::timestamp;
 -- commands with multiple rows are unsupported
 INSERT INTO limit_orders VALUES (DEFAULT), (DEFAULT);
 ERROR:  cannot perform distributed planning for the given modification
@@ -374,9 +375,43 @@ SELECT symbol, bidder_id FROM limit_orders WHERE id = 246;
  gm     |       247
 (1 row)
 
--- updates referencing non-IMMUTABLE functions are unsupported
+-- updates referencing STABLE functions are allowed
 UPDATE limit_orders SET placed_at = now() WHERE id = 246;
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
+-- so are binary operators
+UPDATE limit_orders SET array_of_values = 1 || array_of_values WHERE id = 246;
+CREATE FUNCTION immutable_append(old_values int[], new_value int)
+RETURNS int[] AS $$ SELECT old_values || new_value $$ LANGUAGE SQL IMMUTABLE;
+-- immutable function calls with vars are also allowed
+UPDATE limit_orders
+SET array_of_values = immutable_append(array_of_values, 2) WHERE id = 246;
+CREATE FUNCTION stable_append(old_values int[], new_value int)
+RETURNS int[] AS $$ BEGIN RETURN old_values || new_value; END; $$
+LANGUAGE plpgsql STABLE;
+-- but STABLE function calls with vars are not allowed
+UPDATE limit_orders
+SET array_of_values = stable_append(array_of_values, 3) WHERE id = 246;
+ERROR:  STABLE functions used in UPDATE queries cannot be called with column references
+SELECT array_of_values FROM limit_orders WHERE id = 246;
+ array_of_values 
+-----------------
+ {1,2}
+(1 row)
+
+-- STRICT functions work as expected
+CREATE FUNCTION temp_strict_func(integer,integer) RETURNS integer AS
+'SELECT COALESCE($1, 2) + COALESCE($1, 3);' LANGUAGE SQL STABLE STRICT;
+UPDATE limit_orders SET bidder_id = temp_strict_func(1, null) WHERE id = 246;
+WARNING:  Bad result from localhost:57637
+DETAIL:  Remote message: null value in column "bidder_id" violates not-null constraint
+WARNING:  Bad result from localhost:57638
+DETAIL:  Remote message: null value in column "bidder_id" violates not-null constraint
+ERROR:  could not modify any active placements
+SELECT array_of_values FROM limit_orders WHERE id = 246;
+ array_of_values 
+-----------------
+ {1,2}
+(1 row)
+
 -- cursors are not supported
 UPDATE limit_orders SET symbol = 'GM' WHERE CURRENT OF cursor_name;
 ERROR:  distributed modifications must target exactly one shard

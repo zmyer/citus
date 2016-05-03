@@ -19,29 +19,34 @@
 #include "miscadmin.h"
 
 #include "access/xact.h"
+#include "distributed/citus_clauses.h"
+#include "distributed/citus_ruleutils.h"
 #include "distributed/connection_cache.h"
 #include "distributed/listutils.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_physical_planner.h"
+#include "distributed/multi_planner.h"
 #include "distributed/multi_router_executor.h"
 #include "distributed/resource_lock.h"
-#include "executor/executor.h"
 #include "nodes/pg_list.h"
 #include "utils/builtins.h"
-
 #include "utils/elog.h"
 #include "utils/errcodes.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
+#if (PG_VERSION_NUM >= 90500)
+#include "utils/ruleutils.h"
+#endif
 
 
 /* controls use of locks to enforce safe commutativity */
 bool AllModificationsCommutative = false;
 
-
 static LOCKMODE CommutativityRuleToLockMode(CmdType commandType, bool upsertQuery);
 static void AcquireExecutorShardLock(Task *task, LOCKMODE lockMode);
-static int32 ExecuteDistributedModify(Task *task);
+static int32 ExecuteDistributedModify(Query *query, Task *task);
+static void ExecuteFunctions(Query *query);
+static void DeparseShardQuery(Query *query, Task *task, StringInfo queryString);
 static void ExecuteSingleShardSelect(QueryDesc *queryDesc, uint64 tupleCount,
 									 Task *task, EState *executorState,
 									 TupleDesc tupleDescriptor,
@@ -175,11 +180,19 @@ AcquireExecutorShardLock(Task *task, LOCKMODE lockMode)
  * RouterExecutorRun actually executes a single task on a worker.
  */
 void
-RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count, Task *task)
+RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count)
 {
+	PlannedStmt *planStatement = queryDesc->plannedstmt;
+	MultiPlan *multiPlan = GetMultiPlan(planStatement);
+	List *taskList = multiPlan->workerJob->taskList;
+	Task *task = NULL;
 	EState *estate = queryDesc->estate;
 	CmdType operation = queryDesc->operation;
 	MemoryContext oldcontext = NULL;
+
+	/* router executor can only execute distributed plans with a single task */
+	Assert(list_length(taskList) == 1);
+	task = (Task *) linitial(taskList);
 
 	Assert(estate != NULL);
 	Assert(!(estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY));
@@ -203,7 +216,8 @@ RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count, Tas
 	if (operation == CMD_INSERT || operation == CMD_UPDATE ||
 		operation == CMD_DELETE)
 	{
-		int32 affectedRowCount = ExecuteDistributedModify(task);
+		Query *query = multiPlan->workerJob->jobQuery;
+		int32 affectedRowCount = ExecuteDistributedModify(query, task);
 		estate->es_processed = affectedRowCount;
 	}
 	else if (operation == CMD_SELECT)
@@ -237,12 +251,18 @@ RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count, Tas
  * also generate warnings for individual placement failures.
  */
 static int32
-ExecuteDistributedModify(Task *task)
+ExecuteDistributedModify(Query *query, Task *task)
 {
 	int32 affectedTupleCount = -1;
 	ListCell *taskPlacementCell = NULL;
 	List *failedPlacementList = NIL;
 	ListCell *failedPlacementCell = NULL;
+	StringInfo queryString = makeStringInfo();
+
+	ExecuteFunctions(query);
+	DeparseShardQuery(query, task, queryString);
+	elog(DEBUG4, "old query: %s", task->queryString);
+	elog(DEBUG4, "new query: %s", queryString->data);
 
 	foreach(taskPlacementCell, task->taskPlacementList)
 	{
@@ -264,7 +284,7 @@ ExecuteDistributedModify(Task *task)
 			continue;
 		}
 
-		result = PQexec(connection, task->queryString);
+		result = PQexec(connection, queryString->data);
 		if (PQresultStatus(result) != PGRES_COMMAND_OK)
 		{
 			char *sqlStateString = PQresultErrorField(result, PG_DIAG_SQLSTATE);
@@ -331,6 +351,60 @@ ExecuteDistributedModify(Task *task)
 	}
 
 	return affectedTupleCount;
+}
+
+
+/*
+ * Walks each TargetEntry of the query, evaluates sub-expressions without Vars.
+ */
+static void
+ExecuteFunctions(Query *query)
+{
+	CmdType commandType = query->commandType;
+	ListCell *targetEntryCell = NULL;
+	Node *modifiedNode = NULL;
+
+	if (query->jointree && query->jointree->quals)
+	{
+		query->jointree->quals = PartiallyEvaluateExpression(query->jointree->quals);
+	}
+	else
+	{
+		/* sanity check, since we're inside the router executor a WHERE is required */
+		Assert(commandType == CMD_INSERT);
+	}
+
+	foreach(targetEntryCell, query->targetList)
+	{
+		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
+
+		/* performance optimization for the most common cases */
+		if (IsA(targetEntry->expr, Const) || IsA(targetEntry->expr, Var))
+		{
+			continue;
+		}
+
+		if (commandType == CMD_INSERT)
+		{
+			modifiedNode = EvaluateExpression((Node *) targetEntry->expr);
+		}
+		else
+		{
+			modifiedNode = PartiallyEvaluateExpression((Node *) targetEntry->expr);
+		}
+
+		targetEntry->expr = (Expr *) modifiedNode;
+	}
+}
+
+
+static void
+DeparseShardQuery(Query *query, Task *task, StringInfo queryString)
+{
+	uint64 shardId = task->anchorShardId;
+	Oid relid = ((RangeTblEntry *) linitial(query->rtable))->relid;
+
+	deparse_shard_query(query, relid, shardId, queryString);
 }
 
 

@@ -62,6 +62,11 @@ SELECT master_modify_multiple_shards('DELETE FROM multi_shard_modify_test WHERE 
 
 -- commands with stable functions in their quals
 CREATE FUNCTION temp_stable_func() RETURNS integer AS 'SELECT 10;' LANGUAGE SQL STABLE;
+\c - - - :worker_1_port
+CREATE FUNCTION temp_stable_func() RETURNS integer AS 'SELECT 10;' LANGUAGE SQL STABLE;
+\c - - - :worker_2_port
+CREATE FUNCTION temp_stable_func() RETURNS integer AS 'SELECT 10;' LANGUAGE SQL STABLE;
+\c - - - :master_port
 SELECT master_modify_multiple_shards('DELETE FROM multi_shard_modify_test WHERE t_key = temp_stable_func()');
 
 -- commands with immutable functions in their quals
@@ -147,7 +152,7 @@ SELECT master_modify_multiple_shards('UPDATE multi_shard_modify_test SET t_name 
 SELECT master_modify_multiple_shards('UPDATE multi_shard_modify_test SET t_value = abs(-78) WHERE t_key = 10');
 SELECT t_value FROM multi_shard_modify_test WHERE t_key=10;
 
--- updates referencing STABLE functions in SET section are not supported
+-- updates referencing STABLE functions in SET section are supported
 SELECT master_modify_multiple_shards('UPDATE multi_shard_modify_test SET t_value = temp_stable_func() * 2 WHERE t_key = 10');
 
 -- updates referencing VOLATILE functions in SET section are not supported

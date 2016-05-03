@@ -6,6 +6,7 @@ ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 750000;
 -- ===================================================================
 -- test end-to-end modification functionality
 -- ===================================================================
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 103066;
 
 CREATE TYPE order_side AS ENUM ('buy', 'sell');
 
@@ -15,7 +16,8 @@ CREATE TABLE limit_orders (
 	bidder_id bigint NOT NULL,
 	placed_at timestamp NOT NULL,
 	kind order_side NOT NULL,
-	limit_price decimal NOT NULL DEFAULT 0.00 CHECK (limit_price >= 0.00)
+	limit_price decimal NOT NULL DEFAULT 0.00 CHECK (limit_price >= 0.00),
+	array_of_values integer[]
 );
 
 CREATE TABLE insufficient_shards ( LIKE limit_orders );
@@ -120,14 +122,15 @@ SET client_min_messages TO DEFAULT;
 INSERT INTO limit_orders VALUES (random() * 100, 'ORCL', 152, '2011-08-25 11:50:45',
 								 'sell', 0.58);
 
--- commands with expressions that cannot be collapsed are unsupported
+-- values for other columns are totally fine
 INSERT INTO limit_orders VALUES (2036, 'GOOG', 5634, now(), 'buy', random());
 
 -- commands with mutable functions in their quals
 DELETE FROM limit_orders WHERE id = 246 AND bidder_id = (random() * 1000);
 
--- commands with mutable but non-volatilte functions(ie: stable func.) in their quals
-DELETE FROM limit_orders WHERE id = 246 AND placed_at = current_timestamp;
+-- commands with mutable but non-volatile functions(ie: stable func.) in their quals
+-- (the cast to timestamp is because the timestamp_eq_timestamptz operator is stable)
+DELETE FROM limit_orders WHERE id = 246 AND placed_at = current_timestamp::timestamp;
 
 -- commands with multiple rows are unsupported
 INSERT INTO limit_orders VALUES (DEFAULT), (DEFAULT);
@@ -287,8 +290,34 @@ UPDATE limit_orders SET symbol = LOWER(symbol) WHERE id = 246;
 
 SELECT symbol, bidder_id FROM limit_orders WHERE id = 246;
 
--- updates referencing non-IMMUTABLE functions are unsupported
+-- updates referencing STABLE functions are allowed
 UPDATE limit_orders SET placed_at = now() WHERE id = 246;
+-- so are binary operators
+UPDATE limit_orders SET array_of_values = 1 || array_of_values WHERE id = 246;
+
+CREATE FUNCTION immutable_append(old_values int[], new_value int)
+RETURNS int[] AS $$ SELECT old_values || new_value $$ LANGUAGE SQL IMMUTABLE;
+
+-- immutable function calls with vars are also allowed
+UPDATE limit_orders
+SET array_of_values = immutable_append(array_of_values, 2) WHERE id = 246;
+
+CREATE FUNCTION stable_append(old_values int[], new_value int)
+RETURNS int[] AS $$ BEGIN RETURN old_values || new_value; END; $$
+LANGUAGE plpgsql STABLE;
+
+-- but STABLE function calls with vars are not allowed
+UPDATE limit_orders
+SET array_of_values = stable_append(array_of_values, 3) WHERE id = 246;
+
+SELECT array_of_values FROM limit_orders WHERE id = 246;
+
+-- STRICT functions work as expected
+CREATE FUNCTION temp_strict_func(integer,integer) RETURNS integer AS
+'SELECT COALESCE($1, 2) + COALESCE($1, 3);' LANGUAGE SQL STABLE STRICT;
+UPDATE limit_orders SET bidder_id = temp_strict_func(1, null) WHERE id = 246;
+
+SELECT array_of_values FROM limit_orders WHERE id = 246;
 
 -- cursors are not supported
 UPDATE limit_orders SET symbol = 'GM' WHERE CURRENT OF cursor_name;
