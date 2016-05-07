@@ -43,7 +43,7 @@
 /* Defines used for fetching files and tables */
 /* the tablename in the overloaded COPY statement is the to-be-transferred file */
 #define TRANSMIT_REGULAR_COMMAND "COPY \"%s\" TO STDOUT WITH (format 'transmit')"
-#define COPY_OUT_COMMAND "COPY %s TO STDOUT"
+#define COPY_OUT_COMMAND "COPY (SELECT * FROM %s) TO STDOUT"
 #define COPY_IN_COMMAND "COPY %s FROM '%s'"
 
 /* Defines that relate to fetching foreign tables */

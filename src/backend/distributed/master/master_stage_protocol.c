@@ -84,6 +84,7 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 
 	Oid relationId = ResolveRelationId(relationNameText);
 	char *relationOwner = TableOwner(relationId);
+	char relationKind = get_rel_relkind(relationId);
 
 	EnsureTablePermissions(relationId, ACL_INSERT);
 	CheckDistributedTable(relationId);
@@ -91,6 +92,10 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 	if (CStoreTable(relationId))
 	{
 		storageType = SHARD_STORAGE_COLUMNAR;
+	}
+	else if (relationKind == RELKIND_FOREIGN_TABLE)
+	{
+		storageType = SHARD_STORAGE_FOREIGN;
 	}
 
 	partitionMethod = PartitionMethod(relationId);
