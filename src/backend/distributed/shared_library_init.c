@@ -30,6 +30,7 @@
 #include "distributed/multi_server_executor.h"
 #include "distributed/multi_transaction.h"
 #include "distributed/multi_utility.h"
+#include "distributed/multitree_debug_helper.h"
 #include "distributed/task_tracker.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
@@ -232,6 +233,16 @@ RegisterCitusConfigVariables(void)
 		gettext_noop("Enables supported subquery pushdown to workers."),
 		NULL,
 		&SubqueryPushdown,
+		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.print_multiplan",
+		gettext_noop("Enables printing multi-tree."),
+		NULL,
+		&PrintMultiPlan,
 		false,
 		PGC_USERSET,
 		0,

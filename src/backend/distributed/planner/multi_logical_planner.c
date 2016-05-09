@@ -50,6 +50,7 @@ static MultiNode * MultiPlanTree(Query *queryTree);
 static void ErrorIfQueryNotSupported(Query *queryTree);
 static bool HasUnsupportedJoinWalker(Node *node, void *context);
 static void ErrorIfSubqueryNotSupported(Query *subqueryTree);
+static void ErrorIfSubqueryNotSupportedWithoutPushdown(Query *subqueryTree);
 #if (PG_VERSION_NUM >= 90500)
 static bool HasTablesample(Query *queryTree);
 #endif
@@ -98,6 +99,7 @@ static MultiNode * ApplyCartesianProduct(MultiNode *leftNode, MultiNode *rightNo
 static MultiNode * SubqueryPushdownMultiPlanTree(Query *queryTree,
 												 List *subqueryEntryList);
 static void ErrorIfSubqueryJoin(Query *queryTree);
+static void ErrorIfSubqueryJoinWithoutPushdown(Query *queryTree);
 static MultiTable * MultiSubqueryPushdownTable(RangeTblEntry *subqueryRangeTableEntry);
 
 
@@ -243,17 +245,25 @@ MultiPlanTree(Query *queryTree)
 		subqueryTree = subqueryRangeTableEntry->subquery;
 
 		/* check if subquery satisfies preconditons */
-		ErrorIfSubqueryNotSupported(subqueryTree);
-
 		/* check if subquery has joining tables */
-		ErrorIfSubqueryJoin(subqueryTree);
+		ErrorIfSubqueryNotSupportedWithoutPushdown(subqueryTree);
+		ErrorIfSubqueryJoinWithoutPushdown(subqueryTree);
 
 		subqueryNode = CitusMakeNode(MultiTable);
 		subqueryNode->relationId = SUBQUERY_RELATION_ID;
 		subqueryNode->rangeTableId = SUBQUERY_RANGE_TABLE_ID;
 		subqueryNode->partitionColumn = NULL;
-		subqueryNode->alias = NULL;
-		subqueryNode->referenceNames = NULL;
+
+		if (SubqueryPushdown)
+		{
+			subqueryNode->alias = NULL;
+			subqueryNode->referenceNames = NULL;
+		}
+		else
+		{
+			subqueryNode->alias = subqueryRangeTableEntry->alias;
+			subqueryNode->referenceNames = subqueryRangeTableEntry->eref;
+		}
 
 		/*
 		 * We disregard pulled subqueries. This changes order of range table list.
@@ -549,6 +559,51 @@ ErrorIfSubqueryNotSupported(Query *subqueryTree)
 	{
 		preconditionsSatisfied = false;
 		errorDetail = "Subqueries without group by clause are not supported yet";
+	}
+
+	if (subqueryTree->sortClause != NULL)
+	{
+		preconditionsSatisfied = false;
+		errorDetail = "Subqueries with order by clause are not supported yet";
+	}
+
+	if (subqueryTree->limitCount != NULL)
+	{
+		preconditionsSatisfied = false;
+		errorDetail = "Subqueries with limit are not supported yet";
+	}
+
+	/* finally check and error out if not satisfied */
+	if (!preconditionsSatisfied)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot perform distributed planning on this query"),
+						errdetail("%s", errorDetail)));
+	}
+}
+
+
+/*
+ * ErrorIfSubqueryNotSupportedWithoutPushdown checks that we can perform distributed planning for
+ * the given subquery.
+ */
+static void ErrorIfSubqueryNotSupportedWithoutPushdown(Query *subqueryTree)
+{
+	char *errorDetail = NULL;
+	bool preconditionsSatisfied = true;
+
+	if (subqueryTree->groupClause != NIL && !subqueryTree->hasAggs)
+	{
+		preconditionsSatisfied = false;
+		errorDetail = "Subqueries with group by but no aggregates are not supported yet";
+	}
+
+	/* if subquery has an aggregate then it must have a group by */
+	if (subqueryTree->hasAggs && subqueryTree->groupClause == NIL)
+	{
+		preconditionsSatisfied = false;
+		errorDetail = "Subqueries with aggregates by but no group by "
+					  "are not supported yet";
 	}
 
 	if (subqueryTree->sortClause != NULL)
@@ -1932,6 +1987,43 @@ ErrorIfSubqueryJoin(Query *queryTree)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot perform distributed planning on this query"),
 						errdetail("Join in subqueries is not supported yet")));
+	}
+}
+
+
+/*
+ * ErrorIfSubqueryJoinWithoutPushdown errors out if the given query is a join query. Note that
+ * this function will not be required once we implement subquery joins.
+ */
+static void
+ErrorIfSubqueryJoinWithoutPushdown(Query *queryTree)
+{
+	List *joinTreeTableIndexList = NIL;
+	uint32 joiningRangeTableCount = 0;
+	ListCell *joinTreeIndexCell = NULL;
+	/*
+	 * Extract all range table indexes from the join tree. Note that sub-queries
+	 * that get pulled up by PostgreSQL don't appear in this join tree.
+	 */
+	ExtractRangeTableIndexWalker((Node*) queryTree->jointree, &joinTreeTableIndexList);
+	joiningRangeTableCount = list_length(joinTreeTableIndexList);
+
+	if (joiningRangeTableCount > 1)
+	{
+		foreach(joinTreeIndexCell, joinTreeTableIndexList)
+		{
+			int tableIndex  = lfirst_int(joinTreeIndexCell);
+			RangeTblEntry *rangeTableEntry = (RangeTblEntry *) list_nth(queryTree->rtable,
+																		tableIndex - 1);
+			if (rangeTableEntry->rtekind != RTE_RELATION)
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("cannot perform distributed planning on"
+									   " this query"),
+								errdetail("Only table joins are supported in "
+										  "subqueries")));
+			}
+		}
 	}
 }
 

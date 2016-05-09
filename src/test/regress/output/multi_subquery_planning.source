@@ -1,0 +1,1318 @@
+--
+-- MULTI_SUBQUERY
+--
+-- These tests check that we can pushdown supported subqueries. Here we also
+-- check that if subquery does not satisfy prerequisites we error out with the
+-- proper error message.
+CREATE TABLE lineitem_subquery (
+	l_orderkey bigint not null,
+	l_partkey integer not null,
+	l_suppkey integer not null,
+	l_linenumber integer not null,
+	l_quantity decimal(15, 2) not null,
+	l_extendedprice decimal(15, 2) not null,
+	l_discount decimal(15, 2) not null,
+	l_tax decimal(15, 2) not null,
+	l_returnflag char(1) not null,
+	l_linestatus char(1) not null,
+	l_shipdate date not null,
+	l_commitdate date not null,
+	l_receiptdate date not null,
+	l_shipinstruct char(25) not null,
+	l_shipmode char(10) not null,
+	l_comment varchar(44) not null,
+	PRIMARY KEY(l_orderkey, l_linenumber) );
+SELECT master_create_distributed_table('lineitem_subquery', 'l_orderkey', 'range');
+ master_create_distributed_table 
+---------------------------------
+ 
+(1 row)
+
+CREATE TABLE orders_subquery (
+	o_orderkey bigint not null,
+	o_custkey integer not null,
+	o_orderstatus char(1) not null,
+	o_totalprice decimal(15,2) not null,
+	o_orderdate date not null,
+	o_orderpriority char(15) not null,
+	o_clerk char(15) not null,
+	o_shippriority integer not null,
+	o_comment varchar(79) not null,
+	PRIMARY KEY(o_orderkey) );
+SELECT master_create_distributed_table('orders_subquery', 'o_orderkey', 'range');
+ master_create_distributed_table 
+---------------------------------
+ 
+(1 row)
+
+SET citus.task_executor_type TO 'real-time';
+SET citus.print_multiplan TO 'true';
+-- first check single table subquery planning no re-partition
+SELECT
+   *
+FROM (
+	SELECT
+	    o_orderkey, count(*)
+	FROM
+		orders
+	GROUP BY
+		o_orderkey) o
+ORDER BY 1 DESC
+LIMIT 10;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] {}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] {}}}}}}}}}}
+WARNING:  worker query : SELECT o_orderkey, count FROM (SELECT orders.o_orderkey, count(*) AS count FROM ONLY orders GROUP BY orders.o_orderkey) o ORDER BY o_orderkey DESC LIMIT '10'::bigint
+ o_orderkey | count 
+------------+-------
+      14946 |     1
+      14945 |     1
+      14944 |     1
+      14919 |     1
+      14918 |     1
+      14917 |     1
+      14916 |     1
+      14915 |     1
+      14914 |     1
+      14913 |     1
+(10 rows)
+
+-- Check that we don't crash if there are not any shards.
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  worker query : SELECT sum(unit_price) AS avg, count(unit_price) AS avg FROM (SELECT lineitem_subquery.l_orderkey, avg(orders_subquery.o_totalprice) AS unit_price FROM (ONLY lineitem_subquery JOIN ONLY orders_subquery ON ((lineitem_subquery.l_orderkey = orders_subquery.o_orderkey))) GROUP BY lineitem_subquery.l_orderkey) unit_prices
+ avg 
+-----
+    
+(1 row)
+
+-- Stage data to tables.
+SET citus.shard_max_size TO "1MB";
+\STAGE lineitem_subquery FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
+\STAGE lineitem_subquery FROM '@abs_srcdir@/data/lineitem.2.data' with delimiter '|'
+\STAGE orders_subquery FROM '@abs_srcdir@/data/orders.1.data' with delimiter '|'
+\STAGE orders_subquery FROM '@abs_srcdir@/data/orders.2.data' with delimiter '|'
+-- Check that we error out if shard min/max values are not exactly same.
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}
+ERROR:  cannot push down this subquery
+DETAIL:  Shards of relations in subquery need to have 1-to-1 shard partitioning
+-- Update metadata in order to make all shards equal.
+UPDATE pg_dist_shard SET shardmaxvalue = '14947' WHERE shardid = 102024;
+-- Check that we error out if join is not on partition columns.
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice / l_quantity) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	GROUP BY
+		l_orderkey) AS unit_prices;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1208 [MultiCartesianProduct] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}
+ERROR:  cannot push down this subquery
+DETAIL:  Relations need to be joining on partition columns
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice / l_quantity) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_custkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}
+ERROR:  cannot push down this subquery
+DETAIL:  Relations need to be joining on partition columns
+-- two table join no repartitioning
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  worker query : SELECT sum(unit_price) AS avg, count(unit_price) AS avg FROM (SELECT lineitem_subquery.l_orderkey, avg(orders_subquery.o_totalprice) AS unit_price FROM (ONLY lineitem_subquery JOIN ONLY orders_subquery ON ((lineitem_subquery.l_orderkey = orders_subquery.o_orderkey))) GROUP BY lineitem_subquery.l_orderkey) unit_prices
+           avg           
+-------------------------
+ 142172.8701273458445040
+(1 row)
+
+-- three way join
+SELECT
+	avg(unit_price),
+	avg(unit_price_2)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o.o_totalprice) AS unit_price,
+		avg(o2.o_totalprice) AS unit_price_2
+	FROM
+		lineitem_subquery l,
+		orders_subquery o,
+		orders_subquery o2
+	WHERE
+		l_orderkey = o.o_orderkey and l_orderkey = o2.o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1205 [MultiTable] {}}} , { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1205 [MultiTable] {}}} , { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  worker query : SELECT sum(unit_price) AS avg, count(unit_price) AS avg, sum(unit_price_2) AS avg, count(unit_price_2) AS avg FROM (SELECT l.l_orderkey, avg(o.o_totalprice) AS unit_price, avg(o2.o_totalprice) AS unit_price_2 FROM ((ONLY lineitem_subquery l JOIN ONLY orders_subquery o ON ((l.l_orderkey = o.o_orderkey))) JOIN ONLY orders_subquery o2 ON ((l.l_orderkey = o2.o_orderkey))) GROUP BY l.l_orderkey) unit_prices
+           avg           |           avg           
+-------------------------+-------------------------
+ 142172.8701273458445040 | 142172.8701273458445040
+(1 row)
+
+-- deeper nesting
+SELECT
+	avg(avg_partkey)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(avg_suppkey) as avg_partkey
+	FROM
+		(SELECT
+			l_orderkey,
+			l_partkey,
+			avg(avg_linenumber) as avg_suppkey
+		FROM
+			(SELECT
+				l_orderkey,
+				l_partkey,
+				l_suppkey,
+				avg(avg_quantity) avg_linenumber
+			FROM
+				(SELECT
+					l_orderkey,
+					l_partkey,
+					l_suppkey,
+					l_linenumber,
+					avg(l_quantity) as avg_quantity
+				FROM
+					lineitem_subquery
+				GROUP BY
+					l_orderkey,
+					l_partkey,
+					l_suppkey,
+					l_linenumber) as table_quantity
+			GROUP BY
+				l_orderkey,
+				l_partkey,
+				l_suppkey) as table_linenumber
+		GROUP BY
+			l_orderkey,
+			l_partkey) as table_partkey
+	GROUP BY
+		l_orderkey) as table_orderkey;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] {}}}}}}}}}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] {}}}}}}}}}}}}}}}}}}}
+WARNING:  worker query : SELECT sum(avg_partkey) AS avg, count(avg_partkey) AS avg FROM (SELECT table_partkey.l_orderkey, avg(table_partkey.avg_suppkey) AS avg_partkey FROM (SELECT table_linenumber.l_orderkey, table_linenumber.l_partkey, avg(table_linenumber.avg_linenumber) AS avg_suppkey FROM (SELECT table_quantity.l_orderkey, table_quantity.l_partkey, table_quantity.l_suppkey, avg(table_quantity.avg_quantity) AS avg_linenumber FROM (SELECT lineitem_subquery.l_orderkey, lineitem_subquery.l_partkey, lineitem_subquery.l_suppkey, lineitem_subquery.l_linenumber, avg(lineitem_subquery.l_quantity) AS avg_quantity FROM ONLY lineitem_subquery GROUP BY lineitem_subquery.l_orderkey, lineitem_subquery.l_partkey, lineitem_subquery.l_suppkey, lineitem_subquery.l_linenumber) table_quantity GROUP BY table_quantity.l_orderkey, table_quantity.l_partkey, table_quantity.l_suppkey) table_linenumber GROUP BY table_linenumber.l_orderkey, table_linenumber.l_partkey) table_partkey GROUP BY table_partkey.l_orderkey) table_orderkey
+           avg           
+-------------------------
+ 25.37601738852995134371
+(1 row)
+
+-- Multi table subquery with re-partitioning
+SELECT
+	avg(count_frequency)
+FROM
+	(SELECT
+		order_count,
+		count(order_count) AS count_frequency
+	FROM
+		(SELECT
+			l_orderkey,
+			count(*) AS order_count
+		FROM
+			lineitem_subquery,
+			orders_subquery
+		WHERE
+			l_orderkey = o_orderkey
+		GROUP BY
+			l_orderkey) AS first_query
+	GROUP BY
+		order_count) as second_query
+WHERE
+	count_frequency > 5;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1204 [MultiSelect] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1205 [MultiTable] {}}}}}}}}}}}}}}}}
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Subqueries with joins that need repartitioning are not supported yet
+-- Check that we error out if there is union all.
+SELECT count(*) FROM
+(
+   (SELECT l_orderkey FROM lineitem_subquery) UNION ALL
+   (SELECT 1::bigint)
+) b;
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Complex table expressions are currently unsupported
+-- Check that we error out if queries in union do not include partition columns.
+SELECT count(*) FROM
+(
+   (SELECT l_orderkey FROM lineitem_subquery) UNION
+   (SELECT l_partkey FROM lineitem_subquery)
+) b;
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Union, Intersect, or Except are currently unsupported
+-- Check that we run union queries if partition column is selected.
+SELECT count(*) FROM
+(
+   (SELECT l_orderkey FROM lineitem_subquery) UNION
+   (SELECT l_orderkey FROM lineitem_subquery)
+) b;
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Union, Intersect, or Except are currently unsupported
+-- Check that we error out if the outermost query has subquery join.
+SELECT
+	avg(o_totalprice/l_quantity)
+FROM
+		(SELECT
+			l_orderkey,
+			l_quantity
+		FROM
+			lineitem_subquery
+		ORDER BY
+			l_quantity
+		LIMIT 10
+		) lineitem_quantities
+	JOIN LATERAL
+		(SELECT
+			o_totalprice
+		FROM
+			orders_subquery
+		WHERE
+			lineitem_quantities.l_orderkey = o_orderkey) orders_price ON true;
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Only table joins are supported in subqueries
+-- Check that we error out if the outermost query is a distinct clause.
+SELECT
+	count(DISTINCT a)
+FROM (
+	SELECT
+		count(*) a
+	FROM
+		lineitem_subquery
+) z;
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Subqueries with aggregates by but no group by are not supported yet
+-- Check supported subquery types.
+SELECT
+	o_custkey,
+	sum(order_count) as order_count
+FROM
+	(SELECT
+		o_orderkey,
+		o_custkey,
+		count(*) AS order_count
+	FROM
+		orders_subquery
+	GROUP BY
+		o_orderkey, o_custkey) AS order_counts
+GROUP BY
+	o_custkey
+ORDER BY
+	order_count DESC,
+	o_custkey ASC
+LIMIT 10;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] {}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] {}}}}}}}}}}
+WARNING:  worker query : SELECT o_custkey, sum(order_count) AS order_count FROM (SELECT orders_subquery.o_orderkey, orders_subquery.o_custkey, count(*) AS order_count FROM ONLY orders_subquery GROUP BY orders_subquery.o_orderkey, orders_subquery.o_custkey) order_counts GROUP BY o_custkey
+ o_custkey | order_count 
+-----------+-------------
+        79 |          10
+       643 |          10
+      1348 |          10
+      1462 |          10
+       370 |           9
+       508 |           9
+       946 |           9
+       271 |           8
+       472 |           8
+       619 |           8
+(10 rows)
+
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice / l_quantity) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  worker query : SELECT sum(unit_price) AS avg, count(unit_price) AS avg FROM (SELECT lineitem_subquery.l_orderkey, avg((orders_subquery.o_totalprice / lineitem_subquery.l_quantity)) AS unit_price FROM (ONLY lineitem_subquery JOIN ONLY orders_subquery ON ((lineitem_subquery.l_orderkey = orders_subquery.o_orderkey))) GROUP BY lineitem_subquery.l_orderkey) unit_prices
+          avg           
+------------------------
+ 11074.2400858893455234
+(1 row)
+
+-- Check that if subquery is pulled, we don't error and run query properly.
+SELECT count(*) FROM
+(
+	SELECT l_orderkey FROM (
+		(SELECT l_orderkey FROM lineitem_subquery) UNION
+		(SELECT l_orderkey FROM lineitem_subquery)
+	) a
+	WHERE l_orderkey = 1
+) b;
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Union, Intersect, or Except are currently unsupported
+SELECT count(*) FROM
+(
+	SELECT * FROM (
+		(SELECT * FROM lineitem_subquery) UNION
+		(SELECT * FROM lineitem_subquery)
+	) a
+	WHERE l_orderkey = 1
+) b;
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Union, Intersect, or Except are currently unsupported
+SELECT max(l_orderkey) FROM
+(
+	SELECT l_orderkey FROM
+	(
+		SELECT
+			l_orderkey, count(*)
+		FROM
+			lineitem_subquery
+		WHERE
+			l_orderkey < 20000
+		GROUP BY
+			l_orderkey
+	) z
+) y;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  worker query : SELECT max(l_orderkey) AS max FROM (SELECT lineitem_subquery.l_orderkey, count(*) AS count FROM ONLY lineitem_subquery WHERE (lineitem_subquery.l_orderkey < 20000) GROUP BY lineitem_subquery.l_orderkey) z
+  max  
+-------
+ 14947
+(1 row)
+
+SELECT
+	*
+FROM
+	(SELECT
+		o_orderkey, o_custkey, o_totalprice, cnt, (o_totalprice / cnt) as avg_item_price
+	FROM
+		(SELECT
+			o_orderkey, o_custkey, o_totalprice, count(l_linenumber) cnt
+		FROM
+			lineitem_subquery l, orders_subquery o
+		WHERE
+			o_orderkey = l_orderkey and o_custkey > 1490
+		GROUP BY
+			o_orderkey, o_custkey, o_totalprice
+		) order_size
+	) avg_item_price;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1204 [MultiSelect] { 1205 [MultiTable] {}}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1205 [MultiTable] {}} , { 1204 [MultiSelect] { 1205 [MultiTable] {}}}}}}}}}}}}
+WARNING:  worker query : SELECT o_orderkey, o_custkey, o_totalprice, cnt, (o_totalprice / (cnt)::numeric) AS avg_item_price FROM (SELECT o.o_orderkey, o.o_custkey, o.o_totalprice, count(l.l_linenumber) AS cnt FROM (ONLY lineitem_subquery l JOIN ONLY orders_subquery o ON ((o.o_orderkey = l.l_orderkey))) WHERE (o.o_custkey > 1490) GROUP BY o.o_orderkey, o.o_custkey, o.o_totalprice) order_size
+ o_orderkey | o_custkey | o_totalprice | cnt |     avg_item_price     
+------------+-----------+--------------+-----+------------------------
+      11525 |      1495 |    169021.86 |   4 |     42255.465000000000
+      11783 |      1498 |     22953.13 |   2 | 11476.5650000000000000
+       9763 |      1492 |    132201.56 |   7 |     18885.937142857143
+      10724 |      1492 |    215958.98 |   4 |     53989.745000000000
+      13572 |      1498 |    115177.91 |   6 |     19196.318333333333
+      13504 |      1495 |    126515.95 |   4 |     31628.987500000000
+      11203 |      1498 |     84795.43 |   2 |     42397.715000000000
+      14497 |      1492 |    130424.80 |   4 |     32606.200000000000
+      12514 |      1495 |     38477.49 |   2 |     19238.745000000000
+       9762 |      1492 |    238951.03 |   6 |     39825.171666666667
+        448 |      1498 |    157247.56 |   5 |     31449.512000000000
+       3523 |      1499 |    179947.37 |   5 |     35989.474000000000
+       1607 |      1493 |    228124.53 |   5 |     45624.906000000000
+       1249 |      1498 |     70939.22 |   1 |     70939.220000000000
+       3396 |      1492 |    277647.09 |   7 |     39663.870000000000
+       4929 |      1492 |    198278.90 |   5 |     39655.780000000000
+       5796 |      1493 |     35978.09 |   1 |     35978.090000000000
+       3713 |      1498 |    315464.25 |   7 |     45066.321428571429
+       1953 |      1495 |     65277.06 |   2 |     32638.530000000000
+       3940 |      1495 |    180309.76 |   5 |     36061.952000000000
+       1155 |      1498 |    170273.99 |   5 |     34054.798000000000
+       3747 |      1492 |    258977.08 |   7 |     36996.725714285714
+       1252 |      1499 |    135540.70 |   5 |     27108.140000000000
+       1472 |      1499 |     72730.13 |   3 |     24243.376666666667
+       3395 |      1496 |    180443.18 |   4 |     45110.795000000000
+(25 rows)
+
+-- Load more data to one relation, then test if we error out because of different
+-- shard counts for joining relations.
+\STAGE orders_subquery FROM '@abs_srcdir@/data/orders.1.data' with delimiter '|'
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice / l_quantity) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}
+ERROR:  cannot push down this subquery
+DETAIL:  Shards of relations in subquery need to have 1-to-1 shard partitioning
+-- Create metadata to test if Heap queries work properly.
+CREATE TYPE heap_composite_type AS
+(
+	app_id BIGINT,
+	user_id BIGINT
+);
+CREATE TABLE events (
+	heap_id heap_composite_type,
+	event_id bigint,
+	type character varying(255),
+	"time" bigint
+);
+SELECT master_create_distributed_table('events', 'heap_id', 'range');
+ master_create_distributed_table 
+---------------------------------
+ 
+(1 row)
+
+CREATE TABLE users (
+	heap_id heap_composite_type,
+	lastseen bigint
+);
+SELECT master_create_distributed_table('users', 'heap_id', 'range');
+ master_create_distributed_table 
+---------------------------------
+ 
+(1 row)
+
+INSERT INTO pg_dist_shard (logicalrelid, shardid, shardstorage, shardminvalue, shardmaxvalue)
+	VALUES('events'::regclass, 300, 't', '(1,1)', '(1,2000000000)'),
+		  ('events'::regclass, 301, 't', '(1,2000000001)', '(1,4300000000)'),
+		  ('events'::regclass, 302, 't', '(2,1)', '(2,2000000000)'),
+		  ('events'::regclass, 303, 't', '(2,2000000001)', '(2,4300000000)'),
+		  ('users'::regclass, 304, 't', '(1,1)', '(1,2000000000)'),
+		  ('users'::regclass, 305, 't', '(1,2000000001)', '(1,4300000000)'),
+		  ('users'::regclass, 306, 't', '(2,1)', '(2,2000000000)'),
+		  ('users'::regclass, 307, 't', '(2,2000000001)', '(2,4300000000)');
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 300, 1, 2, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 301, 1, 2, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 302, 1, 2, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 303, 1, 2, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 304, 1, 1, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 305, 1, 1, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 306, 1, 1, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 307, 1, 1, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+SET client_min_messages TO DEBUG4;
+DEBUG:  CommitTransactionCommand
+DEBUG:  CommitTransaction
+DEBUG:  name: unnamed; blockState:       STARTED; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+-- Vanilla funnel query.
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg
+FROM
+	(SELECT
+		heap_id,
+		array_agg(event ORDER BY time) AS events
+	FROM
+		(SELECT
+			u.heap_id,
+			type AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			u.heap_id = e.heap_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type IN ('click', 'focus', 'submit')) t
+	GROUP BY
+		heap_id) q;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+DEBUG:  ProcessUtility
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1204 [MultiSelect] { 1205 [MultiTable] {}}} , { 1204 [MultiSelect] { 1205 [MultiTable] {}}}}}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1206 [MultiJoin] { 1204 [MultiSelect] { 1205 [MultiTable] {}}} , { 1204 [MultiSelect] { 1205 [MultiTable] {}}}}}}}}}}}}}}}
+WARNING:  worker query : SELECT sum(array_ndims(events)) AS dimension_avg, count(array_ndims(events)) AS dimension_avg FROM (SELECT t.heap_id, array_agg(t.event ORDER BY t."time") AS events FROM (SELECT u.heap_id, e.type AS event, e."time" FROM (ONLY users u JOIN ONLY events e ON ((u.heap_id = e.heap_id))) WHERE (u.heap_id >= '(1,-9223372036854775808)'::heap_composite_type), (u.heap_id <= '(1,9223372036854775807)'::heap_composite_type), ((e.type)::text = ANY ('{click,focus,submit}'::text[]))) t GROUP BY t.heap_id) q
+DEBUG:  predicate pruning for shardId 306
+DEBUG:  predicate pruning for shardId 307
+DEBUG:  join prunable for intervals [(1,1),(1,2000000000)] and [(1,2000000001),(1,4300000000)]
+DEBUG:  join prunable for intervals [(1,1),(1,2000000000)] and [(2,1),(2,2000000000)]
+DEBUG:  join prunable for intervals [(1,1),(1,2000000000)] and [(2,2000000001),(2,4300000000)]
+DEBUG:  join prunable for intervals [(1,2000000001),(1,4300000000)] and [(1,1),(1,2000000000)]
+DEBUG:  join prunable for intervals [(1,2000000001),(1,4300000000)] and [(2,1),(2,2000000000)]
+DEBUG:  join prunable for intervals [(1,2000000001),(1,4300000000)] and [(2,2000000001),(2,4300000000)]
+DEBUG:  generated sql query for job 30 and task 3
+DETAIL:  query string: "SELECT sum(array_ndims(events)) AS dimension_avg, count(array_ndims(events)) AS dimension_avg FROM (SELECT t.heap_id, array_agg(t.event ORDER BY t."time") AS events FROM (SELECT u.heap_id, e.type AS event, e."time" FROM (users_304 u JOIN events_300 e ON ((u.heap_id = e.heap_id))) WHERE ((u.heap_id >= '(1,-9223372036854775808)'::heap_composite_type) AND (u.heap_id <= '(1,9223372036854775807)'::heap_composite_type) AND ((e.type)::text = ANY ('{click,focus,submit}'::text[])))) t GROUP BY t.heap_id) q"
+DEBUG:  generated sql query for job 30 and task 6
+DETAIL:  query string: "SELECT sum(array_ndims(events)) AS dimension_avg, count(array_ndims(events)) AS dimension_avg FROM (SELECT t.heap_id, array_agg(t.event ORDER BY t."time") AS events FROM (SELECT u.heap_id, e.type AS event, e."time" FROM (users_305 u JOIN events_301 e ON ((u.heap_id = e.heap_id))) WHERE ((u.heap_id >= '(1,-9223372036854775808)'::heap_composite_type) AND (u.heap_id <= '(1,9223372036854775807)'::heap_composite_type) AND ((e.type)::text = ANY ('{click,focus,submit}'::text[])))) t GROUP BY t.heap_id) q"
+DEBUG:  assigned task 3 to node localhost:57637
+DEBUG:  assigned task 6 to node localhost:57637
+WARNING:  could not receive query results from localhost:57637
+DETAIL:  Client error: relation "users_304" does not exist
+DEBUG:  CommitTransactionCommand
+DEBUG:  CommitTransaction
+DEBUG:  name: unnamed; blockState:       STARTED; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+                                 QUERY PLAN                                  
+-----------------------------------------------------------------------------
+ Distributed Query into pg_merge_job_0011
+   Executor: Real-Time
+   Task Count: 2
+   Tasks Shown: One of 2
+   ->  Task
+         Error: Could not get remote plan.
+ Master Query
+   ->  Aggregate  (cost=0.01..0.02 rows=1 width=0)
+         ->  Seq Scan on pg_merge_job_0011  (cost=0.00..0.00 rows=0 width=0)
+(9 rows)
+
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg
+FROM
+	(SELECT
+		app_id,
+		user_id,
+		array_agg(event ORDER BY time) AS events
+	FROM
+		(SELECT
+			(u.heap_id).app_id,
+			(u.heap_id).user_id,
+			type AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			(u.heap_id).app_id = (e.heap_id).app_id AND
+			(u.heap_id).user_id = (e.heap_id).user_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type IN ('click', 'focus', 'submit')) t
+	GROUP BY
+		app_id,
+		user_id) q;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+DEBUG:  ProcessUtility
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1206 [MultiJoin] { 1203 [MultiCollect] { 1205 [MultiTable] {}}} , { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}}}}}}
+ERROR:  cannot push down this subquery
+DETAIL:  Relations need to be joining on partition columns
+-- Funnel query grouped by whether or not a user has done an event.
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg,
+	hasdone
+FROM
+	(SELECT
+		t1.heap_id,
+		array_agg(event ORDER BY time) AS events,
+		COALESCE(hasdone, 'Has not done view_page_billing_page_paypal') AS hasdone
+	FROM
+	(
+		(SELECT
+			u.heap_id,
+			'step=>1'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			u.heap_id = e.heap_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'click')
+		UNION
+		(SELECT
+			u.heap_id,
+			'step=>2'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			u.heap_id = e.heap_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'focus')
+	) t1
+	LEFT JOIN
+		(SELECT
+			DISTINCT ON (heap_id) heap_id,
+			'Has done view_page_billing_page_paypal'::TEXT AS hasdone
+		FROM
+			events AS e
+		WHERE
+			e.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			e.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'submit') t2
+	ON
+		t1.heap_id = t2.heap_id
+	GROUP BY
+		t1.heap_id,
+		hasdone) t
+GROUP BY
+	hasdone;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+DEBUG:  ProcessUtility
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Only table joins are supported in subqueries
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg,
+	hasdone
+FROM
+	(SELECT
+		t1.app_id,
+		t1.user_id,
+		array_agg(event ORDER BY time) AS events,
+		COALESCE(hasdone, 'Has not done view_page_billing_page_paypal') AS hasdone
+	FROM
+	(
+		(SELECT
+			(u.heap_id).app_id,
+			(u.heap_id).user_id,
+			'step=>1'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			(u.heap_id).app_id = (e.heap_id).app_id AND
+			(u.heap_id).user_id = (e.heap_id).user_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'click')
+		UNION
+		(SELECT
+			(u.heap_id).app_id,
+			(u.heap_id).user_id,
+			'step=>2'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			(u.heap_id).app_id = (e.heap_id).app_id AND
+			(u.heap_id).user_id = (e.heap_id).user_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'focus')
+	) t1
+	LEFT JOIN
+		(SELECT
+			DISTINCT ON ((heap_id).app_id, (heap_id).user_id) heap_id,
+			(heap_id).app_id,
+			(heap_id).user_id,
+			'Has done view_page_billing_page_paypal'::TEXT AS hasdone
+		FROM
+			events AS e
+		WHERE
+			e.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			e.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'submit') t2
+	ON
+		t1.app_id = t2.app_id AND
+		t1.user_id = t2.user_id
+	GROUP BY
+		t1.app_id,
+		t1.user_id,
+		hasdone) t
+GROUP BY
+	hasdone;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+DEBUG:  ProcessUtility
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Only table joins are supported in subqueries
+-- Funnel query with grouped by the number of times a user has done an event.
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg,
+	count_submit
+	FROM (
+  SELECT
+	t1.heap_id,
+	array_agg(event ORDER BY time) AS events,
+	COALESCE(count_submit, 0) AS count_submit
+  FROM
+	(
+		(SELECT
+			u.heap_id,
+			'step=>1'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			u.heap_id = e.heap_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'click')
+		UNION
+		(SELECT
+			u.heap_id,
+			'step=>2'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			u.heap_id = e.heap_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'focus')
+	) t1
+	LEFT JOIN
+		(SELECT
+			heap_id,
+			COUNT(*) AS count_submit
+		FROM
+			events AS e
+		WHERE
+			e.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			e.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'submit'
+		GROUP BY
+			heap_id
+		HAVING
+			COUNT(*) > 2) t2
+	ON
+		t1.heap_id = t2.heap_id
+	GROUP BY
+		t1.heap_id,
+		count_submit) t
+WHERE
+	array_ndims(events) > 0
+GROUP BY
+	count_submit
+ORDER BY
+	count_submit;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+DEBUG:  ProcessUtility
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Only table joins are supported in subqueries
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg,
+	count_submit
+	FROM (
+  SELECT
+	t1.app_id,
+	t1.user_id,
+	array_agg(event ORDER BY time) AS events,
+	COALESCE(count_submit, 0) AS count_submit
+  FROM
+	(
+		(SELECT
+			(u.heap_id).app_id,
+			(u.heap_id).user_id,
+			'step=>1'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			(u.heap_id).app_id = (e.heap_id).app_id AND
+			(u.heap_id).user_id = (e.heap_id).user_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'click')
+		UNION
+		(SELECT
+			(u.heap_id).app_id,
+			(u.heap_id).user_id,
+			'step=>2'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			(u.heap_id).app_id = (e.heap_id).app_id AND
+			(u.heap_id).user_id = (e.heap_id).user_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'focus')
+	) t1
+	LEFT JOIN
+		(SELECT
+			(heap_id).app_id,
+			(heap_id).user_id,
+			COUNT(*) AS count_submit
+		FROM
+			events AS e
+		WHERE
+			e.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			e.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'submit'
+		GROUP BY
+			app_id,
+			user_id
+		HAVING
+			COUNT(*) > 2) t2
+	ON
+		t1.app_id = t2.app_id AND
+		t1.user_id = t2.user_id
+	GROUP BY
+		t1.app_id,
+		t1.user_id,
+		count_submit) t
+WHERE
+	array_ndims(events) > 0
+GROUP BY
+	count_submit
+ORDER BY
+	count_submit;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+DEBUG:  ProcessUtility
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Only table joins are supported in subqueries
+-- List view query.
+EXPLAIN SELECT
+	heap_id,
+	user_lastseen,
+	event_array
+FROM
+	(SELECT
+		heap_id,
+		max(lastseen) as user_lastseen,
+		array_agg(type ORDER BY time) AS event_array
+	FROM
+		(SELECT
+			heap_id,
+			lastseen
+		FROM
+			users
+		WHERE
+			heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			heap_id <= '(1, 9223372036854775807)'::heap_composite_type
+		ORDER BY
+			lastseen DESC
+		LIMIT
+			10
+		) u
+		LEFT JOIN LATERAL
+			(SELECT
+				type,
+				time
+			FROM
+				events
+			WHERE
+				heap_id = u.heap_id
+			ORDER BY
+				time DESC
+			LIMIT
+				99) t
+		ON
+			true
+		GROUP BY
+			heap_id
+	) AS shard_union
+ORDER BY
+	user_lastseen DESC
+LIMIT
+	10;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+DEBUG:  ProcessUtility
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Only table joins are supported in subqueries
+EXPLAIN SELECT
+	app_id,
+	user_id,
+	user_lastseen,
+	event_array
+FROM
+	(SELECT
+		app_id,
+		user_id,
+		max(lastseen) as user_lastseen,
+		array_agg(type ORDER BY time) AS event_array
+	FROM
+		(SELECT
+			(heap_id).app_id,
+			(heap_id).user_id,
+			lastseen
+		FROM
+			users
+		WHERE
+			heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			heap_id <= '(1, 9223372036854775807)'::heap_composite_type
+		ORDER BY
+			lastseen DESC
+		LIMIT
+			10
+		) u
+		LEFT JOIN LATERAL
+			(SELECT
+				type,
+				time
+			FROM
+				events
+			WHERE
+				(heap_id).app_id = u.app_id AND
+				(heap_id).user_id = u.user_id
+			ORDER BY
+				time DESC
+			LIMIT
+				99) t
+		ON
+			true
+		GROUP BY
+			app_id,
+		user_id
+	) AS shard_union
+ORDER BY
+	user_lastseen DESC
+LIMIT
+	10;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+DEBUG:  ProcessUtility
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Only table joins are supported in subqueries
+-- single table repartition query
+select
+    number_sum,
+    count(*) as total,
+    avg(total_count) avg_count
+from
+    (select
+        l_suppkey,
+        l_linestatus,
+        sum(l_linenumber) as number_sum,
+        count(*) as total_count
+    from
+        lineitem_subquery
+    group by
+        l_suppkey,
+        l_linestatus) as distributed_table
+where
+    number_sum >= 10
+group by
+    number_sum
+order by
+    total desc,
+    number_sum desc
+limit 10;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1204 [MultiSelect] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1202 [MultiProject] { 1205 [MultiTable] {}}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1204 [MultiSelect] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1207 [MultiPartition] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] {}}}}}}}}}}}}}}
+WARNING:  map merge job query : SELECT l_suppkey, l_linestatus, sum(l_linenumber) AS number_sum, count(*) AS total_count FROM ONLY lineitem_subquery GROUP BY l_suppkey, l_linestatus
+WARNING:  worker query : SELECT intermediate_column_31_2 AS number_sum, count(*) AS total, sum(intermediate_column_31_3) AS avg_count, count(intermediate_column_31_3) AS avg_count FROM (ONLY (null)) WHERE (intermediate_column_31_2 >= 10) GROUP BY intermediate_column_31_2
+DEBUG:  generated sql query for job 31 and task 2
+DETAIL:  query string: "SELECT l_suppkey, l_linestatus, sum(l_linenumber) AS number_sum, count(*) AS total_count FROM lineitem_subquery_102022 lineitem_subquery WHERE true GROUP BY l_suppkey, l_linestatus"
+DEBUG:  generated sql query for job 31 and task 4
+DETAIL:  query string: "SELECT l_suppkey, l_linestatus, sum(l_linenumber) AS number_sum, count(*) AS total_count FROM lineitem_subquery_102021 lineitem_subquery WHERE true GROUP BY l_suppkey, l_linestatus"
+DEBUG:  assigned task 2 to node localhost:57637
+DEBUG:  assigned task 4 to node localhost:57638
+DEBUG:  generated sql query for job 32 and task 2
+DETAIL:  query string: "SELECT intermediate_column_31_2 AS number_sum, count(*) AS total, sum(intermediate_column_31_3) AS avg_count, count(intermediate_column_31_3) AS avg_count FROM pg_merge_job_0031.task_000005 "pg_merge_job_0031.task_000005" WHERE (intermediate_column_31_2 >= 10) GROUP BY intermediate_column_31_2"
+DEBUG:  generated sql query for job 32 and task 4
+DETAIL:  query string: "SELECT intermediate_column_31_2 AS number_sum, count(*) AS total, sum(intermediate_column_31_3) AS avg_count, count(intermediate_column_31_3) AS avg_count FROM pg_merge_job_0031.task_000008 "pg_merge_job_0031.task_000008" WHERE (intermediate_column_31_2 >= 10) GROUP BY intermediate_column_31_2"
+DEBUG:  generated sql query for job 32 and task 6
+DETAIL:  query string: "SELECT intermediate_column_31_2 AS number_sum, count(*) AS total, sum(intermediate_column_31_3) AS avg_count, count(intermediate_column_31_3) AS avg_count FROM pg_merge_job_0031.task_000011 "pg_merge_job_0031.task_000011" WHERE (intermediate_column_31_2 >= 10) GROUP BY intermediate_column_31_2"
+DEBUG:  generated sql query for job 32 and task 8
+DETAIL:  query string: "SELECT intermediate_column_31_2 AS number_sum, count(*) AS total, sum(intermediate_column_31_3) AS avg_count, count(intermediate_column_31_3) AS avg_count FROM pg_merge_job_0031.task_000014 "pg_merge_job_0031.task_000014" WHERE (intermediate_column_31_2 >= 10) GROUP BY intermediate_column_31_2"
+DEBUG:  pruning merge fetch taskId 1
+DETAIL:  Creating dependency on merge taskId 5
+DEBUG:  pruning merge fetch taskId 3
+DETAIL:  Creating dependency on merge taskId 8
+DEBUG:  pruning merge fetch taskId 5
+DETAIL:  Creating dependency on merge taskId 11
+DEBUG:  pruning merge fetch taskId 7
+DETAIL:  Creating dependency on merge taskId 14
+DEBUG:  assigned task 2 to node localhost:57637
+DEBUG:  assigned task 4 to node localhost:57638
+DEBUG:  assigned task 6 to node localhost:57637
+DEBUG:  assigned task 8 to node localhost:57638
+ERROR:  cannot use real time executor with repartition jobs
+HINT:  Set task_executor_type to "task-tracker".
+-- 3 level subquery with repartition
+select
+    total,
+    avg(avg_count) as total_avg_count
+from
+    (select
+        number_sum,
+        count(*) as total,
+        avg(total_count) avg_count
+    from
+        (select
+            l_suppkey,
+            sum(l_linenumber) as number_sum,
+            count(*) as total_count
+        from
+            lineitem_subquery
+        where
+            l_partkey > 100 and
+            l_quantity > 2 and
+            l_orderkey < 10000
+        group by
+            l_suppkey) as distributed_table
+    where
+        number_sum >= 10
+    group by
+        number_sum) as distributed_table_2
+group by
+    total
+order by
+    total;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1202 [MultiProject] { 1204 [MultiSelect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1202 [MultiProject] { 1204 [MultiSelect] { 1205 [MultiTable] {}}}}}}}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1207 [MultiPartition] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1207 [MultiPartition] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1204 [MultiSelect] { 1205 [MultiTable] {}}}}}}}}}}}}}}}}}}}}}
+WARNING:  map merge job query : SELECT l_suppkey, sum(l_linenumber) AS number_sum, count(*) AS total_count FROM ONLY lineitem_subquery WHERE (l_partkey > 100), (l_quantity > 2::numeric), (l_orderkey < 10000) GROUP BY l_suppkey
+WARNING:  map merge job query : SELECT intermediate_column_33_1 AS number_sum, count(*) AS total, sum(intermediate_column_33_2) AS avg_count, count(intermediate_column_33_2) AS avg_count FROM (ONLY (null)) WHERE (intermediate_column_33_1 >= 10) GROUP BY intermediate_column_33_1
+WARNING:  worker query : SELECT intermediate_column_34_1 AS total, sum(intermediate_column_34_2) AS total_avg_count, count(intermediate_column_34_2) AS total_avg_count FROM (ONLY (null)) GROUP BY intermediate_column_34_1
+DEBUG:  generated sql query for job 33 and task 2
+DETAIL:  query string: "SELECT l_suppkey, sum(l_linenumber) AS number_sum, count(*) AS total_count FROM lineitem_subquery_102022 lineitem_subquery WHERE ((l_partkey > 100) AND (l_quantity > 2::numeric) AND (l_orderkey < 10000)) GROUP BY l_suppkey"
+DEBUG:  generated sql query for job 33 and task 4
+DETAIL:  query string: "SELECT l_suppkey, sum(l_linenumber) AS number_sum, count(*) AS total_count FROM lineitem_subquery_102021 lineitem_subquery WHERE ((l_partkey > 100) AND (l_quantity > 2::numeric) AND (l_orderkey < 10000)) GROUP BY l_suppkey"
+DEBUG:  assigned task 2 to node localhost:57637
+DEBUG:  assigned task 4 to node localhost:57638
+DEBUG:  generated sql query for job 34 and task 2
+DETAIL:  query string: "SELECT intermediate_column_33_1 AS number_sum, count(*) AS total, sum(intermediate_column_33_2) AS avg_count, count(intermediate_column_33_2) AS avg_count FROM pg_merge_job_0033.task_000005 "pg_merge_job_0033.task_000005" WHERE (intermediate_column_33_1 >= 10) GROUP BY intermediate_column_33_1"
+DEBUG:  generated sql query for job 34 and task 4
+DETAIL:  query string: "SELECT intermediate_column_33_1 AS number_sum, count(*) AS total, sum(intermediate_column_33_2) AS avg_count, count(intermediate_column_33_2) AS avg_count FROM pg_merge_job_0033.task_000008 "pg_merge_job_0033.task_000008" WHERE (intermediate_column_33_1 >= 10) GROUP BY intermediate_column_33_1"
+DEBUG:  generated sql query for job 34 and task 6
+DETAIL:  query string: "SELECT intermediate_column_33_1 AS number_sum, count(*) AS total, sum(intermediate_column_33_2) AS avg_count, count(intermediate_column_33_2) AS avg_count FROM pg_merge_job_0033.task_000011 "pg_merge_job_0033.task_000011" WHERE (intermediate_column_33_1 >= 10) GROUP BY intermediate_column_33_1"
+DEBUG:  generated sql query for job 34 and task 8
+DETAIL:  query string: "SELECT intermediate_column_33_1 AS number_sum, count(*) AS total, sum(intermediate_column_33_2) AS avg_count, count(intermediate_column_33_2) AS avg_count FROM pg_merge_job_0033.task_000014 "pg_merge_job_0033.task_000014" WHERE (intermediate_column_33_1 >= 10) GROUP BY intermediate_column_33_1"
+DEBUG:  pruning merge fetch taskId 1
+DETAIL:  Creating dependency on merge taskId 5
+DEBUG:  pruning merge fetch taskId 3
+DETAIL:  Creating dependency on merge taskId 8
+DEBUG:  pruning merge fetch taskId 5
+DETAIL:  Creating dependency on merge taskId 11
+DEBUG:  pruning merge fetch taskId 7
+DETAIL:  Creating dependency on merge taskId 14
+DEBUG:  assigned task 2 to node localhost:57637
+DEBUG:  assigned task 4 to node localhost:57638
+DEBUG:  assigned task 6 to node localhost:57637
+DEBUG:  assigned task 8 to node localhost:57638
+DEBUG:  generated sql query for job 35 and task 2
+DETAIL:  query string: "SELECT intermediate_column_34_1 AS total, sum(intermediate_column_34_2) AS total_avg_count, count(intermediate_column_34_2) AS total_avg_count FROM pg_merge_job_0034.task_000009 "pg_merge_job_0034.task_000009" WHERE true GROUP BY intermediate_column_34_1"
+DEBUG:  generated sql query for job 35 and task 4
+DETAIL:  query string: "SELECT intermediate_column_34_1 AS total, sum(intermediate_column_34_2) AS total_avg_count, count(intermediate_column_34_2) AS total_avg_count FROM pg_merge_job_0034.task_000014 "pg_merge_job_0034.task_000014" WHERE true GROUP BY intermediate_column_34_1"
+DEBUG:  generated sql query for job 35 and task 6
+DETAIL:  query string: "SELECT intermediate_column_34_1 AS total, sum(intermediate_column_34_2) AS total_avg_count, count(intermediate_column_34_2) AS total_avg_count FROM pg_merge_job_0034.task_000019 "pg_merge_job_0034.task_000019" WHERE true GROUP BY intermediate_column_34_1"
+DEBUG:  generated sql query for job 35 and task 8
+DETAIL:  query string: "SELECT intermediate_column_34_1 AS total, sum(intermediate_column_34_2) AS total_avg_count, count(intermediate_column_34_2) AS total_avg_count FROM pg_merge_job_0034.task_000024 "pg_merge_job_0034.task_000024" WHERE true GROUP BY intermediate_column_34_1"
+DEBUG:  pruning merge fetch taskId 1
+DETAIL:  Creating dependency on merge taskId 9
+DEBUG:  pruning merge fetch taskId 3
+DETAIL:  Creating dependency on merge taskId 14
+DEBUG:  pruning merge fetch taskId 5
+DETAIL:  Creating dependency on merge taskId 19
+DEBUG:  pruning merge fetch taskId 7
+DETAIL:  Creating dependency on merge taskId 24
+DEBUG:  assigned task 2 to node localhost:57638
+DEBUG:  assigned task 4 to node localhost:57637
+DEBUG:  assigned task 6 to node localhost:57638
+DEBUG:  assigned task 8 to node localhost:57637
+ERROR:  cannot use real time executor with repartition jobs
+HINT:  Set task_executor_type to "task-tracker".
+-- Check that we support subquery even though group by clause is an expression
+-- and it is not referred in the target list.
+select
+    avg(count)
+from
+    (select
+        l_suppkey,
+        count(*) as count
+    from
+        lineitem_subquery
+    group by
+        (l_orderkey/4)::int,
+        l_suppkey )  as distributed_table;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1203 [MultiCollect] { 1205 [MultiTable] {}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1202 [MultiProject] { 1205 [MultiTable] {}}}}}}}}}}}
+WARNING:  { 1201 [MultiTreeRoot] { 1209 [MultiExtendedOp] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] { 1209 [MultiExtendedOp] { 1207 [MultiPartition] { 1203 [MultiCollect] { 1209 [MultiExtendedOp] { 1202 [MultiProject] { 1205 [MultiTable] {}}}}}}}}}}}}}
+WARNING:  map merge job query : SELECT l_suppkey, count(*) AS count, ((l_orderkey / 4))::integer AS worker_column_3 FROM ONLY lineitem_subquery GROUP BY ((l_orderkey / 4))::integer, l_suppkey
+WARNING:  worker query : SELECT sum(intermediate_column_36_1) AS avg, count(intermediate_column_36_1) AS avg FROM (ONLY (null))
+DEBUG:  generated sql query for job 36 and task 2
+DETAIL:  query string: "SELECT l_suppkey, count(*) AS count, ((l_orderkey / 4))::integer AS worker_column_3 FROM lineitem_subquery_102022 lineitem_subquery WHERE true GROUP BY ((l_orderkey / 4))::integer, l_suppkey"
+DEBUG:  generated sql query for job 36 and task 4
+DETAIL:  query string: "SELECT l_suppkey, count(*) AS count, ((l_orderkey / 4))::integer AS worker_column_3 FROM lineitem_subquery_102021 lineitem_subquery WHERE true GROUP BY ((l_orderkey / 4))::integer, l_suppkey"
+DEBUG:  assigned task 2 to node localhost:57637
+DEBUG:  assigned task 4 to node localhost:57638
+DEBUG:  generated sql query for job 37 and task 2
+DETAIL:  query string: "SELECT sum(intermediate_column_36_1) AS avg, count(intermediate_column_36_1) AS avg FROM pg_merge_job_0036.task_000005 "pg_merge_job_0036.task_000005" WHERE true"
+DEBUG:  generated sql query for job 37 and task 4
+DETAIL:  query string: "SELECT sum(intermediate_column_36_1) AS avg, count(intermediate_column_36_1) AS avg FROM pg_merge_job_0036.task_000008 "pg_merge_job_0036.task_000008" WHERE true"
+DEBUG:  generated sql query for job 37 and task 6
+DETAIL:  query string: "SELECT sum(intermediate_column_36_1) AS avg, count(intermediate_column_36_1) AS avg FROM pg_merge_job_0036.task_000011 "pg_merge_job_0036.task_000011" WHERE true"
+DEBUG:  generated sql query for job 37 and task 8
+DETAIL:  query string: "SELECT sum(intermediate_column_36_1) AS avg, count(intermediate_column_36_1) AS avg FROM pg_merge_job_0036.task_000014 "pg_merge_job_0036.task_000014" WHERE true"
+DEBUG:  pruning merge fetch taskId 1
+DETAIL:  Creating dependency on merge taskId 5
+DEBUG:  pruning merge fetch taskId 3
+DETAIL:  Creating dependency on merge taskId 8
+DEBUG:  pruning merge fetch taskId 5
+DETAIL:  Creating dependency on merge taskId 11
+DEBUG:  pruning merge fetch taskId 7
+DETAIL:  Creating dependency on merge taskId 14
+DEBUG:  assigned task 2 to node localhost:57638
+DEBUG:  assigned task 4 to node localhost:57637
+DEBUG:  assigned task 6 to node localhost:57638
+DEBUG:  assigned task 8 to node localhost:57637
+ERROR:  cannot use real time executor with repartition jobs
+HINT:  Set task_executor_type to "task-tracker".
+-- Check that we don't support subqueries with limit.
+select
+    l_suppkey,
+    sum(suppkey_count) as total_suppkey_count
+from
+    (select
+        l_suppkey,
+        count(*) as suppkey_count
+    from
+        lineitem_subquery
+    group by
+        l_suppkey
+    order by
+        l_suppkey
+    limit 100) as distributed_table
+group by
+    l_suppkey;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Subqueries with limit are not supported yet
+-- Check that we don't support subqueries without aggregates.
+select
+    rounded_tax
+from
+    (select
+        round(l_tax) as rounded_tax
+    from
+        lineitem_subquery
+    group by
+        l_tax) as distributed_table;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Subqueries with group by but no aggregates are not supported yet
+SET citus.task_executor_type TO 'real-time';
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+DEBUG:  ProcessUtility
+DEBUG:  CommitTransactionCommand
+DEBUG:  CommitTransaction
+DEBUG:  name: unnamed; blockState:       STARTED; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+SET client_min_messages TO NOTICE;
+DEBUG:  StartTransactionCommand
+DEBUG:  StartTransaction
+DEBUG:  name: unnamed; blockState:       DEFAULT; state: INPROGR, xid/subid/cid: 0/1/0, nestlvl: 1, children: 
+DEBUG:  ProcessUtility

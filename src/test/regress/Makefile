@@ -49,6 +49,10 @@ check-multi: all tempinstall-main
 	$(pg_regress_multi_check) --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule $(EXTRA_TESTS)
 
+check-sub: all tempinstall-main
+	$(pg_regress_multi_check) --load-extension=citus \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_subquery $(EXTRA_TESTS)
+
 check-multi-fdw: all tempinstall-main
 	$(pg_regress_multi_check) --load-extension=citus --load-extension=file_fdw -- \
 	$(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_fdw_schedule $(EXTRA_TESTS)

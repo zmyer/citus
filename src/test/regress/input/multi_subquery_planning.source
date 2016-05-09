@@ -1,0 +1,1004 @@
+--
+-- MULTI_SUBQUERY
+--
+
+-- These tests check that we can pushdown supported subqueries. Here we also
+-- check that if subquery does not satisfy prerequisites we error out with the
+-- proper error message.
+
+CREATE TABLE lineitem_subquery (
+	l_orderkey bigint not null,
+	l_partkey integer not null,
+	l_suppkey integer not null,
+	l_linenumber integer not null,
+	l_quantity decimal(15, 2) not null,
+	l_extendedprice decimal(15, 2) not null,
+	l_discount decimal(15, 2) not null,
+	l_tax decimal(15, 2) not null,
+	l_returnflag char(1) not null,
+	l_linestatus char(1) not null,
+	l_shipdate date not null,
+	l_commitdate date not null,
+	l_receiptdate date not null,
+	l_shipinstruct char(25) not null,
+	l_shipmode char(10) not null,
+	l_comment varchar(44) not null,
+	PRIMARY KEY(l_orderkey, l_linenumber) );
+
+SELECT master_create_distributed_table('lineitem_subquery', 'l_orderkey', 'range');
+
+CREATE TABLE orders_subquery (
+	o_orderkey bigint not null,
+	o_custkey integer not null,
+	o_orderstatus char(1) not null,
+	o_totalprice decimal(15,2) not null,
+	o_orderdate date not null,
+	o_orderpriority char(15) not null,
+	o_clerk char(15) not null,
+	o_shippriority integer not null,
+	o_comment varchar(79) not null,
+	PRIMARY KEY(o_orderkey) );
+
+SELECT master_create_distributed_table('orders_subquery', 'o_orderkey', 'range');
+
+SET citus.task_executor_type TO 'real-time';
+SET citus.print_multiplan TO 'true';
+
+-- first check single table subquery planning no re-partition
+
+SELECT
+   *
+FROM (
+	SELECT
+	    o_orderkey, count(*)
+	FROM
+		orders
+	GROUP BY
+		o_orderkey) o
+ORDER BY 1 DESC
+LIMIT 10;
+
+-- Check that we don't crash if there are not any shards.
+
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+
+-- Stage data to tables.
+
+SET citus.shard_max_size TO "1MB";
+
+\STAGE lineitem_subquery FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
+\STAGE lineitem_subquery FROM '@abs_srcdir@/data/lineitem.2.data' with delimiter '|'
+
+\STAGE orders_subquery FROM '@abs_srcdir@/data/orders.1.data' with delimiter '|'
+\STAGE orders_subquery FROM '@abs_srcdir@/data/orders.2.data' with delimiter '|'
+
+-- Check that we error out if shard min/max values are not exactly same.
+
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+
+-- Update metadata in order to make all shards equal.
+
+UPDATE pg_dist_shard SET shardmaxvalue = '14947' WHERE shardid = 102024;
+
+-- Check that we error out if join is not on partition columns.
+
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice / l_quantity) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	GROUP BY
+		l_orderkey) AS unit_prices;
+
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice / l_quantity) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_custkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+
+-- two table join no repartitioning
+
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+
+-- three way join
+
+SELECT
+	avg(unit_price),
+	avg(unit_price_2)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o.o_totalprice) AS unit_price,
+		avg(o2.o_totalprice) AS unit_price_2
+	FROM
+		lineitem_subquery l,
+		orders_subquery o,
+		orders_subquery o2
+	WHERE
+		l_orderkey = o.o_orderkey and l_orderkey = o2.o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+
+-- deeper nesting
+
+SELECT
+	avg(avg_partkey)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(avg_suppkey) as avg_partkey
+	FROM
+		(SELECT
+			l_orderkey,
+			l_partkey,
+			avg(avg_linenumber) as avg_suppkey
+		FROM
+			(SELECT
+				l_orderkey,
+				l_partkey,
+				l_suppkey,
+				avg(avg_quantity) avg_linenumber
+			FROM
+				(SELECT
+					l_orderkey,
+					l_partkey,
+					l_suppkey,
+					l_linenumber,
+					avg(l_quantity) as avg_quantity
+				FROM
+					lineitem_subquery
+				GROUP BY
+					l_orderkey,
+					l_partkey,
+					l_suppkey,
+					l_linenumber) as table_quantity
+			GROUP BY
+				l_orderkey,
+				l_partkey,
+				l_suppkey) as table_linenumber
+		GROUP BY
+			l_orderkey,
+			l_partkey) as table_partkey
+	GROUP BY
+		l_orderkey) as table_orderkey;
+
+-- Multi table subquery with re-partitioning
+
+SELECT
+	avg(count_frequency)
+FROM
+	(SELECT
+		order_count,
+		count(order_count) AS count_frequency
+	FROM
+		(SELECT
+			l_orderkey,
+			count(*) AS order_count
+		FROM
+			lineitem_subquery,
+			orders_subquery
+		WHERE
+			l_orderkey = o_orderkey
+		GROUP BY
+			l_orderkey) AS first_query
+	GROUP BY
+		order_count) as second_query
+WHERE
+	count_frequency > 5;
+
+-- Check that we error out if there is union all.
+
+SELECT count(*) FROM
+(
+   (SELECT l_orderkey FROM lineitem_subquery) UNION ALL
+   (SELECT 1::bigint)
+) b;
+
+-- Check that we error out if queries in union do not include partition columns.
+
+SELECT count(*) FROM
+(
+   (SELECT l_orderkey FROM lineitem_subquery) UNION
+   (SELECT l_partkey FROM lineitem_subquery)
+) b;
+
+-- Check that we run union queries if partition column is selected.
+
+SELECT count(*) FROM
+(
+   (SELECT l_orderkey FROM lineitem_subquery) UNION
+   (SELECT l_orderkey FROM lineitem_subquery)
+) b;
+
+-- Check that we error out if the outermost query has subquery join.
+
+SELECT
+	avg(o_totalprice/l_quantity)
+FROM
+		(SELECT
+			l_orderkey,
+			l_quantity
+		FROM
+			lineitem_subquery
+		ORDER BY
+			l_quantity
+		LIMIT 10
+		) lineitem_quantities
+	JOIN LATERAL
+		(SELECT
+			o_totalprice
+		FROM
+			orders_subquery
+		WHERE
+			lineitem_quantities.l_orderkey = o_orderkey) orders_price ON true;
+
+-- Check that we error out if the outermost query is a distinct clause.
+
+SELECT
+	count(DISTINCT a)
+FROM (
+	SELECT
+		count(*) a
+	FROM
+		lineitem_subquery
+) z;
+
+-- Check supported subquery types.
+
+SELECT
+	o_custkey,
+	sum(order_count) as order_count
+FROM
+	(SELECT
+		o_orderkey,
+		o_custkey,
+		count(*) AS order_count
+	FROM
+		orders_subquery
+	GROUP BY
+		o_orderkey, o_custkey) AS order_counts
+GROUP BY
+	o_custkey
+ORDER BY
+	order_count DESC,
+	o_custkey ASC
+LIMIT 10;
+
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice / l_quantity) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+
+-- Check that if subquery is pulled, we don't error and run query properly.
+
+SELECT count(*) FROM
+(
+	SELECT l_orderkey FROM (
+		(SELECT l_orderkey FROM lineitem_subquery) UNION
+		(SELECT l_orderkey FROM lineitem_subquery)
+	) a
+	WHERE l_orderkey = 1
+) b;
+
+SELECT count(*) FROM
+(
+	SELECT * FROM (
+		(SELECT * FROM lineitem_subquery) UNION
+		(SELECT * FROM lineitem_subquery)
+	) a
+	WHERE l_orderkey = 1
+) b;
+
+SELECT max(l_orderkey) FROM
+(
+	SELECT l_orderkey FROM
+	(
+		SELECT
+			l_orderkey, count(*)
+		FROM
+			lineitem_subquery
+		WHERE
+			l_orderkey < 20000
+		GROUP BY
+			l_orderkey
+	) z
+) y;
+
+SELECT
+	*
+FROM
+	(SELECT
+		o_orderkey, o_custkey, o_totalprice, cnt, (o_totalprice / cnt) as avg_item_price
+	FROM
+		(SELECT
+			o_orderkey, o_custkey, o_totalprice, count(l_linenumber) cnt
+		FROM
+			lineitem_subquery l, orders_subquery o
+		WHERE
+			o_orderkey = l_orderkey and o_custkey > 1490
+		GROUP BY
+			o_orderkey, o_custkey, o_totalprice
+		) order_size
+	) avg_item_price;
+
+-- Load more data to one relation, then test if we error out because of different
+-- shard counts for joining relations.
+
+\STAGE orders_subquery FROM '@abs_srcdir@/data/orders.1.data' with delimiter '|'
+
+SELECT
+	avg(unit_price)
+FROM
+	(SELECT
+		l_orderkey,
+		avg(o_totalprice / l_quantity) AS unit_price
+	FROM
+		lineitem_subquery,
+		orders_subquery
+	WHERE
+		l_orderkey = o_orderkey
+	GROUP BY
+		l_orderkey) AS unit_prices;
+
+
+-- Create metadata to test if Heap queries work properly.
+
+CREATE TYPE heap_composite_type AS
+(
+	app_id BIGINT,
+	user_id BIGINT
+);
+
+CREATE TABLE events (
+	heap_id heap_composite_type,
+	event_id bigint,
+	type character varying(255),
+	"time" bigint
+);
+
+SELECT master_create_distributed_table('events', 'heap_id', 'range');
+
+CREATE TABLE users (
+	heap_id heap_composite_type,
+	lastseen bigint
+);
+
+SELECT master_create_distributed_table('users', 'heap_id', 'range');
+
+
+INSERT INTO pg_dist_shard (logicalrelid, shardid, shardstorage, shardminvalue, shardmaxvalue)
+	VALUES('events'::regclass, 300, 't', '(1,1)', '(1,2000000000)'),
+		  ('events'::regclass, 301, 't', '(1,2000000001)', '(1,4300000000)'),
+		  ('events'::regclass, 302, 't', '(2,1)', '(2,2000000000)'),
+		  ('events'::regclass, 303, 't', '(2,2000000001)', '(2,4300000000)'),
+		  ('users'::regclass, 304, 't', '(1,1)', '(1,2000000000)'),
+		  ('users'::regclass, 305, 't', '(1,2000000001)', '(1,4300000000)'),
+		  ('users'::regclass, 306, 't', '(2,1)', '(2,2000000000)'),
+		  ('users'::regclass, 307, 't', '(2,2000000001)', '(2,4300000000)');
+
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 300, 1, 2, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 301, 1, 2, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 302, 1, 2, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 303, 1, 2, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 304, 1, 1, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 305, 1, 1, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 306, 1, 1, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+
+INSERT INTO pg_dist_shard_placement (shardid, shardstate, shardlength, nodename, nodeport)
+	SELECT 307, 1, 1, nodename, nodeport
+	FROM pg_dist_shard_placement
+	GROUP BY nodename, nodeport
+	ORDER BY nodename, nodeport ASC
+	LIMIT 1;
+
+SET client_min_messages TO DEBUG4;
+
+-- Vanilla funnel query.
+
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg
+FROM
+	(SELECT
+		heap_id,
+		array_agg(event ORDER BY time) AS events
+	FROM
+		(SELECT
+			u.heap_id,
+			type AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			u.heap_id = e.heap_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type IN ('click', 'focus', 'submit')) t
+	GROUP BY
+		heap_id) q;
+
+
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg
+FROM
+	(SELECT
+		app_id,
+		user_id,
+		array_agg(event ORDER BY time) AS events
+	FROM
+		(SELECT
+			(u.heap_id).app_id,
+			(u.heap_id).user_id,
+			type AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			(u.heap_id).app_id = (e.heap_id).app_id AND
+			(u.heap_id).user_id = (e.heap_id).user_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type IN ('click', 'focus', 'submit')) t
+	GROUP BY
+		app_id,
+		user_id) q;
+
+
+
+-- Funnel query grouped by whether or not a user has done an event.
+
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg,
+	hasdone
+FROM
+	(SELECT
+		t1.heap_id,
+		array_agg(event ORDER BY time) AS events,
+		COALESCE(hasdone, 'Has not done view_page_billing_page_paypal') AS hasdone
+	FROM
+	(
+		(SELECT
+			u.heap_id,
+			'step=>1'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			u.heap_id = e.heap_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'click')
+		UNION
+		(SELECT
+			u.heap_id,
+			'step=>2'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			u.heap_id = e.heap_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'focus')
+	) t1
+	LEFT JOIN
+		(SELECT
+			DISTINCT ON (heap_id) heap_id,
+			'Has done view_page_billing_page_paypal'::TEXT AS hasdone
+		FROM
+			events AS e
+		WHERE
+			e.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			e.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'submit') t2
+	ON
+		t1.heap_id = t2.heap_id
+	GROUP BY
+		t1.heap_id,
+		hasdone) t
+GROUP BY
+	hasdone;
+
+
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg,
+	hasdone
+FROM
+	(SELECT
+		t1.app_id,
+		t1.user_id,
+		array_agg(event ORDER BY time) AS events,
+		COALESCE(hasdone, 'Has not done view_page_billing_page_paypal') AS hasdone
+	FROM
+	(
+		(SELECT
+			(u.heap_id).app_id,
+			(u.heap_id).user_id,
+			'step=>1'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			(u.heap_id).app_id = (e.heap_id).app_id AND
+			(u.heap_id).user_id = (e.heap_id).user_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'click')
+		UNION
+		(SELECT
+			(u.heap_id).app_id,
+			(u.heap_id).user_id,
+			'step=>2'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			(u.heap_id).app_id = (e.heap_id).app_id AND
+			(u.heap_id).user_id = (e.heap_id).user_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'focus')
+	) t1
+	LEFT JOIN
+		(SELECT
+			DISTINCT ON ((heap_id).app_id, (heap_id).user_id) heap_id,
+			(heap_id).app_id,
+			(heap_id).user_id,
+			'Has done view_page_billing_page_paypal'::TEXT AS hasdone
+		FROM
+			events AS e
+		WHERE
+			e.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			e.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'submit') t2
+	ON
+		t1.app_id = t2.app_id AND
+		t1.user_id = t2.user_id
+	GROUP BY
+		t1.app_id,
+		t1.user_id,
+		hasdone) t
+GROUP BY
+	hasdone;
+
+-- Funnel query with grouped by the number of times a user has done an event.
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg,
+	count_submit
+	FROM (
+  SELECT
+	t1.heap_id,
+	array_agg(event ORDER BY time) AS events,
+	COALESCE(count_submit, 0) AS count_submit
+  FROM
+	(
+		(SELECT
+			u.heap_id,
+			'step=>1'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			u.heap_id = e.heap_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'click')
+		UNION
+		(SELECT
+			u.heap_id,
+			'step=>2'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			u.heap_id = e.heap_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'focus')
+	) t1
+	LEFT JOIN
+		(SELECT
+			heap_id,
+			COUNT(*) AS count_submit
+		FROM
+			events AS e
+		WHERE
+			e.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			e.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'submit'
+		GROUP BY
+			heap_id
+		HAVING
+			COUNT(*) > 2) t2
+	ON
+		t1.heap_id = t2.heap_id
+	GROUP BY
+		t1.heap_id,
+		count_submit) t
+WHERE
+	array_ndims(events) > 0
+GROUP BY
+	count_submit
+ORDER BY
+	count_submit;
+
+
+EXPLAIN SELECT
+	avg(array_ndims(events)) AS dimension_avg,
+	count_submit
+	FROM (
+  SELECT
+	t1.app_id,
+	t1.user_id,
+	array_agg(event ORDER BY time) AS events,
+	COALESCE(count_submit, 0) AS count_submit
+  FROM
+	(
+		(SELECT
+			(u.heap_id).app_id,
+			(u.heap_id).user_id,
+			'step=>1'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			(u.heap_id).app_id = (e.heap_id).app_id AND
+			(u.heap_id).user_id = (e.heap_id).user_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'click')
+		UNION
+		(SELECT
+			(u.heap_id).app_id,
+			(u.heap_id).user_id,
+			'step=>2'AS event,
+			e.time
+		FROM
+			users AS u,
+			events AS e
+		WHERE
+			(u.heap_id).app_id = (e.heap_id).app_id AND
+			(u.heap_id).user_id = (e.heap_id).user_id AND
+			u.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			u.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'focus')
+	) t1
+	LEFT JOIN
+		(SELECT
+			(heap_id).app_id,
+			(heap_id).user_id,
+			COUNT(*) AS count_submit
+		FROM
+			events AS e
+		WHERE
+			e.heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			e.heap_id <= '(1, 9223372036854775807)'::heap_composite_type AND
+			type = 'submit'
+		GROUP BY
+			app_id,
+			user_id
+		HAVING
+			COUNT(*) > 2) t2
+	ON
+		t1.app_id = t2.app_id AND
+		t1.user_id = t2.user_id
+	GROUP BY
+		t1.app_id,
+		t1.user_id,
+		count_submit) t
+WHERE
+	array_ndims(events) > 0
+GROUP BY
+	count_submit
+ORDER BY
+	count_submit;
+
+-- List view query.
+
+EXPLAIN SELECT
+	heap_id,
+	user_lastseen,
+	event_array
+FROM
+	(SELECT
+		heap_id,
+		max(lastseen) as user_lastseen,
+		array_agg(type ORDER BY time) AS event_array
+	FROM
+		(SELECT
+			heap_id,
+			lastseen
+		FROM
+			users
+		WHERE
+			heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			heap_id <= '(1, 9223372036854775807)'::heap_composite_type
+		ORDER BY
+			lastseen DESC
+		LIMIT
+			10
+		) u
+		LEFT JOIN LATERAL
+			(SELECT
+				type,
+				time
+			FROM
+				events
+			WHERE
+				heap_id = u.heap_id
+			ORDER BY
+				time DESC
+			LIMIT
+				99) t
+		ON
+			true
+		GROUP BY
+			heap_id
+	) AS shard_union
+ORDER BY
+	user_lastseen DESC
+LIMIT
+	10;
+
+EXPLAIN SELECT
+	app_id,
+	user_id,
+	user_lastseen,
+	event_array
+FROM
+	(SELECT
+		app_id,
+		user_id,
+		max(lastseen) as user_lastseen,
+		array_agg(type ORDER BY time) AS event_array
+	FROM
+		(SELECT
+			(heap_id).app_id,
+			(heap_id).user_id,
+			lastseen
+		FROM
+			users
+		WHERE
+			heap_id >= '(1, -9223372036854775808)'::heap_composite_type AND
+			heap_id <= '(1, 9223372036854775807)'::heap_composite_type
+		ORDER BY
+			lastseen DESC
+		LIMIT
+			10
+		) u
+		LEFT JOIN LATERAL
+			(SELECT
+				type,
+				time
+			FROM
+				events
+			WHERE
+				(heap_id).app_id = u.app_id AND
+				(heap_id).user_id = u.user_id
+			ORDER BY
+				time DESC
+			LIMIT
+				99) t
+		ON
+			true
+		GROUP BY
+			app_id,
+		user_id
+	) AS shard_union
+ORDER BY
+	user_lastseen DESC
+LIMIT
+	10;
+
+-- single table repartition query
+select
+    number_sum,
+    count(*) as total,
+    avg(total_count) avg_count
+from
+    (select
+        l_suppkey,
+        l_linestatus,
+        sum(l_linenumber) as number_sum,
+        count(*) as total_count
+    from
+        lineitem_subquery
+    group by
+        l_suppkey,
+        l_linestatus) as distributed_table
+where
+    number_sum >= 10
+group by
+    number_sum
+order by
+    total desc,
+    number_sum desc
+limit 10;
+
+-- 3 level subquery with repartition
+
+select
+    total,
+    avg(avg_count) as total_avg_count
+from
+    (select
+        number_sum,
+        count(*) as total,
+        avg(total_count) avg_count
+    from
+        (select
+            l_suppkey,
+            sum(l_linenumber) as number_sum,
+            count(*) as total_count
+        from
+            lineitem_subquery
+        where
+            l_partkey > 100 and
+            l_quantity > 2 and
+            l_orderkey < 10000
+        group by
+            l_suppkey) as distributed_table
+    where
+        number_sum >= 10
+    group by
+        number_sum) as distributed_table_2
+group by
+    total
+order by
+    total;
+
+-- Check that we support subquery even though group by clause is an expression
+-- and it is not referred in the target list.
+
+select
+    avg(count)
+from
+    (select
+        l_suppkey,
+        count(*) as count
+    from
+        lineitem_subquery
+    group by
+        (l_orderkey/4)::int,
+        l_suppkey )  as distributed_table;
+
+-- Check that we don't support subqueries with limit.
+
+select
+    l_suppkey,
+    sum(suppkey_count) as total_suppkey_count
+from
+    (select
+        l_suppkey,
+        count(*) as suppkey_count
+    from
+        lineitem_subquery
+    group by
+        l_suppkey
+    order by
+        l_suppkey
+    limit 100) as distributed_table
+group by
+    l_suppkey;
+
+-- Check that we don't support subqueries without aggregates.
+
+select
+    rounded_tax
+from
+    (select
+        round(l_tax) as rounded_tax
+    from
+        lineitem_subquery
+    group by
+        l_tax) as distributed_table;
+
+
+SET citus.task_executor_type TO 'real-time';
+SET client_min_messages TO NOTICE;

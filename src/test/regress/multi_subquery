@@ -1,0 +1,5 @@
+test: multi_create_table
+test: multi_master_protocol
+test: multi_stage_data
+test: multi_subquery_planning
+

@@ -37,6 +37,7 @@
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
+#include "distributed/multitree_debug_helper.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/shardinterval_utils.h"
@@ -59,7 +60,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/typcache.h"
-
+#include "nodes/print.h"
 
 /* Policy to use when assigning tasks to worker nodes */
 int TaskAssignmentPolicy = TASK_ASSIGNMENT_GREEDY;
@@ -81,6 +82,8 @@ static MultiTable * FindTableNode(MultiNode *multiNode, int rangeTableId);
 static Query * BuildJobQuery(MultiNode *multiNode, List *dependedJobList);
 static Query * BuildReduceQuery(MultiExtendedOp *extendedOpNode, List *dependedJobList);
 static List * BaseRangeTableList(MultiNode *multiNode);
+static List * BuildBaseMultiTableList(MultiNode *multiNode);
+static bool BaseMultiTable(MultiTable *multiTable);
 static List * QueryTargetList(MultiNode *multiNode);
 static List * TargetEntryList(List *expressionList);
 static List * QueryGroupClauseList(MultiNode *multiNode);
@@ -120,6 +123,7 @@ static ArrayType * SplitPointObject(ShardInterval **shardIntervalArray,
 static Job * BuildJobTreeTaskList(Job *jobTree);
 static List * SubquerySqlTaskList(Job *job);
 static List * SqlTaskList(Job *job);
+static Query * GetLeafQuery(Query *jobQuery);
 static bool DependsOnHashPartitionJob(Job *job);
 static uint32 AnchorRangeTableId(List *rangeTableList);
 static List * BaseRangeTableIdList(List *rangeTableList);
@@ -285,6 +289,9 @@ BuildJobTree(MultiTreeRoot *multiTree)
 			PartitionType partitionType = PARTITION_INVALID_FIRST;
 			Oid baseRelationId = InvalidOid;
 
+			ereport(WARNING, (errmsg("building join map merge job")));
+
+
 			if (joinNode->joinRuleType == SINGLE_PARTITION_JOIN)
 			{
 				partitionType = RANGE_PARTITION_TYPE;
@@ -345,6 +352,36 @@ BuildJobTree(MultiTreeRoot *multiTree)
 			List *dependedJobList = list_copy(loopDependedJobList);
 			Query *jobQuery = BuildJobQuery(queryNode, dependedJobList);
 
+			ereport(WARNING, (errmsg("building subquery map merge job")));
+
+
+			if (PrintMultiPlan)
+			{
+				StringInfo workerQueryString  = makeStringInfo();
+				Query *logQuery = (Query *) copyObject(jobQuery);
+				List *rangeTableList = NIL;
+				ListCell *rangeTableCell = NULL;
+
+				ExtractRangeTableEntryWalker((Node *) logQuery, &rangeTableList);
+				foreach(rangeTableCell, rangeTableList)
+				{
+					RangeTblEntry *rangeTable = (RangeTblEntry *) lfirst(rangeTableCell);
+
+					if (rangeTable->rtekind == RTE_FUNCTION)
+					{
+						CitusRTEKind rteKind = CITUS_RTE_RELATION;
+						ExtractRangeTblExtraData(rangeTable, &rteKind, NULL, NULL, NULL);
+						ereport(WARNING, (errmsg("Setting rte kind to %d", (int) rteKind)));
+						rangeTable->rtekind = (RTEKind) rteKind;
+					}
+				}
+
+
+				pg_get_query_def(logQuery, workerQueryString);
+				ereport(WARNING, (errmsg("map merge job query : %s",
+								  workerQueryString->data)));
+			}
+
 			MapMergeJob *mapMergeJob = BuildMapMergeJob(jobQuery, dependedJobList,
 														partitionKey, HASH_PARTITION_TYPE,
 														InvalidOid,
@@ -367,7 +404,7 @@ BuildJobTree(MultiTreeRoot *multiTree)
 			List *subqueryMultiTableList = SubqueryMultiTableList(childNode);
 			int subqueryCount = list_length(subqueryMultiTableList);
 
-			if (subqueryCount > 0)
+			if (subqueryCount > 0 && SubqueryPushdown)
 			{
 				subqueryPushdown = true;
 			}
@@ -390,7 +427,42 @@ BuildJobTree(MultiTreeRoot *multiTree)
 				Query *topLevelQuery = BuildJobQuery(childNode, dependedJobList);
 
 				topLevelJob = BuildJob(topLevelQuery, dependedJobList);
+
+				if (PrintMultiPlan)
+				{
+					StringInfo workerQueryString  = makeStringInfo();
+					Query *logQuery = (Query *) copyObject(topLevelQuery);
+					List *rangeTableList = NIL;
+					ListCell *rangeTableCell = NULL;
+
+
+					ereport(WARNING, (errmsg("Query : %s ", nodeToString(logQuery))));
+/*					pg_get_query_def(logQuery, workerQueryString);
+					ereport(WARNING, (errmsg("worker query : %s", workerQueryString->data)));
+					resetStringInfo(workerQueryString);
+
+					ExtractRangeTableEntryWalker((Node *) logQuery, &rangeTableList);
+					foreach(rangeTableCell, rangeTableList)
+					{
+						RangeTblEntry *rangeTable = (RangeTblEntry *) lfirst(rangeTableCell);
+
+
+						if (rangeTable->rtekind == RTE_FUNCTION)
+						{
+							CitusRTEKind rteKind = CITUS_RTE_RELATION;
+							ExtractRangeTblExtraData(rangeTable, &rteKind, NULL, NULL, NULL);
+							ereport(WARNING, (errmsg("Setting rte kind to %d", (int) rteKind)));
+							rangeTable->rtekind = (RTEKind) rteKind;
+						}
+					}
+
+					pg_get_query_def(logQuery, workerQueryString);
+					ereport(WARNING, (errmsg("worker query : %s", workerQueryString->data)));
+					*/
+				}
+
 			}
+
 		}
 
 		/* walk up the tree */
@@ -503,6 +575,7 @@ BuildJobQuery(MultiNode *multiNode, List *dependedJobList)
 	Query *jobQuery = NULL;
 	MultiNode *parentNode = NULL;
 	bool updateColumnAttributes = false;
+	List *baseMultiTableList = NIL;
 	List *rangeTableList = NIL;
 	List *targetList = NIL;
 	List *extendedOpNodeList = NIL;
@@ -512,10 +585,18 @@ BuildJobQuery(MultiNode *multiNode, List *dependedJobList)
 	List *columnList = NIL;
 	Node *limitCount = NULL;
 	Node *limitOffset = NULL;
+	ListCell *multiTableCell = NULL;
 	ListCell *columnCell = NULL;
 	FromExpr *joinTree = NULL;
 	Node *joinRoot = NULL;
 
+/*
+	if (PrintMultiPlan)
+	{
+		PrintMultiTree(multiNode, 1);
+		ereport(WARNING, (errmsg("Depended Jobs : %s", CitusNodeToString(dependedJobList))));
+	}
+*/
 	/* we start building jobs from below the collect node */
 	Assert(!CitusIsA(multiNode, MultiCollect));
 
@@ -552,25 +633,18 @@ BuildJobQuery(MultiNode *multiNode, List *dependedJobList)
 		}
 	}
 
-	/*
-	 * If we have an extended operator, then we copy the operator's target list.
-	 * Otherwise, we use the target list based on the MultiProject node at this
-	 * level in the query tree.
-	 */
-	extendedOpNodeList = FindNodesOfType(multiNode, T_MultiExtendedOp);
-	if (extendedOpNodeList != NIL)
-	{
-		MultiExtendedOp *extendedOp = (MultiExtendedOp *) linitial(extendedOpNodeList);
-		targetList = copyObject(extendedOp->targetList);
-	}
-	else
-	{
-		targetList = QueryTargetList(multiNode);
-	}
+	targetList = QueryTargetList(multiNode);
 
-	/* build the join tree and the range table list */
-	rangeTableList = BaseRangeTableList(multiNode);
 	joinRoot = QueryJoinTree(multiNode, dependedJobList, &rangeTableList);
+
+	if (list_length(rangeTableList) == 1)
+	{
+		RangeTblEntry *subqueryRTE = (RangeTblEntry *) linitial(rangeTableList);
+		if (subqueryRTE->rtekind == RTE_SUBQUERY)
+		{
+			updateColumnAttributes = false;
+		}
+	}
 
 	/* update the column attributes for target entries */
 	if (updateColumnAttributes)
@@ -585,6 +659,7 @@ BuildJobQuery(MultiNode *multiNode, List *dependedJobList)
 	}
 
 	/* extract limit count/offset and sort clauses */
+	extendedOpNodeList = FindNodesOfType(multiNode, T_MultiExtendedOp);
 	if (extendedOpNodeList != NIL)
 	{
 		MultiExtendedOp *extendedOp = (MultiExtendedOp *) linitial(extendedOpNodeList);
@@ -634,7 +709,13 @@ BuildJobQuery(MultiNode *multiNode, List *dependedJobList)
 	jobQuery->limitOffset = limitOffset;
 	jobQuery->limitCount = limitCount;
 	jobQuery->hasAggs = contain_agg_clause((Node *) targetList);
-
+/*
+	if (PrintMultiPlan)
+	{
+		PrintMultiTree(multiNode, 1);
+		ereport(WARNING, (errmsg("Created query : %s", CitusNodeToString(jobQuery))));
+	}
+	*/
 	return jobQuery;
 }
 
@@ -782,6 +863,77 @@ BaseRangeTableList(MultiNode *multiNode)
 
 
 /*
+ * BuildBaseMultiTableList returns the list of depended MultiTable entries for
+ * a top level query. Note that this function only considers tables relevant to
+ * the current query, and does not visit nodes under the collect or multitable
+ * node. Returned list contains MultiTables belonging to : (1) leaf level
+ * multitables, (2) subquery multitables that do not require repartitioning.
+ */
+static List *
+BuildBaseMultiTableList(MultiNode *multiNode)
+{
+	List *baseRangeTableList = NIL;
+	List *pendingNodeList = list_make1(multiNode);
+
+	while (pendingNodeList != NIL)
+	{
+		MultiNode *currentNode = (MultiNode *) linitial(pendingNodeList);
+		CitusNodeTag nodeType = CitusNodeTag(currentNode);
+		pendingNodeList = list_delete_first(pendingNodeList);
+
+		if (nodeType == T_MultiTable)
+		{
+			MultiTable *multiTable = (MultiTable *) currentNode;
+			bool baseMultiTable = BaseMultiTable(multiTable);
+			if (baseMultiTable)
+			{
+				baseRangeTableList = lappend(baseRangeTableList, currentNode);
+			}
+			else
+			{
+				List *childNodeList = ChildNodeList(currentNode);
+				pendingNodeList = list_concat(pendingNodeList, childNodeList);
+			}
+		}
+		else if (nodeType != T_MultiCollect)
+		{
+			List *childNodeList = ChildNodeList(currentNode);
+			pendingNodeList = list_concat(pendingNodeList, childNodeList);
+		}
+	}
+
+	return baseRangeTableList;
+}
+
+
+/*
+ * BaseMultiTable returns true if given multiTable is leaf level MultiTable or
+ * it denotes a pushdown subquery result. It return false if it represents a
+ * repartition subquery result.
+ */
+static bool
+BaseMultiTable(MultiTable *multiTable)
+{
+	bool baseMultiTable = false;
+
+	if (multiTable->relationId == SUBQUERY_RELATION_ID)
+	{
+		MultiNode *grandChild = GrandChildNode((MultiUnaryNode *) multiTable);
+		if (!CitusIsA(grandChild, MultiPartition))
+		{
+			baseMultiTable = true;
+		}
+	}
+	else
+	{
+		baseMultiTable = true;
+	}
+
+	return baseMultiTable;
+}
+
+
+/*
  * DerivedRangeTableEntry builds a range table entry for the derived table. This
  * derived table either represents the output of a repartition job; or the data
  * on worker nodes in case of the master node query.
@@ -834,22 +986,40 @@ DerivedColumnNameList(uint32 columnCount, uint64 generatingJobId)
  * needed to evaluate the operators above the given multiNode. To do this,
  * the function retrieves a list of all MultiProject nodes below the given
  * node and picks the columns from the top-most MultiProject node, as this
- * will be the minimal list of columns needed. Note that this function relies
- * on a pre-order traversal of the operator tree by the function FindNodesOfType.
+ * will be the minimal list of columns needed.
  */
 static List *
 QueryTargetList(MultiNode *multiNode)
 {
-	MultiProject *topProjectNode = NULL;
-	List *columnList = NIL;
 	List *queryTargetList = NIL;
+	List *pendingNodeList = list_make1(multiNode);
 
-	List *projectNodeList = FindNodesOfType(multiNode, T_MultiProject);
-	Assert(list_length(projectNodeList) > 0);
+	while (pendingNodeList != NIL)
+	{
+		MultiNode *multiNode = (MultiNode *) linitial(pendingNodeList);
+		pendingNodeList = list_delete_first(pendingNodeList);
 
-	topProjectNode = (MultiProject *) linitial(projectNodeList);
-	columnList = topProjectNode->columnList;
-	queryTargetList = TargetEntryList(columnList);
+		CitusNodeTag nodeType = CitusNodeTag(multiNode);
+		if (nodeType == T_MultiExtendedOp)
+		{
+			MultiExtendedOp *extendedOp = (MultiExtendedOp *) multiNode;
+			queryTargetList = copyObject(extendedOp->targetList);
+			break;
+		}
+		else if (nodeType == T_MultiProject)
+		{
+			MultiProject *projectNode = (MultiProject *) multiNode;
+			List *columnList = projectNode->columnList;
+			queryTargetList = TargetEntryList(columnList);
+			break;
+		}
+		/* do not visit nodes that below current level */
+		else if (nodeType == T_MultiSelect || nodeType == T_MultiTreeRoot)
+		{
+			List *childNodeList = ChildNodeList(multiNode);
+			pendingNodeList = list_concat(pendingNodeList, childNodeList);
+		}
+	}
 
 	Assert(queryTargetList != NIL);
 	return queryTargetList;
@@ -941,8 +1111,8 @@ QuerySelectClauseList(MultiNode *multiNode)
 			selectClauseList = list_concat(selectClauseList, clauseList);
 		}
 
-		/* add children only if this node isn't a multi collect */
-		if (nodeType != T_MultiCollect)
+		/* add children only if this node isn't a multi collect and multi table */
+		if (nodeType != T_MultiCollect && nodeType != T_MultiTable)
 		{
 			List *childNodeList = ChildNodeList(multiNode);
 			pendingNodeList = list_concat(pendingNodeList, childNodeList);
@@ -979,8 +1149,8 @@ QueryJoinClauseList(MultiNode *multiNode)
 			joinClauseList = list_concat(joinClauseList, clauseList);
 		}
 
-		/* add this node's children only if the node isn't a multi collect */
-		if (nodeType != T_MultiCollect)
+		/* add children only if this node isn't a multi collect and multi table */
+		if (nodeType != T_MultiCollect && nodeType != T_MultiTable)
 		{
 			List *childNodeList = ChildNodeList(multiNode);
 			pendingNodeList = list_concat(pendingNodeList, childNodeList);
@@ -1063,22 +1233,52 @@ QueryJoinTree(MultiNode *multiNode, List *dependedJobList, List **rangeTableList
 
 		case T_MultiTable:
 		{
-			MultiTable *rangeTableNode = (MultiTable *) multiNode;
+			MultiTable *multiTable = (MultiTable *) multiNode;
 			MultiUnaryNode *unaryNode = (MultiUnaryNode *) multiNode;
+			RangeTblEntry *rangeTableEntry = makeNode(RangeTblEntry);
+			rangeTableEntry->inFromCl = true;
+			rangeTableEntry->eref = multiTable->referenceNames;
+			rangeTableEntry->alias = multiTable->alias;
 
 			if (unaryNode->childNode != NULL)
 			{
-				/* MultiTable is actually a subquery, return the query tree below */
-				Node *childNode = QueryJoinTree(unaryNode->childNode, dependedJobList,
-												rangeTableList);
+				RangeTblRef *rangeTableRef = makeNode(RangeTblRef);
+				int rangeTableId = list_length(*rangeTableList) + 1;
 
-				return childNode;
+				rangeTableEntry->rtekind = RTE_SUBQUERY;
+				rangeTableEntry->subquery = BuildJobQuery(unaryNode->childNode, dependedJobList);
+
+				/*
+				SetRangeTblExtraData(rangeTableEntry, CITUS_RTE_SUBQUERY, NULL, NULL,
+						list_make1_int(rangeTableId));
+				*/
+				*rangeTableList = lappend(*rangeTableList, rangeTableEntry);
+
+				/* rangeTableRef->rtindex = NewTableId(rangeTableId, *rangeTableList); */
+				rangeTableRef->rtindex  = list_length(*rangeTableList);
+
+				Assert(rangeTableRef->rtindex  > 0);
+				Assert(rangeTableRef->rtindex  == list_length(*rangeTableList));
+
+				return (Node *) rangeTableRef;
 			}
 			else
+
 			{
 				RangeTblRef *rangeTableRef = makeNode(RangeTblRef);
-				uint32 rangeTableId = rangeTableNode->rangeTableId;
-				rangeTableRef->rtindex = NewTableId(rangeTableId, *rangeTableList);
+
+				rangeTableEntry->relid = multiTable->relationId;
+				rangeTableEntry->rtekind = RTE_RELATION;
+				rangeTableEntry->relkind = RELKIND_RELATION;
+
+				SetRangeTblExtraData(rangeTableEntry, CITUS_RTE_RELATION, NULL, NULL,
+						list_make1_int(multiTable->rangeTableId));
+				*rangeTableList = lappend(*rangeTableList, rangeTableEntry);
+
+				rangeTableRef->rtindex = NewTableId(multiTable->rangeTableId, *rangeTableList);
+
+				Assert(rangeTableRef->rtindex  > 0);
+				Assert(rangeTableRef->rtindex  == list_length(*rangeTableList));
 
 				return (Node *) rangeTableRef;
 			}
@@ -1566,7 +1766,8 @@ JobForTableIdList(List *jobList, List *searchedTableIdList)
 	foreach(jobCell, jobList)
 	{
 		Job *job = (Job *) lfirst(jobCell);
-		List *jobRangeTableList = job->jobQuery->rtable;
+		Query *leafQuery = GetLeafQuery(job->jobQuery);
+		List *jobRangeTableList = leafQuery->rtable;
 		List *jobTableIdList = NIL;
 		ListCell *jobRangeTableCell = NULL;
 		List *lhsDiff = NIL;
@@ -2115,8 +2316,9 @@ SqlTaskList(Job *job)
 	ListCell *fragmentCombinationCell = NULL;
 
 	Query *jobQuery = job->jobQuery;
-	List *rangeTableList = jobQuery->rtable;
-	List *whereClauseList = (List *) jobQuery->jointree->quals;
+	Query *leafQuery = GetLeafQuery(jobQuery);
+	List *rangeTableList = leafQuery->rtable;
+	List *whereClauseList = (List *) leafQuery->jointree->quals;
 	List *dependedJobList = job->dependedJobList;
 
 	/*
@@ -2135,7 +2337,7 @@ SqlTaskList(Job *job)
 
 	/* adjust our column old attributes for partition pruning to work */
 	AdjustColumnOldAttributes(whereClauseList);
-	AdjustColumnOldAttributes(jobQuery->targetList);
+	AdjustColumnOldAttributes(leafQuery->targetList);
 
 	/*
 	 * Ands are made implicit during shard pruning, as predicate comparison and
@@ -2143,8 +2345,8 @@ SqlTaskList(Job *job)
 	 * that the query string is generated as (...) AND (...) as opposed to
 	 * (...), (...).
 	 */
-	whereClauseTree = (Node *) make_ands_explicit((List *) jobQuery->jointree->quals);
-	jobQuery->jointree->quals = whereClauseTree;
+	whereClauseTree = (Node *) make_ands_explicit((List *) leafQuery->jointree->quals);
+	leafQuery->jointree->quals = whereClauseTree;
 
 	/*
 	 * For each range table, we first get a list of their shards or merge tasks.
@@ -2164,7 +2366,7 @@ SqlTaskList(Job *job)
 	 * represents one SQL task's dependencies.
 	 */
 	fragmentCombinationList = FragmentCombinationList(rangeTableFragmentsList,
-													  jobQuery, dependedJobList);
+													  leafQuery, dependedJobList);
 
 	fragmentCombinationCell = NULL;
 	foreach(fragmentCombinationCell, fragmentCombinationList)
@@ -2175,6 +2377,7 @@ SqlTaskList(Job *job)
 		StringInfo sqlQueryString = NULL;
 		Task *sqlTask = NULL;
 		Query *taskQuery = NULL;
+		Query *taskLeafQuery = NULL;
 		List *fragmentRangeTableList = NIL;
 
 		/* create tasks to fetch fragments required for the sql task */
@@ -2184,7 +2387,8 @@ SqlTaskList(Job *job)
 
 		/* update range table entries with fragment aliases (in place) */
 		taskQuery = copyObject(jobQuery);
-		fragmentRangeTableList = taskQuery->rtable;
+		taskLeafQuery = GetLeafQuery(taskQuery);
+		fragmentRangeTableList = taskLeafQuery->rtable;
 		UpdateRangeTableAlias(fragmentRangeTableList, fragmentCombination);
 
 		/* transform the updated task query to a SQL query string */
@@ -2211,6 +2415,35 @@ SqlTaskList(Job *job)
 	}
 
 	return sqlTaskList;
+}
+
+
+/*
+ * GetLeafQuery returns the leaf level query from given Query. Query tree assumed to have
+ * a single branch until the leaf level.
+ */
+static Query *
+GetLeafQuery(Query *jobQuery)
+{
+	Query *candidateQuery = jobQuery;
+	Query *leafQuery = NULL;
+
+	while (leafQuery == NULL)
+	{
+		List *rangeTables = candidateQuery->rtable;
+		RangeTblEntry *rteSubquery = linitial(rangeTables);
+
+		if (GetRangeTblKind(rteSubquery) == CITUS_RTE_SUBQUERY)
+		{
+			candidateQuery = rteSubquery->subquery;
+		}
+		else
+		{
+			leafQuery = candidateQuery;
+		}
+	}
+
+	return leafQuery;
 }
 
 

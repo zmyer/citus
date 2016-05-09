@@ -47,7 +47,7 @@
 #include "utils/relcache.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
-
+#include "distributed/multitree_debug_helper.h"
 
 /* Config variable managed via guc.c */
 int LimitClauseRowFetchCount = -1; /* number of rows to fetch from each task */
@@ -60,6 +60,12 @@ static MultiSelect * OrSelectNode(MultiSelect *selectNode);
 static List * OrSelectClauseList(List *selectClauseList);
 static void PushDownNodeLoop(MultiUnaryNode *currentNode);
 static void PullUpCollectLoop(MultiCollect *collectNode);
+static bool CanPullUpCollectOverExtendedOp(MultiExtendedOp *extendedOpNode);
+static List * ExtractPartitionColumns(MultiNode *multiNode);
+static List * MultiProjectNodePartitionColumns(List* partitionColumnsList,
+											   MultiProject* projectNode);
+static List * MultiExtendedNodePartitionColumns(List* partitionColumnsList,
+												MultiExtendedOp* extendedOpNode);
 static void AddressProjectSpecialConditions(MultiProject *projectNode);
 static List * ListCopyDeep(List *nodeList);
 static PushDownStatus CanPushDown(MultiUnaryNode *parentNode);
@@ -138,6 +144,7 @@ static bool SupportedLateralQuery(Query *parentQuery, Query *lateralQuery);
 static bool JoinOnPartitionColumn(Query *query);
 static void ErrorIfUnsupportedShardDistribution(Query *query);
 static List * RelationIdList(Query *query);
+static List * MultiNodeRelationIdList(MultiNode *multiNode);
 static bool CoPartitionedTables(Oid firstRelationId, Oid secondRelationId);
 static bool ShardIntervalsEqual(FmgrInfo *comparisonFunction,
 								ShardInterval *firstInterval,
@@ -154,6 +161,12 @@ static bool HasOrderByAggregate(List *sortClauseList, List *targetList);
 static bool HasOrderByAverage(List *sortClauseList, List *targetList);
 static bool HasOrderByComplexExpression(List *sortClauseList, List *targetList);
 static bool HasOrderByHllType(List *sortClauseList, List *targetList);
+
+/* local subquery specific functions */
+static void ErrorIfContainsUnsupportedSubqueryWithoutPushdown(MultiNode *logicalPlanNode);
+static void ErrorIfHasUnsupportedJoinWithoutPushdown(MultiNode *multiNode);
+static bool JoinOnPartitionColumnWithoutPushdown(MultiJoin *joinNode);
+static void ErrorIfUnsupportedShardDistributionWithoutPushdown(MultiNode *multiNode);
 
 
 /*
@@ -186,11 +199,23 @@ MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 	MultiExtendedOp *workerExtendedOpNode = NULL;
 	MultiNode *logicalPlanNode = (MultiNode *) multiLogicalPlan;
 
+	if (PrintMultiPlan)
+	{
+		PrintMultiTree(logicalPlanNode, 1);
+	}
+
 	/* check that we can optimize aggregates in the plan */
 	ErrorIfContainsUnsupportedAggregate(logicalPlanNode);
 
 	/* check that we can pushdown subquery in the plan */
-	ErrorIfContainsUnsupportedSubquery(logicalPlanNode);
+	if (SubqueryPushdown)
+	{
+		ErrorIfContainsUnsupportedSubquery(logicalPlanNode);
+	}
+	else
+	{
+		ErrorIfContainsUnsupportedSubqueryWithoutPushdown(logicalPlanNode);
+	}
 
 	/*
 	 * If a select node exists, we use the idempower property to split the node
@@ -255,14 +280,23 @@ MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 
 	ApplyExtendedOpNodes(extendedOpNode, masterExtendedOpNode, workerExtendedOpNode);
 
+	if (PrintMultiPlan)
+	{
+		PrintMultiTree(logicalPlanNode, 1);
+	}
+
 	tableNodeList = FindNodesOfType(logicalPlanNode, T_MultiTable);
 	foreach(tableNodeCell, tableNodeList)
 	{
 		MultiTable *tableNode = (MultiTable *) lfirst(tableNodeCell);
 		if (tableNode->relationId == SUBQUERY_RELATION_ID)
 		{
-			ErrorIfContainsUnsupportedAggregate((MultiNode *) tableNode);
-			TransformSubqueryNode(tableNode);
+			MultiNode *collectNode = GrandChildNode((MultiUnaryNode*) tableNode);
+			if (CitusIsA(collectNode, MultiCollect))
+			{
+				ErrorIfContainsUnsupportedAggregate((MultiNode *) tableNode);
+				TransformSubqueryNode(tableNode);
+			}
 		}
 	}
 
@@ -279,6 +313,11 @@ MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 		ereport(ERROR, (errmsg("cannot approximate count(distinct) and order by it"),
 						errhint("You might need to disable approximations for either "
 								"count(distinct) or limit through configuration.")));
+	}
+
+	if (PrintMultiPlan)
+	{
+		PrintMultiTree(logicalPlanNode, 1);
 	}
 }
 
@@ -459,8 +498,24 @@ PullUpCollectLoop(MultiCollect *collectNode)
 	MultiUnaryNode *currentNode = (MultiUnaryNode *) collectNode;
 
 	PullUpStatus pullUpStatus = CanPullUp(currentNode);
-	while (pullUpStatus == PULL_UP_VALID)
+	while (pullUpStatus == PULL_UP_VALID || pullUpStatus == PULL_UP_SPECIAL_CONDITIONS)
 	{
+		if (pullUpStatus == PULL_UP_SPECIAL_CONDITIONS)
+		{
+			MultiNode *parentNode = ParentNode((MultiNode *) collectNode);
+			MultiExtendedOp *extendedOpNode = (MultiExtendedOp *) parentNode;
+			Assert(parentNode->type == T_MultiExtendedOp);
+
+			/*
+			 * Check if collect node can be pulled up MultiExtendedOp node,
+			 * break the loop if it can't be done.
+			 */
+			if (!CanPullUpCollectOverExtendedOp(extendedOpNode))
+			{
+				break;
+			}
+		}
+
 		PullUpUnaryNode(currentNode);
 		pullUpStatus = CanPullUp(currentNode);
 	}
@@ -475,6 +530,223 @@ PullUpCollectLoop(MultiCollect *collectNode)
 		RemoveUnaryNode(currentNode);
 	}
 }
+
+
+/*
+ * CanPullUpCollectOverExtendedOp checks if a MultiCollect node can be pulled up
+ * over this MultiExtendedOp node. The following conditions must be satisfied:
+ * (1) MultiExtendedOp node can not be the top most MultiExtendedOp node in the
+ * tree i.e. its parent is the MultiTreeRoot.
+ * (2) Query can not include limit or offset clause.
+ * (3) Query's group by list must include partition columns of multitree below.
+ */
+static bool
+CanPullUpCollectOverExtendedOp(MultiExtendedOp *extendedOpNode)
+{
+	bool pullUpStatus = true;
+	MultiNode *parentNode = ParentNode((MultiNode*) extendedOpNode);
+	MultiNode *childNode = ChildNode((MultiUnaryNode*) extendedOpNode);
+
+	Assert(CitusIsA(childNode, MultiCollect));
+
+	/* check parent node, we do not attempt to pull up over top level MultiExtendedOp */
+	if (CitusIsA(parentNode, MultiTreeRoot))
+	{
+		return false;
+	}
+
+	/* check limit clause */
+	if (extendedOpNode->limitCount != NULL || extendedOpNode->limitOffset != NULL)
+	{
+		pullUpStatus = false;
+	}
+
+	if (extendedOpNode->groupClauseList != NULL)
+	{
+		List *partitionColumnList = ExtractPartitionColumns(childNode);
+		List *groupByColumnList = NIL;
+		ListCell *groupClauseCell = NULL;
+
+		foreach(groupClauseCell, extendedOpNode->groupClauseList)
+		{
+			SortGroupClause *groupClause = (SortGroupClause *) lfirst(groupClauseCell);
+			TargetEntry *targetEntry = NULL;
+			targetEntry = get_sortgroupref_tle(groupClause->tleSortGroupRef,
+											   extendedOpNode->targetList);
+
+			/* only Var types are considered */
+			if (IsA(targetEntry->expr, Var))
+			{
+				Var *column = (Var*) (targetEntry->expr);
+				groupByColumnList = lappend(groupByColumnList, column);
+			}
+		}
+
+		/*
+		 * Now check if groupByColumnList contains partition columns. partitionColumnList
+		 * and groupByColumnList should have at least one common element.
+		 * We need to check for full containment of partition column list in group by
+		 * column list if we decide to have multiple columns as partition column.
+		 */
+
+		if (list_length(partitionColumnList) == 0)
+		{
+			/* can not pull up if partitioning is unknown */
+			pullUpStatus = false;
+		}
+		else
+		{
+			List *groupIntersectList = list_intersection(partitionColumnList,
+														 groupByColumnList);
+			if (list_length(groupIntersectList) == 0)
+			{
+				pullUpStatus = false;
+			}
+		}
+	}
+
+	return pullUpStatus;
+}
+
+
+/*
+ * ExtractPartitionColumns recursively runs and returns a list of partition columns of
+ * a multi-tree starting from given MultiNode.
+ * The returned list is empty if given MultiNode does not have any partition column.
+ * It will have a single entry if MultiNode has a partition column. The function will
+ * return list with 2 entries for binary operator (MultiJoin) since it is not clear
+ * which column is to be selected during column projection in MultiExtendedOp.
+ */
+static List *
+ExtractPartitionColumns(MultiNode *multiNode)
+{
+	List *partitionColumnsList = NIL;
+
+	if (multiNode == NULL)
+	{
+		return NIL;
+	}
+
+	if (CitusIsA(multiNode, MultiTable))
+	{
+		MultiTable *multiTable = (MultiTable*) multiNode;
+		if (ChildNode((MultiUnaryNode *) multiTable) == NULL)
+		{
+			Assert(multiTable->partitionColumn != NULL);
+			partitionColumnsList = lappend(partitionColumnsList,
+										   multiTable->partitionColumn);
+			return partitionColumnsList;
+		}
+	}
+
+	if (UnaryOperator(multiNode))
+	{
+		MultiNode *childNode = ChildNode((MultiUnaryNode*) multiNode);
+		partitionColumnsList = ExtractPartitionColumns(childNode);
+	}
+	else if (BinaryOperator(multiNode))
+	{
+		MultiBinaryNode *binaryNode = (MultiBinaryNode*) multiNode;
+		List *leftList =  ExtractPartitionColumns(binaryNode->leftChildNode);
+		List *rightList = ExtractPartitionColumns(binaryNode->rightChildNode);
+		partitionColumnsList = list_concat(leftList, rightList);
+	}
+
+	/*
+	 * MultiProject and MultiExtendedOp nodes may remove partition column from
+	 * projected column list.
+	 */
+	if (CitusIsA(multiNode, MultiProject))
+	{
+		MultiProject *projectNode = (MultiProject*) multiNode;
+		partitionColumnsList = MultiProjectNodePartitionColumns(partitionColumnsList,
+																projectNode);
+	}
+
+	if (CitusIsA(multiNode, MultiExtendedOp))
+	{
+		MultiExtendedOp *extendedOpNode = (MultiExtendedOp*) multiNode;
+		partitionColumnsList = MultiExtendedNodePartitionColumns(partitionColumnsList,
+																 extendedOpNode);
+	}
+
+	return partitionColumnsList;
+}
+
+
+/*
+ * MultiProjectNodePartitionColumns re-creates partitionColumnsList using previously
+ * found partitionColumns, and projected columns from MultiProject node.
+ * It reuses existing Var values from MultiProject node columnList.
+ */
+static List *
+MultiProjectNodePartitionColumns(List* partitionColumnsList,
+								 MultiProject* projectNode)
+{
+	List *targetColumnList = NIL;
+	ListCell *columnCell = NULL;
+	List *newPartitionColumnList = NIL;
+
+	targetColumnList = projectNode->columnList;
+	foreach(columnCell, targetColumnList)
+	{
+		Expr *columnExpr = lfirst(columnCell);
+		Assert(IsA(columnExpr, Var));
+
+		if (list_member(partitionColumnsList, columnExpr))
+		{
+			newPartitionColumnList = lappend(newPartitionColumnList, columnExpr);
+		}
+	}
+
+	return newPartitionColumnList;
+}
+
+
+/*
+ * MultiExtendedNodePartitionColumns re-creates partitionColumnsList using previously
+ * found partitionColumns, and targetList from MultiExtendedOp nodes. It creates a new
+ * Var node with new varno and varattno fields for MultiExtendedOp nodes since
+ * reported column list is modified by this node.
+ */
+static List *
+MultiExtendedNodePartitionColumns(List* partitionColumnsList,
+								  MultiExtendedOp* extendedOpNode)
+{
+	List *targetColumnList = NIL;
+	ListCell *columnCell = NULL;
+	List *newPartitionColumnList = NIL;
+	int index = 0;
+
+	targetColumnList = extendedOpNode->targetList;
+	foreach(columnCell, targetColumnList)
+	{
+		TargetEntry *targetEntry = (TargetEntry *) lfirst(columnCell);
+		Expr *columnExpr = targetEntry->expr;
+		Var *newPartitionColumn = NULL;
+
+		index++;
+
+		if (!IsA(columnExpr, Var))
+		{
+			continue;
+		}
+
+		if (!list_member(partitionColumnsList, columnExpr))
+		{
+			continue;
+		}
+
+		newPartitionColumn = copyObject(columnExpr);
+		newPartitionColumn->varno = 1;
+		newPartitionColumn->varattno = index;
+
+		newPartitionColumnList = lappend(newPartitionColumnList, newPartitionColumn);
+	}
+
+	return newPartitionColumnList;
+}
+
 
 
 /*
@@ -618,6 +890,10 @@ CanPullUp(MultiUnaryNode *childNode)
 		{
 			pullUpStatus = PULL_UP_VALID;
 		}
+		else if (parentPushDownStatus == PUSH_DOWN_SPECIAL_CONDITIONS)
+		{
+			pullUpStatus = PULL_UP_SPECIAL_CONDITIONS;
+		}
 		else
 		{
 			pullUpStatus = PULL_UP_NOT_VALID;
@@ -673,6 +949,15 @@ Commutative(MultiUnaryNode *parentNode, MultiUnaryNode *childNode)
 	}
 
 	/*
+	 * This is an extension to MRA logic. MultiTable node is also used to represent
+	 * a subquery. MultiCollect node can be safely pulled up on MultiTable node.
+	 */
+	if (parentNodeTag == T_MultiTable && childNodeTag == T_MultiCollect)
+	{
+		pushDownStatus = PUSH_DOWN_VALID;
+	}
+
+	/*
 	 * The project node is commutative with the below operators given that
 	 * its special conditions apply.
 	 */
@@ -680,6 +965,15 @@ Commutative(MultiUnaryNode *parentNode, MultiUnaryNode *childNode)
 		(parentNodeTag == T_MultiProject && childNodeTag == T_MultiPartition) ||
 		(parentNodeTag == T_MultiProject && childNodeTag == T_MultiSelect) ||
 		(parentNodeTag == T_MultiProject && childNodeTag == T_MultiJoin))
+	{
+		pushDownStatus = PUSH_DOWN_SPECIAL_CONDITIONS;
+	}
+
+	/*
+	 * MultiCollect node may be pulled up over MultiExtendedOp under some conditions.
+	 * Please see CanPullUpCollectOverExtendedOp() for details.
+	 */
+	if (parentNodeTag == T_MultiExtendedOp && childNodeTag == T_MultiCollect)
 	{
 		pushDownStatus = PUSH_DOWN_SPECIAL_CONDITIONS;
 	}
@@ -1151,6 +1445,15 @@ TransformSubqueryNode(MultiTable *subqueryNode)
 	List *groupTargetEntryList = GroupTargetEntryList(groupClauseList, targetEntryList);
 	TargetEntry *groupByTargetEntry = (TargetEntry *) linitial(groupTargetEntryList);
 	Expr *groupByExpression = groupByTargetEntry->expr;
+
+	List *joinNodeList = FindNodesOfType((MultiNode *) subqueryNode, T_MultiJoin);
+	if (list_length(joinNodeList) > 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot perform distributed planning on this query"),
+						errdetail("Subqueries with joins that need repartitioning are "
+								  "not supported yet")));
+	}
 
 	/*
 	 * If group by is on a function expression, then we create a new column from
@@ -2436,7 +2739,7 @@ SubqueryMultiTableList(MultiNode *multiNode)
 		MultiTable *multiTable = (MultiTable *) lfirst(multiTableNodeCell);
 		Query *subquery = multiTable->subquery;
 
-		if (subquery != NULL)
+		if (subquery != NULL || ChildNode( (MultiUnaryNode *) multiTable) != NULL)
 		{
 			subqueryMultiTableList = lappend(subqueryMultiTableList, multiTable);
 		}
@@ -3480,6 +3783,30 @@ RelationIdList(Query *query)
 
 
 /*
+ * MultiNodeRelationIdList returns list of unique relation ids in query tree.
+ */
+List *
+MultiNodeRelationIdList(MultiNode *multiNode)
+{
+	List *relationIdList = NIL;
+	List *multiTableNodeList = FindNodesOfType(multiNode, T_MultiTable);
+	ListCell *multiTableNodeCell = NULL;
+	foreach(multiTableNodeCell, multiTableNodeList)
+	{
+		MultiTable *multiTable = (MultiTable *) lfirst(multiTableNodeCell);
+
+		if (multiTable->relationId != SUBQUERY_RELATION_ID)
+		{
+			relationIdList = list_append_unique_oid(relationIdList,
+													multiTable->relationId);
+		}
+	}
+
+	return relationIdList;
+}
+
+
+/*
  * CoPartitionedTables checks if given two distributed tables have 1-to-1 shard
  * partitioning. It uses shard interval array that are sorted on interval minimum
  * values. Then it compares every shard interval in order and if any pair of
@@ -4146,3 +4473,177 @@ HasOrderByHllType(List *sortClauseList, List *targetList)
 
 	return hasOrderByHllType;
 }
+
+
+
+/*
+ * ErrorIfContainsUnsupportedSubqueryWithoutPushdown extracts subquery multi table from the
+ * logical plan and uses helper functions to check if we can support this query.
+ */
+static void
+ErrorIfContainsUnsupportedSubqueryWithoutPushdown(MultiNode *logicalPlanNode)
+{
+	List *subqueryMultiTableList = SubqueryMultiTableList(logicalPlanNode);
+	if (subqueryMultiTableList == NIL)
+	{
+		return;
+	}
+
+	ErrorIfHasUnsupportedJoinWithoutPushdown(logicalPlanNode);
+	ErrorIfUnsupportedShardDistributionWithoutPushdown(logicalPlanNode);
+}
+
+
+/*
+ * ErrorIfHasUnsupportedJoinWithoutPushdown recursively checks if join is on the partition column and
+ * errors out if it is not.
+ */
+static void
+ErrorIfHasUnsupportedJoinWithoutPushdown(MultiNode *multiNode)
+{
+	List *cartesianProductList = NIL;
+	List *joinNodeList = NIL;
+	ListCell *joinCell = NULL;
+
+	cartesianProductList =  FindNodesOfType(multiNode, T_MultiCartesianProduct);
+	if (list_length(cartesianProductList) > 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot push down this subquery"),
+						errdetail("Relations need to be joining on partition columns")));
+	}
+
+	joinNodeList = FindNodesOfType(multiNode, T_MultiJoin);
+	foreach(joinCell, joinNodeList)
+	{
+		MultiJoin *joinNode = (MultiJoin*) lfirst(joinCell);
+		bool joiningOnPartitionColumn = JoinOnPartitionColumnWithoutPushdown(joinNode);
+		if (!joiningOnPartitionColumn)
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot push down this subquery"),
+							errdetail("Relations need to be joining on partition "
+									  "columns")));
+		}
+	}
+}
+
+
+
+/*
+ * JoinOnPartitionColumnWithoutPushdown function returns true if the join is on the partition column,
+ * false otherwise.
+ */
+static bool
+JoinOnPartitionColumnWithoutPushdown(MultiJoin *joinNode)
+{
+	bool joinOnPartitionColumn = false;
+	List *partitionColumnList = ExtractPartitionColumns((MultiNode*) joinNode);
+	List *joinClauseList = joinNode->joinClauseList;
+	ListCell *joinClauseCell = NULL;
+	foreach(joinClauseCell, joinClauseList)
+	{
+		OpExpr *joinClause = (OpExpr *) lfirst(joinClauseCell);
+		List *joinArgumentList = joinClause->args;
+		Expr *leftArgument = (Expr *) linitial(joinArgumentList);
+		Expr *rightArgument = (Expr *) lsecond(joinArgumentList);
+
+		if (IsA(leftArgument, Var) && IsA(rightArgument, Var))
+		{
+			Var *leftVar = (Var*) leftArgument;
+			Var *rightVar = (Var*) rightArgument;
+			bool leftVarIsPartitionColumn = list_member(partitionColumnList, leftVar);
+			bool rightVarIsPartitionColumn = list_member(partitionColumnList, rightVar);
+
+			if (leftVarIsPartitionColumn && rightVarIsPartitionColumn)
+			{
+				joinOnPartitionColumn = true;
+				break;
+			}
+		}
+	}
+
+	return joinOnPartitionColumn;
+}
+
+
+/*
+ * ErrorIfUnsupportedShardDistributionWithoutPushdown gets list of relations in the given query
+ * and checks if two conditions below hold for them, otherwise it errors out.
+ * a. Every relation is distributed by range or hash. This means shards are
+ * disjoint based on the partition column.
+ * b. All relations have 1-to-1 shard partitioning between them. This means
+ * shard count for every relation is same and for every shard in a relation
+ * there is exactly one shard in other relations with same min/max values.
+ */
+static void
+ErrorIfUnsupportedShardDistributionWithoutPushdown(MultiNode *multiNode)
+{
+	Oid firstRelationId = InvalidOid;
+	List *relationIdList = MultiNodeRelationIdList(multiNode);
+	ListCell *relationIdCell = NULL;
+	uint32 relationIndex = 0;
+	uint32 rangeDistributedRelationCount = 0;
+	uint32 hashDistributedRelationCount = 0;
+
+	/* no need to check shard distribution for single table queries */
+	if (list_length(relationIdList) <= 1)
+	{
+		return;
+	}
+
+	foreach(relationIdCell, relationIdList)
+	{
+		Oid relationId = lfirst_oid(relationIdCell);
+		char partitionMethod = PartitionMethod(relationId);
+		if (partitionMethod == DISTRIBUTE_BY_RANGE)
+		{
+			rangeDistributedRelationCount++;
+		}
+		else if (partitionMethod == DISTRIBUTE_BY_HASH)
+		{
+			hashDistributedRelationCount++;
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot push down this subquery"),
+							errdetail("Currently range and hash partitioned "
+									  "relations are supported")));
+		}
+	}
+
+	if ((rangeDistributedRelationCount > 0) && (hashDistributedRelationCount > 0))
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot push down this subquery"),
+						errdetail("A query including both range and hash "
+								  "partitioned relations are unsupported")));
+	}
+
+	foreach(relationIdCell, relationIdList)
+	{
+		Oid currentRelationId = lfirst_oid(relationIdCell);
+		bool coPartitionedTables = false;
+
+		/* get shard list of first relation and continue for the next relation */
+		if (relationIndex == 0)
+		{
+			firstRelationId = currentRelationId;
+			relationIndex++;
+
+			continue;
+		}
+
+		/* check if this table as 1-1 shard partitioning with first table */
+		coPartitionedTables = CoPartitionedTables(firstRelationId, currentRelationId);
+		if (!coPartitionedTables)
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot push down this subquery"),
+							errdetail("Shards of relations in subquery need to "
+									  "have 1-to-1 shard partitioning")));
+		}
+	}
+}
+
