@@ -44,7 +44,6 @@ PG_FUNCTION_INFO_V1(load_shard_placement_array);
 PG_FUNCTION_INFO_V1(partition_column_id);
 PG_FUNCTION_INFO_V1(partition_type);
 PG_FUNCTION_INFO_V1(is_distributed_table);
-PG_FUNCTION_INFO_V1(column_name_to_column);
 PG_FUNCTION_INFO_V1(column_name_to_column_id);
 PG_FUNCTION_INFO_V1(create_monolithic_shard_row);
 PG_FUNCTION_INFO_V1(create_healthy_local_shard_placement_row);
@@ -207,37 +206,6 @@ is_distributed_table(PG_FUNCTION_ARGS)
 	bool isDistributedTable = IsDistributedTable(distributedTableId);
 
 	PG_RETURN_BOOL(isDistributedTable);
-}
-
-
-/*
- * column_name_to_column is an internal UDF to obtain a textual representation
- * of a particular column node (Var), given a relation identifier and column
- * name. There is no requirement that the table be distributed; this function
- * simply returns the textual representation of a Var representing a column.
- * This function will raise an ERROR if no such column can be found or if the
- * provided name refers to a system column.
- */
-Datum
-column_name_to_column(PG_FUNCTION_ARGS)
-{
-	Oid relationId = PG_GETARG_OID(0);
-	text *columnText = PG_GETARG_TEXT_P(1);
-	Relation relation = NULL;
-	char *columnName = text_to_cstring(columnText);
-	Var *column = NULL;
-	char *columnNodeString = NULL;
-	text *columnNodeText = NULL;
-
-	relation = relation_open(relationId, AccessExclusiveLock);
-
-	column = (Var *) BuildDistributionKeyFromColumnName(relation, columnName);
-	columnNodeString = nodeToString(column);
-	columnNodeText = cstring_to_text(columnNodeString);
-
-	relation_close(relation, NoLock);
-
-	PG_RETURN_TEXT_P(columnNodeText);
 }
 
 

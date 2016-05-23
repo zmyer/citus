@@ -16,6 +16,7 @@
 #include "libpq-fe.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
+#include "utils/hsearch.h"
 
 
 /* Enumeration that defines the different commit protocols available */

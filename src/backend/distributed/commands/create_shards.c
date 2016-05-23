@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * master_create_shards.c
+ * create_shards.c
  *
  * This file contains functions to distribute a table by creating shards for it
  * across a set of worker nodes.
@@ -30,11 +30,13 @@
 #include "distributed/listutils.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/resource_lock.h"
 #include "distributed/worker_manager.h"
+#include "distributed/worker_transaction.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
@@ -49,22 +51,21 @@
 
 
 /* local function forward declarations */
+static void CreateWorkerShards(Oid distributedTableId, int shardCount,
+							   int replicationFactor);
 static void CheckHashPartitionedTable(Oid distributedTableId);
 static text * IntegerToText(int32 value);
 
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(master_create_worker_shards);
+PG_FUNCTION_INFO_V1(cluster_create_shards);
 
 
 /*
- * master_create_worker_shards creates empty shards for the given table based
- * on the specified number of initial shards. The function first gets a list of
- * candidate nodes and issues DDL commands on the nodes to create empty shard
- * placements on those nodes. The function then updates metadata on the master
- * node to make this shard (and its placements) visible. Note that the function
- * assumes the table is hash partitioned and calculates the min/max hash token
- * ranges for each shard, giving them an equal split of the hash space.
+ * master_create_worker_shards creates empty shards for the given
+ * master-distributed table based on the specified number of initial
+ * shards and replication factor.
  */
 Datum
 master_create_worker_shards(PG_FUNCTION_ARGS)
@@ -74,8 +75,59 @@ master_create_worker_shards(PG_FUNCTION_ARGS)
 	int32 replicationFactor = PG_GETARG_INT32(2);
 
 	Oid distributedTableId = ResolveRelationId(tableNameText);
+
+	CreateWorkerShards(distributedTableId, shardCount,
+					  replicationFactor);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * cluster_create_shards creates empty shards for the given
+ * cluster-distributed table based on the specified number of initial
+ * shards.
+ */
+Datum
+cluster_create_shards(PG_FUNCTION_ARGS)
+{
+	Oid distributedRelationId = PG_GETARG_OID(0);
+	int32 shardCount = PG_GETARG_INT32(1);
+
+	List *shardIntervalList = NIL;
+	List *commandList = NIL;
+	ListCell *commandCell = NULL;
+
+	CreateWorkerShards(distributedRelationId, shardCount, 1);
+
+	shardIntervalList = LoadShardIntervalList(distributedRelationId);
+	commandList = ShardCreateCommands(shardIntervalList);
+
+	foreach(commandCell, commandList)
+	{
+		char *command = (char *) lfirst(commandCell);
+
+		SendCommandToWorkersInParallel(command);
+	}
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * CreateWorkerShards creates empty shards for the given table based on the
+ * specified number of initial shards. The function first gets a list of
+ * candidate nodes and issues DDL commands on the nodes to create empty shard
+ * placements on those nodes. The function then updates metadata on the master
+ * node to make this shard (and its placements) visible. Note that the function
+ * assumes the table is hash partitioned and calculates the min/max hash token
+ * ranges for each shard, giving them an equal split of the hash space.
+ */
+static void
+CreateWorkerShards(Oid distributedTableId, int shardCount, int replicationFactor)
+{
 	char relationKind = get_rel_relkind(distributedTableId);
-	char *tableName = text_to_cstring(tableNameText);
+	char *tableName = get_rel_name(distributedTableId);
 	char *relationOwner = NULL;
 	char shardStorageType = '\0';
 	List *workerNodeList = NIL;
@@ -209,8 +261,6 @@ master_create_worker_shards(PG_FUNCTION_ARGS)
 	}
 
 	RESUME_INTERRUPTS();
-
-	PG_RETURN_VOID();
 }
 
 

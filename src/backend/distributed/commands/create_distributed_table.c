@@ -16,6 +16,7 @@
 #include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/nbtree.h"
+#include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
@@ -25,9 +26,13 @@
 #include "catalog/pg_opclass.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
+#include "distributed/citus_ruleutils.h"
 #include "distributed/master_metadata_utility.h"
+#include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/pg_dist_partition.h"
+#include "distributed/worker_transaction.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
@@ -44,26 +49,25 @@
 
 /* local function forward declarations */
 static char LookupDistributionMethod(Oid distributionMethodOid);
+static char * LookupDistributionMethodName(Oid distributionMethodOid);
 static void RecordDistributedRelationDependencies(Oid distributedRelationId,
 												  Node *distributionKey);
 static Oid SupportFunctionForColumn(Var *partitionColumn, Oid accessMethodId,
 									int16 supportFunctionNumber);
+static void CreateDistributedTable(Oid distributedRelationId,
+								   char distributionMethod,
+								   char *distributionColumnName);
 
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_create_distributed_table);
+PG_FUNCTION_INFO_V1(cluster_create_distributed_table);
 
 
 /*
- * master_create_distributed_table accepts a table, distribution column and
- * method and performs the corresponding catalog changes.
- *
- * XXX: We should perform more checks here to see if this table is fit for
- * partitioning. At a minimum, we should validate the following: (i) this node
- * runs as the master node, (ii) table does not make use of the inheritance
- * mechanism, (iii) table does not own columns that are sequences, and (iv)
- * table does not have collated columns. (v) table does not have
- * preexisting content.
+ * master_create_distributed_table accepts a table, distribution column
+ * and method and performs the appropriate catalog changes to turn a
+ * table into a master-distributed table.
  */
 Datum
 master_create_distributed_table(PG_FUNCTION_ARGS)
@@ -72,13 +76,80 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 	text *distributionColumnText = PG_GETARG_TEXT_P(1);
 	Oid distributionMethodOid = PG_GETARG_OID(2);
 
+	char distributionMethod = LookupDistributionMethod(distributionMethodOid);
+	char *distributionColumnName = text_to_cstring(distributionColumnText);
+
+	CreateDistributedTable(distributedRelationId, distributionMethod,
+						   distributionColumnName);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * cluster_create_distributed_table accepts a table, distribution column
+ * and method and performs the appropriate catalog changes to turn a table
+ * into a cluster-distributed table.
+ */
+Datum
+cluster_create_distributed_table(PG_FUNCTION_ARGS)
+{
+	Oid distributedRelationId = PG_GETARG_OID(0);
+	text *distributionColumnText = PG_GETARG_TEXT_P(1);
+	Oid distributionMethodOid = PG_GETARG_OID(2);
+
+	char distributionMethod = 0;
+	char *distributionColumnName = NULL;
+
+	List *commandList = NIL;
+	ListCell *commandCell = NULL;
+	char *metadataCommand = NULL;
+
+	distributionMethod = LookupDistributionMethod(distributionMethodOid);
+	distributionColumnName = text_to_cstring(distributionColumnText);
+
+	CreateDistributedTable(distributedRelationId, distributionMethod,
+						   distributionColumnName);
+
+	commandList = GetTableDDLEvents(distributedRelationId);
+
+	metadataCommand = DistributionCreateCommand(distributedRelationId,
+												distributionMethod,
+												distributionColumnName);
+
+	commandList = lappend(commandList, metadataCommand);
+
+	foreach(commandCell, commandList)
+	{
+		char *command = (char *) lfirst(commandCell);
+
+		SendCommandToWorkersInParallel(command);
+	}
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * CreateDistributedTable accepts a table, distribution column and method
+ * and performs the appropriate catalog changes.
+ *
+ * XXX: We should perform more checks here to see if this table is fit for
+ * partitioning. At a minimum, we should validate the following: (i) this node
+ * runs as the master node, (ii) table does not make use of the inheritance
+ * mechanism, (iii) table does not own columns that are sequences, and (iv)
+ * table does not have collated columns. (v) table does not have
+ * preexisting content.
+ */
+static void
+CreateDistributedTable(Oid distributedRelationId, char distributionMethod,
+					   char *distributionColumnName)
+{
 	Relation distributedRelation = NULL;
 	char *distributedRelationName = NULL;
 	char relationKind = '\0';
 
 	Relation pgDistPartition = NULL;
-	char distributionMethod = LookupDistributionMethod(distributionMethodOid);
-	char *distributionColumnName = text_to_cstring(distributionColumnText);
 	Node *distributionKey = NULL;
 	Var *distributionColumn = NULL;
 	char *distributionKeyString = NULL;
@@ -248,14 +319,14 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 	/* finally insert tuple, build index entries & register cache invalidation */
 	simple_heap_insert(pgDistPartition, newTuple);
 	CatalogUpdateIndexes(pgDistPartition, newTuple);
-	CitusInvalidateRelcacheByRelid(distributedRelationId);
 
 	RecordDistributedRelationDependencies(distributedRelationId, distributionKey);
+	CommandCounterIncrement();
 
 	heap_close(pgDistPartition, NoLock);
-	relation_close(distributedRelation, NoLock);
+	CitusInvalidateRelcacheByRelid(distributedRelationId);
 
-	PG_RETURN_VOID();
+	relation_close(distributedRelation, NoLock);
 }
 
 
@@ -304,20 +375,10 @@ RecordDistributedRelationDependencies(Oid distributedRelationId, Node *distribut
 static char
 LookupDistributionMethod(Oid distributionMethodOid)
 {
-	HeapTuple enumTuple = NULL;
-	Form_pg_enum enumForm = NULL;
 	char distributionMethod = 0;
 	const char *enumLabel = NULL;
 
-	enumTuple = SearchSysCache1(ENUMOID, ObjectIdGetDatum(distributionMethodOid));
-	if (!HeapTupleIsValid(enumTuple))
-	{
-		ereport(ERROR, (errmsg("invalid internal value for enum: %u",
-							   distributionMethodOid)));
-	}
-
-	enumForm = (Form_pg_enum) GETSTRUCT(enumTuple);
-	enumLabel = NameStr(enumForm->enumlabel);
+	enumLabel = LookupDistributionMethodName(distributionMethodOid);
 
 	if (strncmp(enumLabel, "append", NAMEDATALEN) == 0)
 	{
@@ -336,11 +397,37 @@ LookupDistributionMethod(Oid distributionMethodOid)
 		ereport(ERROR, (errmsg("invalid label for enum: %s", enumLabel)));
 	}
 
-	ReleaseSysCache(enumTuple);
-
 	return distributionMethod;
 }
 
+
+/*
+ * LookupDistributionMethodName maps the oids of citus.distribution_type enum
+ * values to an enum label.
+ *
+ * The passed in oid has to belong to a value of citus.distribution_type.
+ */
+static char *
+LookupDistributionMethodName(Oid distributionMethodOid)
+{
+	HeapTuple enumTuple = NULL;
+	Form_pg_enum enumForm = NULL;
+	char *enumLabel = NULL;
+
+	enumTuple = SearchSysCache1(ENUMOID, ObjectIdGetDatum(distributionMethodOid));
+	if (!HeapTupleIsValid(enumTuple))
+	{
+		ereport(ERROR, (errmsg("invalid internal value for enum: %u",
+							   distributionMethodOid)));
+	}
+
+	enumForm = (Form_pg_enum) GETSTRUCT(enumTuple);
+	enumLabel = NameStr(enumForm->enumlabel);
+
+	ReleaseSysCache(enumTuple);
+
+	return enumLabel;
+}
 
 /*
  *	SupportFunctionForColumn locates a support function given a column, an access method,
