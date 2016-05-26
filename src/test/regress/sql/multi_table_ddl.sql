@@ -30,7 +30,7 @@ SELECT 1 FROM master_create_empty_shard('testtableddl');
 DROP TABLE testtableddl;
 
 -- ensure no metadata of distributed tables are remaining
-SELECT * FROM pg_dist_partition;
+SELECT logicalrelid FROM pg_dist_partition;
 SELECT * FROM pg_dist_shard;
 SELECT * FROM pg_dist_shard_placement;
 

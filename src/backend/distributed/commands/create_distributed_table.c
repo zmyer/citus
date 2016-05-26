@@ -56,7 +56,8 @@ static Oid SupportFunctionForColumn(Var *partitionColumn, Oid accessMethodId,
 									int16 supportFunctionNumber);
 static void CreateDistributedTable(Oid distributedRelationId,
 								   char distributionMethod,
-								   char *distributionColumnName);
+								   char *distributionColumnName,
+								   bool isCluster);
 
 
 /* exports for SQL callable functions */
@@ -80,7 +81,7 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 	char *distributionColumnName = text_to_cstring(distributionColumnText);
 
 	CreateDistributedTable(distributedRelationId, distributionMethod,
-						   distributionColumnName);
+						   distributionColumnName, false);
 
 	PG_RETURN_VOID();
 }
@@ -106,10 +107,19 @@ cluster_create_distributed_table(PG_FUNCTION_ARGS)
 	char *metadataCommand = NULL;
 
 	distributionMethod = LookupDistributionMethod(distributionMethodOid);
+	if (distributionMethod != DISTRIBUTE_BY_HASH)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot create clustered append-distributed "
+							   "table"),
+						errdetail("Only hash-distributed tables can be "
+								  "clustered.")));
+	}
+
 	distributionColumnName = text_to_cstring(distributionColumnText);
 
 	CreateDistributedTable(distributedRelationId, distributionMethod,
-						   distributionColumnName);
+						   distributionColumnName, true);
 
 	commandList = GetTableDDLEvents(distributedRelationId);
 
@@ -143,7 +153,8 @@ cluster_create_distributed_table(PG_FUNCTION_ARGS)
  */
 static void
 CreateDistributedTable(Oid distributedRelationId, char distributionMethod,
-					   char *distributionColumnName)
+					   char *distributionColumnName,
+					   bool isCluster)
 {
 	Relation distributedRelation = NULL;
 	char *distributedRelationName = NULL;
@@ -313,6 +324,10 @@ CreateDistributedTable(Oid distributedRelationId, char distributionMethod,
 		CharGetDatum(distributionMethod);
 	newValues[Anum_pg_dist_partition_partkey - 1] =
 		CStringGetTextDatum(distributionKeyString);
+	newValues[Anum_pg_dist_partition_isowner - 1] =
+		BoolGetDatum(true);
+	newValues[Anum_pg_dist_partition_iscluster - 1] =
+		BoolGetDatum(isCluster);
 
 	newTuple = heap_form_tuple(RelationGetDescr(pgDistPartition), newValues, newNulls);
 

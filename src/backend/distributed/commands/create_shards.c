@@ -30,6 +30,7 @@
 #include "distributed/listutils.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/pg_dist_partition.h"
@@ -55,6 +56,7 @@ static void CreateWorkerShards(Oid distributedTableId, int shardCount,
 							   int replicationFactor);
 static void CheckHashPartitionedTable(Oid distributedTableId);
 static text * IntegerToText(int32 value);
+static void CheckClusteredTable(Oid relationId);
 
 
 /* declarations for dynamic loading */
@@ -97,6 +99,15 @@ cluster_create_shards(PG_FUNCTION_ARGS)
 	List *shardIntervalList = NIL;
 	List *commandList = NIL;
 	ListCell *commandCell = NULL;
+
+	if (!IsTableMaster(distributedRelationId))
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("can only create shards on the node that created "
+							   "the table")));
+	}
+
+	CheckClusteredTable(distributedRelationId);
 
 	CreateWorkerShards(distributedRelationId, shardCount, 1);
 
@@ -292,4 +303,22 @@ IntegerToText(int32 value)
 	valueText = cstring_to_text(valueString->data);
 
 	return valueText;
+}
+
+
+/*
+ * CheckClusteredTable throws an error if relationId is not
+ * cluster-distributed.
+ */
+static void
+CheckClusteredTable(Oid relationId)
+{
+	DistTableCacheEntry *distTableEntry = NULL;
+
+	distTableEntry = DistributedTableCacheEntry(relationId);
+	if (!distTableEntry->isCluster)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("table is not cluster-distributed")));
+	}
 }

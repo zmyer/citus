@@ -32,6 +32,8 @@ typedef struct
 	bool isValid;
 
 	bool isDistributedTable;
+	bool isOwner;
+	bool isCluster;
 	bool hasUninitializedShardInterval;
 	bool hasUniformHashDistribution; /* valid for hash partitioned tables */
 
@@ -49,6 +51,7 @@ typedef struct
 
 
 extern bool IsDistributedTable(Oid relationId);
+extern bool IsTableMaster(Oid relationId);
 extern ShardInterval * LoadShardInterval(uint64 shardId);
 extern DistTableCacheEntry * DistributedTableCacheEntry(Oid distributedRelationId);
 extern void CitusInvalidateRelcacheByRelid(Oid relationId);

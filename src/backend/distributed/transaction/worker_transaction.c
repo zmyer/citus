@@ -26,12 +26,14 @@
 
 
 /* Local functions forward declarations */
-static List * OpenWorkerTransactions();
+static List * OpenWorkerTransactions(void);
 static void CompleteWorkerTransactions(XactEvent event, void *arg);
+static void CloseWorkerConnections(void);
 
 
 /* Global worker connection list */
 static List *workerConnectionList = NIL;
+static bool isXactCallbackRegistered = false;
 
 
 /*
@@ -60,7 +62,6 @@ SendCommandToWorkersInOrder(char *command)
 			char *nodePort = ConnectionGetOptionValue(connection, "port");
 
 			ReportRemoteError(connection, result);
-			PurgeConnection(connection);
 
 			ereport(ERROR, (errmsg("failed to send metadata change to %s:%s",
 								   nodeName, nodePort)));
@@ -95,7 +96,6 @@ SendCommandToWorkersInParallel(char *command)
 			char *nodePort = ConnectionGetOptionValue(connection, "port");
 
 			ReportRemoteError(connection, NULL);
-			PurgeConnection(connection);
 
 			ereport(ERROR, (errmsg("failed to send metadata change to %s:%s",
 								   nodeName, nodePort)));
@@ -116,7 +116,6 @@ SendCommandToWorkersInParallel(char *command)
 			char *nodePort = ConnectionGetOptionValue(connection, "port");
 
 			ReportRemoteError(connection, result);
-			PurgeConnection(connection);
 			PQclear(result);
 
 			ereport(ERROR, (errmsg("failed to apply metadata change on %s:%s",
@@ -196,7 +195,11 @@ OpenWorkerTransactions(void)
 
 	MemoryContextSwitchTo(oldContext);
 
-	RegisterXactCallback(CompleteWorkerTransactions, connectionList);
+	if (!isXactCallbackRegistered)
+	{
+		RegisterXactCallback(CompleteWorkerTransactions, NULL);
+		isXactCallbackRegistered = true;
+	}
 
 	workerConnectionList = connectionList;
 
@@ -211,9 +214,12 @@ OpenWorkerTransactions(void)
 static void
 CompleteWorkerTransactions(XactEvent event, void *arg)
 {
-	List *connectionList = (List *) arg;
-
-	if (event == XACT_EVENT_PRE_COMMIT)
+	if (workerConnectionList == NIL)
+	{
+		/* nothing to do */
+		return;
+	}
+	else if (event == XACT_EVENT_PRE_COMMIT)
 	{
 		/*
 		 * Any failure here will cause local changes to be rolled back,
@@ -224,7 +230,7 @@ CompleteWorkerTransactions(XactEvent event, void *arg)
 
 		if (MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC)
 		{
-			PrepareRemoteTransactions(connectionList);
+			PrepareRemoteTransactions(workerConnectionList);
 		}
 
 		return;
@@ -238,7 +244,7 @@ CompleteWorkerTransactions(XactEvent event, void *arg)
 		 * changes have already been committed.
 		 */
 
-		CommitRemoteTransactions(connectionList, false);
+		CommitRemoteTransactions(workerConnectionList, false);
 	}
 	else if (event == XACT_EVENT_ABORT)
 	{
@@ -249,7 +255,7 @@ CompleteWorkerTransactions(XactEvent event, void *arg)
 		 * already been rolled back.
 		 */
 
-		AbortRemoteTransactions(connectionList);
+		AbortRemoteTransactions(workerConnectionList);
 	}
 	else
 	{
@@ -257,6 +263,5 @@ CompleteWorkerTransactions(XactEvent event, void *arg)
 	}
 
 	workerConnectionList = NIL;
-
-	UnregisterXactCallback(CompleteWorkerTransactions, connectionList);
 }
+

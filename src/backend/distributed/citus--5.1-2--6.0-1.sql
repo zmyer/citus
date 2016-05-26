@@ -34,4 +34,7 @@ CREATE FUNCTION cluster_create_shards(table_name regclass, shard_count integer)
 COMMENT ON FUNCTION cluster_create_shards(table_name regclass, shard_count integer)
     IS 'create shards for a cluster-distributed table';
 
+ALTER TABLE pg_dist_partition ADD COLUMN isowner bool DEFAULT true NOT NULL;
+ALTER TABLE pg_dist_partition ADD COLUMN iscluster bool DEFAULT false NOT NULL;
+
 RESET search_path;

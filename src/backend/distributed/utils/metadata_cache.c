@@ -119,6 +119,20 @@ IsDistributedTable(Oid relationId)
 
 
 /*
+ * IsTableMaster returns whether this node is the master of relationId.
+ */
+bool
+IsTableMaster(Oid relationId)
+{
+	DistTableCacheEntry *cacheEntry = NULL;
+
+	cacheEntry = LookupDistTableCacheEntry(relationId);
+
+	return cacheEntry->isOwner;
+}
+
+
+/*
  * LoadShardInterval reads shard metadata for given shardId from pg_dist_shard,
  * and converts min/max values in these metadata to their properly typed datum
  * representations. The function then allocates a structure that stores the read
@@ -218,6 +232,8 @@ LookupDistTableCacheEntry(Oid relationId)
 	HeapTuple distPartitionTuple = NULL;
 	char *partitionKeyString = NULL;
 	char partitionMethod = 0;
+	bool isOwner = false;
+	bool isCluster = false;
 	List *distShardTupleList = NIL;
 	int shardIntervalArrayLength = 0;
 	ShardInterval **shardIntervalArray = NULL;
@@ -253,15 +269,24 @@ LookupDistTableCacheEntry(Oid relationId)
 		Form_pg_dist_partition partitionForm =
 			(Form_pg_dist_partition) GETSTRUCT(distPartitionTuple);
 		Datum partitionKeyDatum = PointerGetDatum(&partitionForm->partkey);
+		Relation pgDistPartition = heap_open(DistPartitionRelationId(), AccessShareLock);
+		TupleDesc tupleDescriptor = RelationGetDescr(pgDistPartition);
+		bool isNull = false;
 
 		MemoryContext oldContext = MemoryContextSwitchTo(CacheMemoryContext);
 
 		partitionKeyString = TextDatumGetCString(partitionKeyDatum);
 		partitionMethod = partitionForm->partmethod;
 
+		isOwner = heap_getattr(distPartitionTuple, Anum_pg_dist_partition_isowner,
+							   tupleDescriptor, &isNull);
+		isCluster = heap_getattr(distPartitionTuple,
+								 Anum_pg_dist_partition_iscluster,
+											tupleDescriptor, &isNull);
 		MemoryContextSwitchTo(oldContext);
 
 		heap_freetuple(distPartitionTuple);
+		heap_close(pgDistPartition, AccessShareLock);
 	}
 
 	distShardTupleList = LookupDistShardTuples(relationId);
@@ -365,6 +390,8 @@ LookupDistTableCacheEntry(Oid relationId)
 	{
 		cacheEntry->isValid = true;
 		cacheEntry->isDistributedTable = true;
+		cacheEntry->isOwner = isOwner;
+		cacheEntry->isCluster = isCluster;
 		cacheEntry->partitionKeyString = partitionKeyString;
 		cacheEntry->partitionMethod = partitionMethod;
 		cacheEntry->shardIntervalArrayLength = shardIntervalArrayLength;
@@ -1042,8 +1069,6 @@ LookupDistPartitionTuple(Oid relationId)
 	currentPartitionTuple = systable_getnext(scanDescriptor);
 	if (HeapTupleIsValid(currentPartitionTuple))
 	{
-		Assert(!HeapTupleHasNulls(currentPartitionTuple));
-
 		distPartitionTuple = heap_copytuple(currentPartitionTuple);
 	}
 

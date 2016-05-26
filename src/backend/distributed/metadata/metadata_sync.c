@@ -37,8 +37,8 @@
  */
 char *
 DistributionCreateCommand(Oid distributedRelationId,
-						   char distributionMethod,
-						   char *distributionColumnName)
+						  char distributionMethod,
+						  char *distributionColumnName)
 {
 	char *distributedRelationName = NULL;
 	StringInfo insertDistributionCommand = makeStringInfo();
@@ -47,9 +47,10 @@ DistributionCreateCommand(Oid distributedRelationId,
 
 	appendStringInfo(insertDistributionCommand,
 					 "INSERT INTO pg_dist_partition "
-					 "(logicalrelid, partmethod, partkey) "
+					 "(logicalrelid, partmethod, partkey, isowner, iscluster) "
 					 "VALUES "
-					 "(%s::regclass, '%c', column_name_to_column(%s,%s))",
+					 "(%s::regclass, '%c', column_name_to_column(%s,%s),"
+					 " false, true)",
 					 quote_literal_cstr(distributedRelationName),
 					 distributionMethod,
 					 quote_literal_cstr(distributedRelationName),

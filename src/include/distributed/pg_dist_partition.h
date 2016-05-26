@@ -37,10 +37,12 @@ typedef FormData_pg_dist_partition *Form_pg_dist_partition;
  *      compiler constants for pg_dist_partitions
  * ----------------
  */
-#define Natts_pg_dist_partition 3
+#define Natts_pg_dist_partition 5
 #define Anum_pg_dist_partition_logicalrelid 1
 #define Anum_pg_dist_partition_partmethod 2
 #define Anum_pg_dist_partition_partkey 3
+#define Anum_pg_dist_partition_isowner 4
+#define Anum_pg_dist_partition_iscluster 5
 
 /* valid values for partmethod include append, hash, and range */
 #define DISTRIBUTE_BY_APPEND 'a'
