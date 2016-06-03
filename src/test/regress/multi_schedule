@@ -7,6 +7,7 @@
 # test results. For more information:
 # http://www.postgresql.org/docs/9.5/static/regress-variant.html
 # ----------
+# ----------
 
 # ---
 # Tests around schema changes, these are run first, so there's no preexisting objects.
@@ -149,3 +150,7 @@ test: multi_drop_extension
 # multi_complex_count_distinct creates table lineitem_hash, creates shards and load data
 # ----------
 test: multi_complex_count_distinct
+
+# multi_comprehensive_schema runs all Citus functionality on/cross different schemas
+# ----------
+test: multi_comprehensive_schema
