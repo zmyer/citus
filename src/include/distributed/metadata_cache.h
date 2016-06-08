@@ -62,6 +62,7 @@ extern bool CitusHasBeenLoaded(void);
 extern Oid DistPartitionRelationId(void);
 extern Oid DistShardRelationId(void);
 extern Oid DistShardPlacementRelationId(void);
+extern Oid DistNodeRelationId(void);
 
 /* index oids */
 extern Oid DistPartitionLogicalRelidIndexId(void);

@@ -37,4 +37,36 @@ COMMENT ON FUNCTION cluster_create_shards(table_name regclass, shard_count integ
 ALTER TABLE pg_dist_partition ADD COLUMN isowner bool DEFAULT true NOT NULL;
 ALTER TABLE pg_dist_partition ADD COLUMN iscluster bool DEFAULT false NOT NULL;
 
+-- TODO: Is there a better place to define the followings?
+CREATE TABLE citus.pg_dist_node(
+    nodeid int NOT NULL,
+    nodename text NOT NULL,
+    nodeport int NOT NULL,
+    noderole "char" NOT NULL,
+    groupid bigint NOT NULL
+);
+
+CREATE SEQUENCE citus.pg_dist_groupid_seq
+    MINVALUE 1
+    MAXVALUE 4294967296;
+
+CREATE SEQUENCE citus.pg_dist_node_nodeid_seq
+    MINVALUE 1
+    MAXVALUE 4294967296;
+
+ALTER TABLE citus.pg_dist_node SET SCHEMA pg_catalog;
+ALTER SEQUENCE  citus.pg_dist_groupid_seq SET SCHEMA pg_catalog;
+ALTER SEQUENCE  citus.pg_dist_node_nodeid_seq SET SCHEMA pg_catalog;
+
+CREATE FUNCTION cluster_add_node(nodename text,
+                                 nodeport integer,
+                                 groupid integer)
+    RETURNS bool
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', $$cluster_add_node$$;
+COMMENT ON FUNCTION cluster_add_node(nodename text,
+                                     nodeport integer,
+                                     groupid integer)
+    IS 'add nodes to the cluster';
+
 RESET search_path;

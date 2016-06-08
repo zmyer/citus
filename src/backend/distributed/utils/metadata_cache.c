@@ -49,6 +49,7 @@ static bool extensionLoaded = false;
 static Oid distShardRelationId = InvalidOid;
 static Oid distShardPlacementRelationId = InvalidOid;
 static Oid distPartitionRelationId = InvalidOid;
+static Oid distNodeRelationId = InvalidOid;
 static Oid distPartitionLogicalRelidIndexId = InvalidOid;
 static Oid distShardLogicalRelidIndexId = InvalidOid;
 static Oid distShardShardidIndexId = InvalidOid;
@@ -618,6 +619,15 @@ DistPartitionRelationId(void)
 	return distPartitionRelationId;
 }
 
+
+/* return oid of pg_dist_partition relation */
+Oid
+DistNodeRelationId(void)
+{
+	CachedRelationLookup("pg_dist_node", &distNodeRelationId);
+
+	return distNodeRelationId;
+}
 
 /* return oid of pg_dist_partition_logical_relid_index index */
 Oid
