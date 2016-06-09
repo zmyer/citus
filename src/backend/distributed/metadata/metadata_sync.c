@@ -177,4 +177,3 @@ ShardDeleteCommands(List *shardIntervalList)
 
 	return commandList;
 }
-

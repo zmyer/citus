@@ -37,3 +37,7 @@ SELECT * FROM pg_dist_shard_placement;
 -- check that the extension now can be dropped (and recreated)
 DROP EXTENSION citus;
 CREATE EXTENSION citus;
+
+-- re-add the nodes to the cluster
+SELECT cluster_add_node('localhost', :worker_1_port);
+SELECT cluster_add_node('localhost', :worker_2_port);

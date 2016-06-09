@@ -5,6 +5,10 @@
 -- Create new table definitions for use in testing in distributed foreign data
 -- wrapper functionality.
 
+-- add nodes to the cluster
+SELECT cluster_add_node('localhost', :worker_1_port);
+SELECT cluster_add_node('localhost', :worker_2_port);
+
 SELECT fdwname FROM pg_foreign_data_wrapper;
 
 CREATE SERVER file_server FOREIGN DATA WRAPPER file_fdw;

@@ -141,18 +141,26 @@ static List *
 OpenWorkerTransactions(void)
 {
 	ListCell *workerNodeCell = NULL;
-	List *workerList = NIL;
 	List *connectionList = NIL;
 	MemoryContext oldContext = NULL;
+	List *workerList = WorkerNodeList();
+	int workerCount = list_length(workerList);
+	int workerConnectionCount = list_length(workerConnectionList);
 
+	/* a new node is added to the cluster, re-open the connections */
+	if (workerCount != workerConnectionCount)
+	{
+		CloseConnections(workerConnectionList);
+		workerConnectionList = NIL;
+	}
+
+	/* connections were cached, we need to drop them as well */
 	if (workerConnectionList != NIL)
 	{
 		return workerConnectionList;
 	}
 
 	/* TODO: lock worker list */
-
-	workerList = WorkerNodeList();
 	oldContext = MemoryContextSwitchTo(TopTransactionContext);
 
 	foreach(workerNodeCell, workerList)
@@ -264,4 +272,3 @@ CompleteWorkerTransactions(XactEvent event, void *arg)
 
 	workerConnectionList = NIL;
 }
-

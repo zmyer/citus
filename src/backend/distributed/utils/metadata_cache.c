@@ -25,9 +25,11 @@
 #include "commands/trigger.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/pg_dist_node.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/shardinterval_utils.h"
+#include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
 #include "parser/parse_func.h"
 #include "utils/builtins.h"
@@ -48,6 +50,7 @@
 static bool extensionLoaded = false;
 static Oid distShardRelationId = InvalidOid;
 static Oid distShardPlacementRelationId = InvalidOid;
+static Oid distNodeRelationId = InvalidOid;
 static Oid distPartitionRelationId = InvalidOid;
 static Oid distPartitionLogicalRelidIndexId = InvalidOid;
 static Oid distShardLogicalRelidIndexId = InvalidOid;
@@ -57,6 +60,9 @@ static Oid extraDataContainerFuncId = InvalidOid;
 
 /* Hash table for informations about each partition */
 static HTAB *DistTableCacheHash = NULL;
+
+/* Hash table for informations about worker nodes */
+static HTAB *WorkerNodeHash = NULL;
 
 /* built first time through in InitializePartitionCache */
 static ScanKeyData DistPartitionScanKey[1];
@@ -76,8 +82,10 @@ static bool HasUniformHashDistribution(ShardInterval **shardIntervalArray,
 static bool HasUninitializedShardInterval(ShardInterval **sortedShardIntervalArray,
 										  int shardCount);
 static void InitializeDistTableCache(void);
+static void InitializeWorkerNodeCache(void);
 static void ResetDistTableCacheEntry(DistTableCacheEntry *cacheEntry);
 static void InvalidateDistRelationCacheCallback(Datum argument, Oid relationId);
+static void InvalidateNodeRelationCacheCallback(Datum argument, Oid relationId);
 static HeapTuple LookupDistPartitionTuple(Oid relationId);
 static List * LookupDistShardTuples(Oid relationId);
 static void GetPartitionTypeInputInfo(char *partitionKeyString, char partitionMethod,
@@ -85,12 +93,15 @@ static void GetPartitionTypeInputInfo(char *partitionKeyString, char partitionMe
 static ShardInterval * TupleToShardInterval(HeapTuple heapTuple,
 											TupleDesc tupleDescriptor, Oid intervalTypeId,
 											int32 intervalTypeMod);
+static List * ReadWorkerNodes(void);
+static WorkerNode * TupleToWorkerNode(TupleDesc tupleDescriptor, HeapTuple heapTuple);
 static void CachedRelationLookup(const char *relationName, Oid *cachedOid);
 
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_dist_partition_cache_invalidate);
 PG_FUNCTION_INFO_V1(master_dist_shard_cache_invalidate);
+PG_FUNCTION_INFO_V1(master_dist_node_cache_invalidate);
 
 
 /*
@@ -282,7 +293,7 @@ LookupDistTableCacheEntry(Oid relationId)
 							   tupleDescriptor, &isNull);
 		isCluster = heap_getattr(distPartitionTuple,
 								 Anum_pg_dist_partition_iscluster,
-											tupleDescriptor, &isNull);
+								 tupleDescriptor, &isNull);
 		MemoryContextSwitchTo(oldContext);
 
 		heap_freetuple(distPartitionTuple);
@@ -609,6 +620,16 @@ DistShardPlacementRelationId(void)
 }
 
 
+/* return oid of pg_dist_node relation */
+Oid
+DistNodeRelationId(void)
+{
+	CachedRelationLookup("pg_dist_node", &distNodeRelationId);
+
+	return distNodeRelationId;
+}
+
+
 /* return oid of pg_dist_partition relation */
 Oid
 DistPartitionRelationId(void)
@@ -882,6 +903,29 @@ master_dist_shard_cache_invalidate(PG_FUNCTION_ARGS)
 }
 
 
+/*
+ * master_dist_node_cache_invalidate is a trigger function that performs
+ * relcache invalidations when the contents of pg_dist_node are changed
+ * on the SQL level.
+ *
+ * NB: We decided there is little point in checking permissions here, there
+ * are much easier ways to waste CPU than causing cache invalidations.
+ */
+Datum
+master_dist_node_cache_invalidate(PG_FUNCTION_ARGS)
+{
+	if (!CALLED_AS_TRIGGER(fcinfo))
+	{
+		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+						errmsg("must be called as trigger")));
+	}
+
+	CitusInvalidateRelcacheByRelid(DistNodeRelationId());
+
+	PG_RETURN_DATUM(PointerGetDatum(NULL));
+}
+
+
 /* initialize the infrastructure for the metadata cache */
 static void
 InitializeDistTableCache(void)
@@ -927,6 +971,110 @@ InitializeDistTableCache(void)
 	/* Watch for invalidation events. */
 	CacheRegisterRelcacheCallback(InvalidateDistRelationCacheCallback,
 								  (Datum) 0);
+}
+
+
+/*
+ * GetWorkerNodeHash is a wrapper around InitializeWorkerNodeCache(). It
+ * triggers InitializeWorkerNodeCache when the workerHash is NULL. Otherwise,
+ * it returns the hash.
+ */
+HTAB *
+GetWorkerNodeHash(void)
+{
+	if (WorkerNodeHash == NULL)
+	{
+		InitializeWorkerNodeCache();
+	}
+
+	return WorkerNodeHash;
+}
+
+
+/*
+ * Initialize the infrastructure for the worker node cache. The functions
+ * reads the worker nodes from the metadata table, adds them to the hash and
+ * finally registers an invalidation callaback.
+ */
+static void
+InitializeWorkerNodeCache(void)
+{
+	static bool invalidationRegistered = false;
+	List *workerNodeList = NIL;
+	ListCell *workerNodeCell = NULL;
+	HASHCTL info;
+	int hashFlags = 0;
+	long maxTableSize = (long) MaxWorkerNodesTracked;
+
+	/* make sure we've initialized CacheMemoryContext */
+	if (CacheMemoryContext == NULL)
+	{
+		CreateCacheMemoryContext();
+	}
+
+	/*
+	 * Create the hash that holds the worker nodes. The key is the unique nodeid
+	 * field.
+	 */
+	memset(&info, 0, sizeof(info));
+	info.keysize = sizeof(uint32);
+	info.entrysize = sizeof(WorkerNode);
+	info.hcxt = CacheMemoryContext;
+	info.hash = tag_hash;
+	hashFlags = HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT;
+
+	WorkerNodeHash = hash_create("Worker Node Hash",
+								 maxTableSize,
+								 &info, hashFlags);
+
+	/* read the list from the pg_dist_node */
+	workerNodeList = ReadWorkerNodes();
+
+	/* iterate over the worker node list */
+	foreach(workerNodeCell, workerNodeList)
+	{
+		WorkerNode *workerNode = NULL;
+		WorkerNode *currentNode = lfirst(workerNodeCell);
+		void *hashKey = NULL;
+		bool handleFound = false;
+
+		/*
+		 * Search for the worker node in the hash, and then insert the
+		 * values. When searching, we make the hashKey the unique nodeid.
+		 */
+		hashKey = (void *) &currentNode->nodeId;
+		workerNode = (WorkerNode *) hash_search(WorkerNodeHash, hashKey,
+												HASH_ENTER, &handleFound);
+
+		/* fill the newly allocated workerNode in the cache */
+		strlcpy(workerNode->workerName, currentNode->workerName, WORKER_LENGTH);
+		workerNode->workerPort = currentNode->workerPort;
+		workerNode->workerActive = currentNode->workerActive;
+		workerNode->workerRole = currentNode->workerRole;
+		workerNode->groupId = currentNode->groupId;
+
+		if (handleFound)
+		{
+			ereport(WARNING, (errmsg("multiple lines for worker node: \"%s:%u\"",
+									 workerNode->workerName,
+									 workerNode->workerPort)));
+		}
+
+		workerNode->workerPort = currentNode->workerPort;
+
+		/* we do not need the currentNode anymore */
+		pfree(currentNode);
+	}
+
+	/* prevent multiple invalidation registrations */
+	if (!invalidationRegistered)
+	{
+		/* Watch for invalidation events. */
+		CacheRegisterRelcacheCallback(InvalidateNodeRelationCacheCallback,
+									  (Datum) 0);
+
+		invalidationRegistered = true;
+	}
 }
 
 
@@ -1036,7 +1184,25 @@ InvalidateDistRelationCacheCallback(Datum argument, Oid relationId)
 		distShardLogicalRelidIndexId = InvalidOid;
 		distShardShardidIndexId = InvalidOid;
 		distShardPlacementShardidIndexId = InvalidOid;
+		distNodeRelationId = InvalidOid;
 		extraDataContainerFuncId = InvalidOid;
+	}
+}
+
+
+/*
+ * InvalidateNodeRelationCacheCallback destroys the WorkerNodeHash when
+ * any change happens on pg_dist_node table. It also set WorkerNodeHash to
+ * NULL, which allows consequent accesses to the hash read from the
+ * pg_dist_node from scratch.
+ */
+static void
+InvalidateNodeRelationCacheCallback(Datum argument, Oid relationId)
+{
+	if (WorkerNodeHash != NULL && relationId == DistNodeRelationId())
+	{
+		hash_destroy(WorkerNodeHash);
+		WorkerNodeHash = NULL;
 	}
 }
 
@@ -1231,6 +1397,176 @@ TupleToShardInterval(HeapTuple heapTuple, TupleDesc tupleDescriptor, Oid interva
 	shardInterval->shardId = shardId;
 
 	return shardInterval;
+}
+
+
+/*
+ * ReadWorkerNodes iterates over pg_dist_node table, converts each row
+ * into it's memory representation (i.e., WorkerNode) and adds them into
+ * a list. Lastly, the list is returned to the caller.
+ */
+static List *
+ReadWorkerNodes()
+{
+	SysScanDesc scanDescriptor = NULL;
+	ScanKeyData scanKey[1];
+	int scanKeyCount = 0;
+	HeapTuple heapTuple = NULL;
+	List *workerNodeList = NIL;
+	TupleDesc tupleDescriptor = NULL;
+
+	Relation pgDistNode = heap_open(DistNodeRelationId(), AccessShareLock);
+
+	scanDescriptor = systable_beginscan(pgDistNode,
+										InvalidOid, false,
+										NULL, scanKeyCount, scanKey);
+
+	tupleDescriptor = RelationGetDescr(pgDistNode);
+
+	heapTuple = systable_getnext(scanDescriptor);
+	while (HeapTupleIsValid(heapTuple))
+	{
+		WorkerNode *workerNode = TupleToWorkerNode(tupleDescriptor, heapTuple);
+		workerNodeList = lappend(workerNodeList, workerNode);
+
+		heapTuple = systable_getnext(scanDescriptor);
+	}
+
+	systable_endscan(scanDescriptor);
+	heap_close(pgDistNode, AccessShareLock);
+
+	return workerNodeList;
+}
+
+
+/*
+ * InsertNodedRow opens the node system catalog, and inserts a new row with the
+ * given values into that system catalog.
+ */
+void
+InsertNodedRow(int nodeid, char *nodename, int32 nodeport, char noderole,
+			   bool nodeActive, uint32 groupId)
+{
+	Relation pgDistNode = NULL;
+	TupleDesc tupleDescriptor = NULL;
+	HeapTuple heapTuple = NULL;
+	Datum values[Natts_pg_dist_node];
+	bool isNulls[Natts_pg_dist_node];
+
+	/* form new shard tuple */
+	memset(values, 0, sizeof(values));
+	memset(isNulls, false, sizeof(isNulls));
+
+	values[Anum_pg_dist_node_nodeid - 1] = Int32GetDatum(nodeid);
+	values[Anum_pg_dist_node_nodename - 1] = CStringGetTextDatum(nodename);
+	values[Anum_pg_dist_node_nodeport - 1] = Int32GetDatum(nodeport);
+	values[Anum_pg_dist_node_noderole - 1] = CharGetDatum(noderole);
+	values[Anum_pg_dist_node_nodeactive - 1] = BoolGetDatum(nodeActive);
+	values[Anum_pg_dist_node_groupid - 1] = Int64GetDatum(groupId);
+
+	/* open shard relation and insert new tuple */
+	pgDistNode = heap_open(DistNodeRelationId(), RowExclusiveLock);
+
+	tupleDescriptor = RelationGetDescr(pgDistNode);
+	heapTuple = heap_form_tuple(tupleDescriptor, values, isNulls);
+
+	simple_heap_insert(pgDistNode, heapTuple);
+	CatalogUpdateIndexes(pgDistNode, heapTuple);
+
+	/* close relation and invalidate previous cache entry */
+	heap_close(pgDistNode, RowExclusiveLock);
+
+	CitusInvalidateRelcacheByRelid(DistNodeRelationId());
+
+	/* increment the counter so that next accesses to hash invalidates the cache */
+	CommandCounterIncrement();
+}
+
+
+/*
+ * UpdateNodeActiveColumn updates the nodeactive column of the given worker node
+ * on the pg_dist_node. The function also invalidates the pg_dist_node's cache so
+ * that subsequent accesses to the table reads the updated values.
+ */
+void
+UpdateNodeActiveColumn(WorkerNode *workerNode, bool nodeActive)
+{
+	Relation pgDistNode = NULL;
+	HeapTuple heapTuple = NULL;
+	SysScanDesc scanDescriptor = NULL;
+	Form_pg_dist_node nodeForm = NULL;
+	ScanKeyData scanKey[1];
+	int scanKeyCount = 1;
+	uint32 nodeId = workerNode->nodeId;
+
+	pgDistNode = heap_open(DistNodeRelationId(), RowExclusiveLock);
+
+	ScanKeyInit(&scanKey[0], Anum_pg_dist_node_nodeid,
+				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(nodeId));
+
+	scanDescriptor = systable_beginscan(pgDistNode, InvalidOid, false, NULL,
+										scanKeyCount, scanKey);
+
+	heapTuple = systable_getnext(scanDescriptor);
+	if (!HeapTupleIsValid(heapTuple))
+	{
+		ereport(ERROR, (errmsg("could not find valid entry for node %d", nodeId)));
+	}
+
+	nodeForm = (Form_pg_dist_node) GETSTRUCT(heapTuple);
+
+	/* now update the active column */
+	nodeForm->nodeactive = nodeActive;
+
+	simple_heap_update(pgDistNode, &heapTuple->t_self, heapTuple);
+
+	systable_endscan(scanDescriptor);
+	heap_close(pgDistNode, RowExclusiveLock);
+
+	/* invalidate the cache */
+	CitusInvalidateRelcacheByRelid(DistNodeRelationId());
+
+	/* increment the counter so that next accesses to hash invalidates the cache */
+	CommandCounterIncrement();
+}
+
+
+
+/*
+ * TupleToWorkerNode takes in a heap tuple from pg_dist_node, and
+ * converts this tuple to an equivalent struct in memory. The function assumes
+ * the caller already has locks on the tuple, and doesn't perform any locking.
+ */
+static WorkerNode *
+TupleToWorkerNode(TupleDesc tupleDescriptor, HeapTuple heapTuple)
+{
+	WorkerNode *workerNode = NULL;
+	bool isNull = false;
+
+	Datum nodeId = heap_getattr(heapTuple, Anum_pg_dist_node_nodeid,
+								tupleDescriptor, &isNull);
+	Datum nodeName = heap_getattr(heapTuple, Anum_pg_dist_node_nodename,
+								  tupleDescriptor, &isNull);
+	Datum nodePort = heap_getattr(heapTuple, Anum_pg_dist_node_nodeport,
+								  tupleDescriptor, &isNull);
+	Datum nodeRole = heap_getattr(heapTuple, Anum_pg_dist_node_noderole,
+								  tupleDescriptor, &isNull);
+	Datum nodeActive = heap_getattr(heapTuple, Anum_pg_dist_node_nodeactive,
+									  tupleDescriptor, &isNull);
+	Datum groupId = heap_getattr(heapTuple, Anum_pg_dist_node_groupid,
+								 tupleDescriptor, &isNull);
+
+	Assert(!HeapTupleHasNulls(heapTuple));
+
+	workerNode = (WorkerNode *) palloc0(sizeof(WorkerNode));
+	workerNode->nodeId = DatumGetInt32(nodeId);
+	workerNode->workerPort = DatumGetUInt32(nodePort);
+	workerNode->workerRole = DatumGetChar(nodeRole);
+	workerNode->groupId = DatumGetChar(groupId);
+	workerNode->workerActive = DatumGetBool(nodeActive);
+	strlcpy(workerNode->workerName, TextDatumGetCString(nodeName), WORKER_LENGTH);
+
+	return workerNode;
 }
 
 
