@@ -1080,10 +1080,15 @@ ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId)
 	StringInfo command = makeStringInfo();
 	char *qualifiedName = NULL;
 
-	qualifiedName = quote_qualified_identifier(copyStatement->relation->schemaname,
-											   copyStatement->relation->relname);
+	char *relationName = copyStatement->relation->relname;
 
-	appendStringInfo(command, "COPY %s_%ld ", qualifiedName, shardId);
+	char *shardName = pstrdup(relationName);
+	AppendShardIdToName(&shardName, shardId);
+
+	qualifiedName = quote_qualified_identifier(copyStatement->relation->schemaname,
+											   shardName);
+
+	appendStringInfo(command, "COPY %s ", qualifiedName);
 
 	appendStringInfoString(command, "FROM STDIN WITH (FORMAT BINARY)");
 
