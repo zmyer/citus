@@ -6,7 +6,6 @@ ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 750000;
 -- ===================================================================
 -- test end-to-end modification functionality
 -- ===================================================================
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 103066;
 
 CREATE TYPE order_side AS ENUM ('buy', 'sell');
 

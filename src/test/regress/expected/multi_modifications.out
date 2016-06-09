@@ -3,7 +3,6 @@ ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 750000;
 -- ===================================================================
 -- test end-to-end modification functionality
 -- ===================================================================
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 103066;
 CREATE TYPE order_side AS ENUM ('buy', 'sell');
 CREATE TABLE limit_orders (
 	id bigint PRIMARY KEY,
@@ -152,7 +151,7 @@ ERROR:  cannot plan INSERT using row with NULL value in partition column
 INSERT INTO limit_orders VALUES (18811, 'BUD', 14962, '2014-04-05 08:32:16', 'sell',
 								 -5.00);
 ERROR:  new row for relation "limit_orders_750000" violates check constraint "limit_orders_limit_price_check"
-DETAIL:  Failing row contains (18811, BUD, 14962, 2014-04-05 08:32:16, sell, -5.00).
+DETAIL:  Failing row contains (18811, BUD, 14962, 2014-04-05 08:32:16, sell, -5.00, null).
 CONTEXT:  while executing command on localhost:57637
 -- INSERT violating primary key constraint
 INSERT INTO limit_orders VALUES (32743, 'LUV', 5994, '2001-04-16 03:37:28', 'buy', 0.58);
@@ -401,11 +400,9 @@ SELECT array_of_values FROM limit_orders WHERE id = 246;
 CREATE FUNCTION temp_strict_func(integer,integer) RETURNS integer AS
 'SELECT COALESCE($1, 2) + COALESCE($1, 3);' LANGUAGE SQL STABLE STRICT;
 UPDATE limit_orders SET bidder_id = temp_strict_func(1, null) WHERE id = 246;
-WARNING:  Bad result from localhost:57637
-DETAIL:  Remote message: null value in column "bidder_id" violates not-null constraint
-WARNING:  Bad result from localhost:57638
-DETAIL:  Remote message: null value in column "bidder_id" violates not-null constraint
-ERROR:  could not modify any active placements
+ERROR:  null value in column "bidder_id" violates not-null constraint
+DETAIL:  Failing row contains (246, gm, null, 2016-06-09 06:36:41.203933, buy, 0.00, {1,2}).
+CONTEXT:  while executing command on localhost:57637
 SELECT array_of_values FROM limit_orders WHERE id = 246;
  array_of_values 
 -----------------
