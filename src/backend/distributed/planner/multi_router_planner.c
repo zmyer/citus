@@ -506,7 +506,21 @@ ContainsDisallowedFunctionCallsWalker(Node *expression, WalkerState *state)
 		return false;
 	}
 
-	/* this list of nodes is taken from contain_mutable_functions_walker */
+	/*
+	 * In order for statement replication to give us consistent results it's important
+	 * that we either disallow or evaluate on the master anything which has a volatility
+	 * category above IMMUTABLE. Newer versions of postgres might add node types which
+	 * should be checked in this function.
+	 *
+	 * Look through contain_mutable_functions_walker or future PG's equivalent for new
+	 * node types before bumping this version number to fix compilation.
+	 *
+	 * Once you've added them to this check, make sure you also evaluate them in the
+	 * executor!
+	 */
+	StaticAssertStmt(PG_VERSION_NUM <= 90501, "When porting to a newer PG this section"
+											  " needs to be reviewed.");
+
 	if (IsA(expression, OpExpr))
 	{
 		OpExpr *expr = (OpExpr *) expression;
