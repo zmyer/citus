@@ -133,7 +133,9 @@ EvaluateExpression(Node *expression)
 	{
 		CoerceViaIO *expr = (CoerceViaIO *) expression;
 
-		Assert(false); /* This node has multiple functions, it's not obvious what to do */
+		return (Node *) citus_evaluate_expr((Expr *) expr,
+											expr->resulttype, -1,
+											expr->resultcollid);
 	}
 
 	if (IsA(expression, ArrayCoerceExpr))
