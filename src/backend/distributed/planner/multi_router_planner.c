@@ -56,9 +56,17 @@
 #include "optimizer/planmain.h"
 
 
+typedef struct {
+	bool containsVar;
+	bool varArgument;
+	bool badCoalesce;
+} WalkerState;
+
+
 /* planner functions forward declarations */
-static bool ContainsDisallowedFunctionCalls(Node *expression);
-static bool ContainsDisallowedFunctionCallsWalker(Node *expression, bool *containsVar);
+static bool ContainsDisallowedFunctionCalls(Node *expression, bool *varArgument,
+											bool *badCoalesce);
+static bool ContainsDisallowedFunctionCallsWalker(Node *expression, WalkerState *state);
 static char MostPermissiveVolatileFlag(char left, char right);
 static Task * RouterModifyTask(Query *query);
 #if (PG_VERSION_NUM >= 90500)
@@ -263,6 +271,8 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 	if (commandType == CMD_INSERT || commandType == CMD_UPDATE ||
 		commandType == CMD_DELETE)
 	{
+		bool hasVarArgument = false; /* A STABLE function is passed a Var argument */
+		bool hasBadCoalesce = false; /* CASE/COALESCE passed a mutable function */
 		FromExpr *joinTree = NULL;
 		ListCell *targetEntryCell = NULL;
 
@@ -298,11 +308,10 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 			}
 
 			if (commandType == CMD_UPDATE &&
-				ContainsDisallowedFunctionCalls((Node *) targetEntry->expr))
+				ContainsDisallowedFunctionCalls((Node *) targetEntry->expr,
+												&hasVarArgument, &hasBadCoalesce))
 			{
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("STABLE functions used in UPDATE queries"
-									   " cannot be called with column references")));
+				Assert(hasVarArgument || hasBadCoalesce);
 			}
 		}
 
@@ -313,12 +322,25 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 			{
 				hasNonConstQualExprs = true;
 			}
-			else if (ContainsDisallowedFunctionCalls(joinTree->quals))
+			else if (ContainsDisallowedFunctionCalls(joinTree->quals, &hasVarArgument,
+													 &hasBadCoalesce))
 			{
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("STABLE functions used in WHERE clauses"
-									   " cannot be called with column references")));
+				Assert(hasVarArgument || hasBadCoalesce);
 			}
+		}
+
+		if (hasVarArgument)
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("STABLE functions used in UPDATE queries"
+								   " cannot be called with column references")));
+		}
+
+		if (hasBadCoalesce)
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("non-IMMUTABLE functions are not allowed in CASE or"
+								   " COALESCE statements")));
 		}
 	}
 
@@ -398,34 +420,89 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 
 
 /*
- * Fails if the expression contains STABLE functions which accept any paramaters derived
- * from a Var. Assumes the expression contains no VOLATILE functions.
+ * If the expression contains STABLE functions which accept any parameters derived from a
+ * Var returns true and sets varArgument.
+ *
+ * If the expression contains a CASE or COALESCE which invoke non-IMMUTABLE functions
+ * returns true and sets badCoalesce.
+ *
+ * Assumes the expression contains no VOLATILE functions.
  *
  * Var's are allowed, but only if they are passed solely to IMMUTABLE functions
+ *
+ * We special-case CASE/COALESCE because those are evaluated lazily. We could evaluate
+ * CASE/COALESCE expressions which don't reference Vars, or partially evaluate some
+ * which do, but for now we just error out. That makes both the code and user-education
+ * easier.
  */
 static bool
-ContainsDisallowedFunctionCalls(Node *expression)
+ContainsDisallowedFunctionCalls(Node *expression, bool *varArgument, bool *badCoalesce)
 {
-	bool unused = false;
-	return ContainsDisallowedFunctionCallsWalker(expression, &unused);
+	bool result;
+	WalkerState data;
+	data.containsVar = data.varArgument = data.badCoalesce = false;
+
+	result = ContainsDisallowedFunctionCallsWalker(expression, &data);
+
+	*varArgument |= data.varArgument;
+	*badCoalesce |= data.badCoalesce;
+	return result;
 }
 
 
 static bool
-ContainsDisallowedFunctionCallsWalker(Node *expression, bool *containsVar)
+ContainsDisallowedFunctionCallsWalker(Node *expression, WalkerState *state)
 {
 	char volatileFlag = 0;
-	bool childContainsVar = false;
+	WalkerState childState;
 	bool containsDisallowedFunction = false;
+
+	childState.containsVar = childState.varArgument = childState.badCoalesce = false;
 
 	if (expression == NULL)
 	{
 		return false;
 	}
 
+	if (IsA(expression, CoalesceExpr))
+	{
+		CoalesceExpr* expr = (CoalesceExpr *) expression;
+
+		if (contain_mutable_functions((Node *) (expr->args)))
+		{
+			state->badCoalesce = true;
+			return true;
+		}
+		else
+		{
+			/*
+			 * There's no need to recurse. Since there are no STABLE functions
+			 * varArgument will never be set.
+			 */
+			return false;
+		}
+	}
+
+	if (IsA(expression, CaseExpr))
+	{
+		CaseExpr* expr = (CaseExpr *) expression;
+
+		if (contain_mutable_functions((Node *) (expr->args)) ||
+			contain_mutable_functions((Node *) (expr->defresult)))
+		{
+			state->badCoalesce = true;
+			return true;
+		}
+		else
+		{
+			/* The args are fine, so we only need to check the testexpr */
+			return ContainsDisallowedFunctionCallsWalker((Node *) (expr->arg), state);
+		}
+	}
+
 	if (IsA(expression, Var))
 	{
-		*containsVar = true;
+		state->containsVar = true;
 		return false;
 	}
 
@@ -532,15 +609,23 @@ ContainsDisallowedFunctionCallsWalker(Node *expression, bool *containsVar)
 		containsDisallowedFunction =
 			expression_tree_walker(expression,
 								   ContainsDisallowedFunctionCallsWalker,
-								   &childContainsVar);
+								   &childState);
 
-		return (containsDisallowedFunction || childContainsVar);
+		if (childState.containsVar)
+		{
+			state->varArgument = true;
+		}
+
+		state->badCoalesce |= childState.badCoalesce;
+		state->varArgument |= childState.varArgument;
+
+		return (containsDisallowedFunction || childState.containsVar);
 	}
 
 	/* keep traversing */
 	return expression_tree_walker(expression,
 								  ContainsDisallowedFunctionCallsWalker,
-								  containsVar);
+								  state);
 }
 
 
