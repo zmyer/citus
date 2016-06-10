@@ -158,3 +158,46 @@ SELECT count(*) FROM lineitem JOIN orders ON l_orderkey = o_orderkey
 -- Check that we make sure local joins are between columns only.
 
 SELECT count(*) FROM lineitem, orders WHERE l_orderkey + 1 = o_orderkey;
+
+-- Check that we can issue limit/offset queries
+
+-- SIMPLE LIMIT/OFFSET with ORDER BY
+SELECT o_orderkey FROM orders ORDER BY o_orderkey LIMIT 10 OFFSET 20;
+
+-- LIMIT/OFFSET with a Subquery
+SET citus.task_executor_type TO 'task-tracker';
+SELECT 
+	t.o_custkey,
+	COUNT(*) AS ss
+FROM 
+	(SELECT o_custkey, COUNT(*) AS order_count FROM orders GROUP BY o_custkey) t
+GROUP BY 
+	t.o_custkey
+ORDER BY 
+	t.o_custkey DESC
+LIMIT 10 OFFSET 20;
+
+SET citus.task_executor_type TO 'real-time';
+
+-- Ensure that we push down LIMIT and OFFSET properly
+
+EXPLAIN (COSTS FALSE) SELECT o_custkey FROM orders LIMIT 10 OFFSET 15;
+
+EXPLAIN (COSTS FALSE) SELECT o_custkey FROM orders GROUP BY o_custkey LIMIT 10 OFFSET 15;
+
+EXPLAIN (COSTS FALSE) SELECT o_custkey FROM orders GROUP BY o_custkey ORDER BY o_custkey LIMIT 10 OFFSET 15;
+
+EXPLAIN (COSTS FALSE) SELECT o_custkey, COUNT(*) AS ccnt FROM orders GROUP BY o_custkey ORDER BY ccnt LIMIT 10 OFFSET 15;
+
+-- LIMIT/OFFSET with Joins
+SELECT 
+	li.l_partkey,
+	o.o_custkey,
+	li.l_quantity
+FROM 
+	lineitem li JOIN orders o ON li.l_orderkey = o.o_orderkey
+WHERE 
+	li.l_quantity > 25
+ORDER BY
+	li.l_quantity
+LIMIT 10 OFFSET 20;

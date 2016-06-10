@@ -347,3 +347,155 @@ SELECT count(*) FROM lineitem JOIN orders ON l_orderkey = o_orderkey
 SELECT count(*) FROM lineitem, orders WHERE l_orderkey + 1 = o_orderkey;
 ERROR:  cannot perform local joins that involve expressions
 DETAIL:  local joins can be performed between columns only
+-- Check that we can issue limit/offset queries
+-- SIMPLE LIMIT/OFFSET with ORDER BY
+SELECT o_orderkey FROM orders ORDER BY o_orderkey LIMIT 10 OFFSET 20;
+ o_orderkey 
+------------
+         69
+         70
+         71
+         96
+         97
+         98
+         99
+        100
+        101
+        102
+(10 rows)
+
+-- LIMIT/OFFSET with a Subquery
+SET citus.task_executor_type TO 'task-tracker';
+SELECT 
+	t.o_custkey,
+	COUNT(*) AS ss
+FROM 
+	(SELECT o_custkey, COUNT(*) AS order_count FROM orders GROUP BY o_custkey) t
+GROUP BY 
+	t.o_custkey
+ORDER BY 
+	t.o_custkey DESC
+LIMIT 10 OFFSET 20;
+ o_custkey | ss 
+-----------+----
+      1466 |  1
+      1465 |  1
+      1463 |  1
+      1462 |  1
+      1460 |  1
+      1459 |  1
+      1457 |  1
+      1456 |  1
+      1454 |  1
+      1453 |  1
+(10 rows)
+
+SET citus.task_executor_type TO 'real-time';
+-- Ensure that we push down LIMIT and OFFSET properly
+EXPLAIN (COSTS FALSE) SELECT o_custkey FROM orders LIMIT 10 OFFSET 15;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Distributed Query into pg_merge_job_420038
+   Executor: Real-Time
+   Task Count: 2
+   Tasks Shown: One of 2
+   ->  Task
+         Node: host=localhost port=57637 dbname=regression
+         ->  Limit
+               ->  Seq Scan on orders_290006 orders
+ Master Query
+   ->  Limit
+         ->  Seq Scan on pg_merge_job_420038
+(11 rows)
+
+EXPLAIN (COSTS FALSE) SELECT o_custkey FROM orders GROUP BY o_custkey LIMIT 10 OFFSET 15;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Distributed Query into pg_merge_job_420039
+   Executor: Real-Time
+   Task Count: 2
+   Tasks Shown: One of 2
+   ->  Task
+         Node: host=localhost port=57637 dbname=regression
+         ->  Limit
+               ->  HashAggregate
+                     Group Key: o_custkey
+                     ->  Seq Scan on orders_290006 orders
+ Master Query
+   ->  Limit
+         ->  HashAggregate
+               Group Key: intermediate_column_420039_0
+               ->  Seq Scan on pg_merge_job_420039
+(15 rows)
+
+EXPLAIN (COSTS FALSE) SELECT o_custkey FROM orders GROUP BY o_custkey ORDER BY o_custkey LIMIT 10 OFFSET 15;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Distributed Query into pg_merge_job_420040
+   Executor: Real-Time
+   Task Count: 2
+   Tasks Shown: One of 2
+   ->  Task
+         Node: host=localhost port=57637 dbname=regression
+         ->  Limit
+               ->  Sort
+                     Sort Key: o_custkey
+                     ->  HashAggregate
+                           Group Key: o_custkey
+                           ->  Seq Scan on orders_290006 orders
+ Master Query
+   ->  Limit
+         ->  Sort
+               Sort Key: intermediate_column_420040_0
+               ->  HashAggregate
+                     Group Key: intermediate_column_420040_0
+                     ->  Seq Scan on pg_merge_job_420040
+(19 rows)
+
+EXPLAIN (COSTS FALSE) SELECT o_custkey, COUNT(*) AS ccnt FROM orders GROUP BY o_custkey ORDER BY ccnt LIMIT 10 OFFSET 15;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Distributed Query into pg_merge_job_420041
+   Executor: Real-Time
+   Task Count: 2
+   Tasks Shown: One of 2
+   ->  Task
+         Node: host=localhost port=57637 dbname=regression
+         ->  HashAggregate
+               Group Key: o_custkey
+               ->  Seq Scan on orders_290006 orders
+ Master Query
+   ->  Limit
+         ->  Sort
+               Sort Key: (sum(((sum(intermediate_column_420041_1))::bigint)))::bigint
+               ->  HashAggregate
+                     Group Key: intermediate_column_420041_0
+                     ->  Seq Scan on pg_merge_job_420041
+(16 rows)
+
+-- LIMIT/OFFSET with Joins
+SELECT 
+	li.l_partkey,
+	o.o_custkey,
+	li.l_quantity
+FROM 
+	lineitem li JOIN orders o ON li.l_orderkey = o.o_orderkey
+WHERE 
+	li.l_quantity > 25
+ORDER BY
+	li.l_quantity
+LIMIT 10 OFFSET 20;
+ l_partkey | o_custkey | l_quantity 
+-----------+-----------+------------
+    135912 |       509 |      26.00
+     75351 |      1261 |      26.00
+    199475 |      1052 |      26.00
+     91309 |         8 |      26.00
+     53624 |       400 |      26.00
+    182736 |      1048 |      26.00
+     59694 |       163 |      26.00
+     20481 |       173 |      26.00
+     78748 |      1499 |      26.00
+      7614 |      1397 |      26.00
+(10 rows)
+

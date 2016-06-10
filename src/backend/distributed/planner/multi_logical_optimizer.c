@@ -130,6 +130,7 @@ static Oid AggregateFunctionOid(const char *functionName, Oid inputType);
 static char * CountDistinctHashFunctionName(Oid argumentType);
 static int CountDistinctStorageSize(double approximationErrorRate);
 static Const * MakeIntegerConst(int32 integerValue);
+static Const * MakeIntegerConstInt64(int64 integerValue);
 
 /* Local functions forward declarations for aggregate expression checks */
 static void ErrorIfContainsUnsupportedAggregate(MultiNode *logicalPlanNode);
@@ -1282,6 +1283,7 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
 	masterExtendedOpNode->groupClauseList = originalOpNode->groupClauseList;
 	masterExtendedOpNode->sortClauseList = originalOpNode->sortClauseList;
 	masterExtendedOpNode->limitCount = originalOpNode->limitCount;
+	masterExtendedOpNode->limitOffset = originalOpNode->limitOffset;
 
 	return masterExtendedOpNode;
 }
@@ -2217,6 +2219,24 @@ MakeIntegerConst(int32 integerValue)
 									integerDatum, typeIsNull, typePassByValue);
 
 	return integerConst;
+}
+
+
+/* Makes a 64-bit integer constant node from the given value, and returns that node. */
+static Const *
+MakeIntegerConstInt64(int64 integerValue)
+{
+	const int typeCollationId = get_typcollation(INT8OID);
+	const int16 typeLength = get_typlen(INT8OID);
+	const int32 typeModifier = -1;
+	const bool typeIsNull = false;
+	const bool typePassByValue = true;
+
+	Datum integer64Datum = Int64GetDatum(integerValue);
+	Const *integer64Const = makeConst(INT8OID, typeModifier, typeCollationId, typeLength,
+									  integer64Datum, typeIsNull, typePassByValue);
+
+	return integer64Const;
 }
 
 
@@ -4080,19 +4100,27 @@ EqualOpExpressionLists(List *firstOpExpressionList, List *secondOpExpressionList
  * WorkerLimitCount checks if the given extended node contains a limit node, and
  * if that node can be pushed down. For this, the function checks if this limit
  * count or a meaningful approximation of it can be pushed down to worker nodes.
- * If they can, the function returns the limit count. Otherwise, the function
+ * If they can, the function returns the limit count.
+ *
+ * When an offset is present, the offset value is added to limit because for a query
+ * with LIMIT x OFFSET y, (x+y) records should be pulled from the workers.
+ *
+ * If no limit or offset is present or can be pushed down, then WorkerLimitCount
  * returns null.
  */
 static Node *
 WorkerLimitCount(MultiExtendedOp *originalOpNode)
 {
-	Node *workerLimitCount = NULL;
+	Node *workerLimitNode = NULL;
 	List *groupClauseList = originalOpNode->groupClauseList;
 	List *sortClauseList = originalOpNode->sortClauseList;
 	List *targetList = originalOpNode->targetList;
+	bool hasOrderByAggregate = HasOrderByAggregate(sortClauseList, targetList);
+	bool canPushDownLimit = false;
+	bool canApproximate = CanPushDownLimitApproximate(sortClauseList, targetList);
 
 	/* no limit node to push down */
-	if (originalOpNode->limitCount == NULL)
+	if (originalOpNode->limitCount == NULL && originalOpNode->limitOffset == NULL)
 	{
 		return NULL;
 	}
@@ -4102,40 +4130,56 @@ WorkerLimitCount(MultiExtendedOp *originalOpNode)
 	 * aggregates, we can push down the original limit. Else if we have order by
 	 * clauses with commutative aggregates, we can push down approximate limits.
 	 */
-	if (groupClauseList == NIL)
+	if (groupClauseList == NIL || sortClauseList == NIL || !hasOrderByAggregate)
 	{
-		workerLimitCount = originalOpNode->limitCount;
+		canPushDownLimit = true;
 	}
-	else if (sortClauseList != NIL)
+
+	if (canPushDownLimit)
 	{
-		bool orderByNonAggregates = !(HasOrderByAggregate(sortClauseList, targetList));
-		bool canApproximate = CanPushDownLimitApproximate(sortClauseList, targetList);
+		workerLimitNode = (Node *) copyObject(originalOpNode->limitCount);
+	}
+	else if (canApproximate)
+	{
+		Const *workerLimitConst = (Const *) copyObject(originalOpNode->limitCount);
+		int64 workerLimitCount = (int64) LimitClauseRowFetchCount;
+		workerLimitConst->constvalue = Int64GetDatum(workerLimitCount);
 
-		if (orderByNonAggregates)
-		{
-			workerLimitCount = originalOpNode->limitCount;
-		}
-		else if (canApproximate)
-		{
-			Const *workerLimitConst = (Const *) copyObject(originalOpNode->limitCount);
-			int64 workerLimitCountInt64 = (int64) LimitClauseRowFetchCount;
-			workerLimitConst->constvalue = Int64GetDatum(workerLimitCountInt64);
+		workerLimitNode = (Node *) workerLimitConst;
+	}
 
-			workerLimitCount = (Node *) workerLimitConst;
+	/*
+	 * If offset clause is present and limit can be pushed down (whether exactly or
+	 * approximately), add the offset value to limit on workers
+	 */
+	if (originalOpNode->limitOffset != NULL && (canPushDownLimit || canApproximate))
+	{
+		Const *workerOffsetConst = (Const *) originalOpNode->limitOffset;
+		int64 workerOffsetValue = DatumGetInt64(workerOffsetConst->constvalue);
+		int64 workerLimitValue = 0;
+
+		/* if a limit is present, use it for initial value */
+		if (workerLimitNode != NULL)
+		{
+			Const *workerLimitConst = (Const *) workerLimitNode;
+			workerLimitValue = DatumGetInt64(workerLimitConst->constvalue);
 		}
+
+		workerLimitValue = workerLimitValue + workerOffsetValue;
+		workerLimitNode = (Node *) MakeIntegerConstInt64(workerLimitValue);
 	}
 
 	/* display debug message on limit push down */
-	if (workerLimitCount != NULL)
+	if (workerLimitNode != NULL)
 	{
-		Const *workerLimitConst = (Const *) workerLimitCount;
-		int64 workerLimitCountInt64 = DatumGetInt64(workerLimitConst->constvalue);
+		Const *workerLimitConst = (Const *) workerLimitNode;
+		int64 workerLimitCount = DatumGetInt64(workerLimitConst->constvalue);
 
 		ereport(DEBUG1, (errmsg("push down of limit count: " INT64_FORMAT,
-								workerLimitCountInt64)));
+								workerLimitCount)));
 	}
 
-	return workerLimitCount;
+	return workerLimitNode;
 }
 
 
