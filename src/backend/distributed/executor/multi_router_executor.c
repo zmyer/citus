@@ -29,6 +29,7 @@
 #include "distributed/multi_router_executor.h"
 #include "distributed/resource_lock.h"
 #include "nodes/pg_list.h"
+#include "optimizer/clauses.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
@@ -395,6 +396,9 @@ ExecuteFunctions(Query *query)
 
 		targetEntry->expr = (Expr *) modifiedNode;
 	}
+
+	Assert(!contain_mutable_functions((Node *) (query->jointree->quals)));
+	Assert(!contain_mutable_functions((Node *) (query->targetList)));
 }
 
 
