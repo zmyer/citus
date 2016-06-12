@@ -53,6 +53,8 @@ static Oid distPartitionLogicalRelidIndexId = InvalidOid;
 static Oid distShardLogicalRelidIndexId = InvalidOid;
 static Oid distShardShardidIndexId = InvalidOid;
 static Oid distShardPlacementShardidIndexId = InvalidOid;
+static Oid distTransactionRelationId = InvalidOid;
+static Oid distTransactionGroupIndexId = InvalidOid;
 static Oid extraDataContainerFuncId = InvalidOid;
 
 /* Hash table for informations about each partition */
@@ -659,6 +661,27 @@ DistShardPlacementShardidIndexId(void)
 						 &distShardPlacementShardidIndexId);
 
 	return distShardPlacementShardidIndexId;
+}
+
+
+/* return oid of pg_dist_transaction relation */
+Oid
+DistTransactionRelationId(void)
+{
+	CachedRelationLookup("pg_dist_transaction", &distTransactionRelationId);
+
+	return distTransactionRelationId;
+}
+
+
+/* return oid of pg_dist_transaction_group_index */
+Oid
+DistTransactionGroupIndexId(void)
+{
+	CachedRelationLookup("pg_dist_transaction_group_index",
+						 &distTransactionGroupIndexId);
+
+	return distTransactionGroupIndexId;
 }
 
 

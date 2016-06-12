@@ -16,6 +16,27 @@ SELECT cluster_create_shards('clustered_table', 4);
  
 (1 row)
 
+-- Verify that we've logged commit records
+SELECT count(*) FROM pg_dist_transaction;
+ count 
+-------
+     4
+(1 row)
+
+-- Confirm that the metadata transactions have been committed
+SELECT recover_prepared_transactions();
+ recover_prepared_transactions 
+-------------------------------
+ 
+(1 row)
+
+-- Verify that the commit records have been removed
+SELECT count(*) FROM pg_dist_transaction;
+ count 
+-------
+     0
+(1 row)
+
 \c - - - :worker_1_port
 \d clustered_table
 Table "public.clustered_table"

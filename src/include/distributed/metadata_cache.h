@@ -62,12 +62,15 @@ extern bool CitusHasBeenLoaded(void);
 extern Oid DistPartitionRelationId(void);
 extern Oid DistShardRelationId(void);
 extern Oid DistShardPlacementRelationId(void);
+extern Oid DistTransactionRelationId(void);
 
 /* index oids */
 extern Oid DistPartitionLogicalRelidIndexId(void);
 extern Oid DistShardLogicalRelidIndexId(void);
 extern Oid DistShardShardidIndexId(void);
 extern Oid DistShardPlacementShardidIndexId(void);
+extern Oid DistTransactionGidIndexId(void);
+extern Oid DistTransactionGroupIndexId(void);
 
 /* function oids */
 extern Oid CitusExtraDataContainerFuncId(void);

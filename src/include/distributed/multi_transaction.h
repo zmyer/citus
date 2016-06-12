@@ -43,7 +43,9 @@ typedef enum
 typedef struct TransactionConnection
 {
 	int64 connectionId;
+	int32 groupId;
 	TransactionState transactionState;
+	char *transactionName;
 	PGconn *connection;
 } TransactionConnection;
 
@@ -71,6 +73,7 @@ extern ShardConnections * GetShardConnections(HTAB *shardConnectionHash,
 											  int64 shardId,
 											  bool *shardConnectionsFound);
 extern List * ConnectionList(HTAB *connectionHash);
+extern StringInfo BuildTransactionName(int connectionId);
 
 
 #endif /* MULTI_TRANSACTION_H */

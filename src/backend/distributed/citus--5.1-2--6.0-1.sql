@@ -1,6 +1,17 @@
-/* citus--5.1-1--6.0-1.sql */
+/* citus--5.1-3--6.0-1.sql */
 
 SET search_path = 'pg_catalog';
+
+CREATE TABLE citus.pg_dist_transaction (
+    groupid int NOT NULL,
+    gid text NOT NULL
+);
+CREATE INDEX pg_dist_transaction_group_index
+ON citus.pg_dist_transaction using btree(groupid);
+ALTER TABLE citus.pg_dist_transaction SET SCHEMA pg_catalog;
+ALTER TABLE pg_catalog.pg_dist_transaction
+ADD CONSTRAINT pg_dist_transaction_unique_constraint UNIQUE (groupid, gid);
+GRANT SELECT ON pg_catalog.pg_dist_transaction TO public;
 
 CREATE FUNCTION column_to_column_name(table_name regclass, column_var text)
     RETURNS text
@@ -33,6 +44,13 @@ CREATE FUNCTION cluster_create_shards(table_name regclass, shard_count integer)
     AS 'MODULE_PATHNAME', $$cluster_create_shards$$;
 COMMENT ON FUNCTION cluster_create_shards(table_name regclass, shard_count integer)
     IS 'create shards for a cluster-distributed table';
+
+CREATE FUNCTION recover_prepared_transactions()
+    RETURNS void
+    LANGUAGE C STRICT
+    AS 'MODULE_PATHNAME', $$recover_prepared_transactions$$;
+COMMENT ON FUNCTION recover_prepared_transactions()
+    IS 'recover prepared transactions started by this node';
 
 ALTER TABLE pg_dist_partition ADD COLUMN isowner bool DEFAULT true NOT NULL;
 ALTER TABLE pg_dist_partition ADD COLUMN iscluster bool DEFAULT false NOT NULL;

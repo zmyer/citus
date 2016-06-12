@@ -35,16 +35,14 @@ SortList(List *pointerList, int (*comparisonFunction)(const void *, const void *
 	List *sortedList = NIL;
 	uint32 arrayIndex = 0;
 	uint32 arraySize = (uint32) list_length(pointerList);
-	void **array = (void **) palloc0(arraySize * sizeof(void *));
+	void **array = NULL;
 
-	ListCell *pointerCell = NULL;
-	foreach(pointerCell, pointerList)
+	if (arraySize == 0)
 	{
-		void *pointer = lfirst(pointerCell);
-		array[arrayIndex] = pointer;
-
-		arrayIndex++;
+		return NIL;
 	}
+
+	array = PointerArrayFromList(pointerList);
 
 	/* sort the array of pointers using the comparison function */
 	qsort(array, arraySize, sizeof(void *), comparisonFunction);
@@ -59,4 +57,25 @@ SortList(List *pointerList, int (*comparisonFunction)(const void *, const void *
 	pfree(array);
 
 	return sortedList;
+}
+
+
+/*
+ * PointerArrayFromList converts a list of pointers to an array of pointers.
+ */
+void **
+PointerArrayFromList(List *pointerList)
+{
+	int pointerCount = list_length(pointerList);
+	void **pointerArray = (void **) palloc0(pointerCount * sizeof(void *));
+	ListCell *pointerCell = NULL;
+	int pointerIndex = 0;
+
+	foreach(pointerCell, pointerList)
+	{
+		pointerArray[pointerIndex] = (void *) lfirst(pointerCell);
+		pointerIndex += 1;
+	}
+
+	return pointerArray;
 }

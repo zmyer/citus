@@ -13,25 +13,25 @@
 #include "libpq-fe.h"
 #include "miscadmin.h"
 
+#include "access/heapam.h"
 #include "access/xact.h"
 #include "distributed/connection_cache.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/multi_transaction.h"
+#include "distributed/pg_dist_transaction.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
+#include "storage/lock.h"
+#include "utils/builtins.h"
 
 
 #define INITIAL_CONNECTION_CACHE_SIZE 1001
 
 
-/* Local functions forward declarations */
+/* a local counter for constructing unique transaction names */
 static uint32 DistributedTransactionId = 0;
 
-
-/* Local functions forward declarations */
-static StringInfo BuildTransactionName(int connectionId);
-
-
-/* the commit protocol to use for COPY commands */
+/* the commit protocol to use for multi-shard modification commands */
 int MultiShardCommitProtocol = COMMIT_PROTOCOL_1PC;
 
 
@@ -85,6 +85,7 @@ PrepareRemoteTransactions(List *connectionList)
 		PQclear(result);
 
 		transactionConnection->transactionState = TRANSACTION_STATE_PREPARED;
+		transactionConnection->transactionName = transactionName->data;
 	}
 }
 
@@ -243,13 +244,13 @@ CommitRemoteTransactions(List *connectionList, bool stopOnFailure)
  * transaction, which causes it to be rolled back. In general, the user
  * should ensure that prepared transactions do not linger.
  */
-static StringInfo
+StringInfo
 BuildTransactionName(int connectionId)
 {
 	StringInfo commandString = makeStringInfo();
 
-	appendStringInfo(commandString, "citus_%d_%u_%d", MyProcPid,
-					 DistributedTransactionId, connectionId);
+	appendStringInfo(commandString, "citus_%d_%u_%d", connectionId,
+					 DistributedTransactionId, MyProcPid);
 
 	return commandString;
 }
