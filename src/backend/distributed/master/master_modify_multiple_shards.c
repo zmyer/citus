@@ -56,7 +56,6 @@ static void LockShardsForModify(List *shardIntervalList);
 static bool HasReplication(List *shardIntervalList);
 static int SendQueryToShards(Query *query, List *shardIntervalList);
 static HTAB * OpenConnectionsToAllShardPlacements(List *shardIntervalList);
-static void OpenConnectionsToShardPlacements(uint64 shardId, HTAB *shardConnectionHash);
 static int SendQueryToPlacements(char *shardQueryString,
 								 ShardConnections *shardConnections);
 
@@ -266,77 +265,18 @@ static HTAB *
 OpenConnectionsToAllShardPlacements(List *shardIntervalList)
 {
 	HTAB *shardConnectionHash = CreateShardConnectionHash();
-
 	ListCell *shardIntervalCell = NULL;
+	char *currentUserName = CurrentUserName();
 
 	foreach(shardIntervalCell, shardIntervalList)
 	{
 		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 		uint64 shardId = shardInterval->shardId;
 
-		OpenConnectionsToShardPlacements(shardId, shardConnectionHash);
+		OpenConnectionsToShardPlacements(shardId, shardConnectionHash, currentUserName);
 	}
 
 	return shardConnectionHash;
-}
-
-
-/*
- * OpenConnectionsToShardPlacements opens connections to all placements of the
- * shard with the given shardId and populates the shardConnectionHash table
- * accordingly.
- */
-static void
-OpenConnectionsToShardPlacements(uint64 shardId, HTAB *shardConnectionHash)
-{
-	bool shardConnectionsFound = false;
-
-	/* get existing connections to the shard placements, if any */
-	ShardConnections *shardConnections = GetShardConnections(shardConnectionHash,
-															 shardId,
-															 &shardConnectionsFound);
-
-	List *shardPlacementList = FinalizedShardPlacementList(shardId);
-	ListCell *shardPlacementCell = NULL;
-	List *connectionList = NIL;
-
-	Assert(!shardConnectionsFound);
-
-	if (shardPlacementList == NIL)
-	{
-		ereport(ERROR, (errmsg("could not find any shard placements for the shard "
-							   UINT64_FORMAT, shardId)));
-	}
-
-	foreach(shardPlacementCell, shardPlacementList)
-	{
-		ShardPlacement *shardPlacement = (ShardPlacement *) lfirst(
-			shardPlacementCell);
-		char *workerName = shardPlacement->nodeName;
-		uint32 workerPort = shardPlacement->nodePort;
-		char *nodeUser = CurrentUserName();
-		PGconn *connection = ConnectToNode(workerName, workerPort, nodeUser);
-		TransactionConnection *transactionConnection = NULL;
-
-		if (connection == NULL)
-		{
-			List *abortConnectionList = ConnectionList(shardConnectionHash);
-			CloseConnections(abortConnectionList);
-
-			ereport(ERROR, (errmsg("could not establish a connection to all "
-								   "placements")));
-		}
-
-		transactionConnection = palloc0(sizeof(TransactionConnection));
-
-		transactionConnection->connectionId = shardConnections->shardId;
-		transactionConnection->transactionState = TRANSACTION_STATE_INVALID;
-		transactionConnection->connection = connection;
-
-		connectionList = lappend(connectionList, transactionConnection);
-	}
-
-	shardConnections->connectionList = connectionList;
 }
 
 

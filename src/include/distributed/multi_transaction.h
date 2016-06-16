@@ -70,6 +70,7 @@ extern ShardConnections * GetShardConnections(HTAB *shardConnectionHash,
 											  int64 shardId,
 											  bool *shardConnectionsFound);
 extern List * ConnectionList(HTAB *connectionHash);
-
+extern void OpenConnectionsToShardPlacements(uint64 shardId, HTAB *shardConnectionHash,
+											 char *nodeUser);
 
 #endif /* MULTI_TRANSACTION_H */

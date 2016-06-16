@@ -15,6 +15,7 @@
 
 #include "access/xact.h"
 #include "distributed/connection_cache.h"
+#include "distributed/master_metadata_utility.h"
 #include "distributed/multi_transaction.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
@@ -346,4 +347,63 @@ ConnectionList(HTAB *connectionHash)
 	}
 
 	return connectionList;
+}
+
+
+/*
+ * OpenConnectionsToShardPlacements opens connections to all placements of the
+ * shard with the given shardId and populates the shardConnectionHash table
+ * accordingly.
+ */
+void
+OpenConnectionsToShardPlacements(uint64 shardId, HTAB *shardConnectionHash,
+								 char *nodeUser)
+{
+	bool shardConnectionsFound = false;
+
+	/* get existing connections to the shard placements, if any */
+	ShardConnections *shardConnections = GetShardConnections(shardConnectionHash,
+															 shardId,
+															 &shardConnectionsFound);
+
+	List *shardPlacementList = FinalizedShardPlacementList(shardId);
+	ListCell *shardPlacementCell = NULL;
+	List *connectionList = NIL;
+
+	Assert(!shardConnectionsFound);
+
+	if (shardPlacementList == NIL)
+	{
+		ereport(ERROR, (errmsg("could not find any shard placements for the shard "
+							   UINT64_FORMAT, shardId)));
+	}
+
+	foreach(shardPlacementCell, shardPlacementList)
+	{
+		ShardPlacement *shardPlacement = (ShardPlacement *) lfirst(
+			shardPlacementCell);
+		char *workerName = shardPlacement->nodeName;
+		uint32 workerPort = shardPlacement->nodePort;
+		PGconn *connection = ConnectToNode(workerName, workerPort, nodeUser);
+		TransactionConnection *transactionConnection = NULL;
+
+		if (connection == NULL)
+		{
+			List *abortConnectionList = ConnectionList(shardConnectionHash);
+			CloseConnections(abortConnectionList);
+
+			ereport(ERROR, (errmsg("could not establish a connection to all "
+								   "placements of shard %lu", shardId)));
+		}
+
+		transactionConnection = palloc0(sizeof(TransactionConnection));
+
+		transactionConnection->connectionId = shardConnections->shardId;
+		transactionConnection->transactionState = TRANSACTION_STATE_INVALID;
+		transactionConnection->connection = connection;
+
+		connectionList = lappend(connectionList, transactionConnection);
+	}
+
+	shardConnections->connectionList = connectionList;
 }
