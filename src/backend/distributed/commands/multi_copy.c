@@ -126,7 +126,6 @@
 #include "utils/tuplestore.h"
 #include "utils/memutils.h"
 
-
 /* constant used in binary protocol */
 static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 
@@ -137,16 +136,20 @@ static PGconn *masterConnection = NULL;
 /* Local functions forward declarations */
 static void CopyFromWorkerNode(CopyStmt *copyStatement, char *completionTag);
 static void CopyToExistingShards(CopyStmt *copyStatement, char *completionTag);
-static void CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId);
+static void CopyToNewShards(CopyStmt *copyStatement, char *completionTag,
+							Oid relationId);
 static char MasterPartitionMethod(RangeVar *relation);
 static void RemoveMasterOptions(CopyStmt *copyStatement);
 static void OpenCopyTransactions(CopyStmt *copyStatement,
-								 ShardConnections *shardConnections, bool stopOnFailure);
+								 ShardConnections *shardConnections, bool stopOnFailure,
+								 bool binaryCopyFormat);
+static bool BinaryCopyFormat(TupleDesc tupleDescription, CopyOutState rowOutputState);
 static List * MasterShardPlacementList(uint64 shardId);
 static List * RemoteFinalizedShardPlacementList(uint64 shardId);
 static void SendCopyBinaryHeaders(CopyOutState copyOutState, List *connectionList);
 static void SendCopyBinaryFooters(CopyOutState copyOutState, List *connectionList);
-static StringInfo ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId);
+static StringInfo ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId,
+										 bool binaryCopyFormat);
 static void SendCopyDataToAll(StringInfo dataBuffer, List *connectionList);
 static void SendCopyDataToPlacement(StringInfo dataBuffer, PGconn *connection,
 									int64 shardId);
@@ -154,7 +157,7 @@ static void EndRemoteCopy(List *connectionList, bool stopOnFailure);
 static void ReportCopyError(PGconn *connection, PGresult *result);
 static uint32 AvailableColumnCount(TupleDesc tupleDescriptor);
 static void StartCopyToNewShard(ShardConnections *shardConnections,
-								CopyStmt *copyStatement);
+								CopyStmt *copyStatement, bool binaryCopyFormat);
 static int64 MasterCreateEmptyShard(char *relationName);
 static int64 CreateEmptyShard(char *relationName);
 static int64 RemoteCreateEmptyShard(char *relationName);
@@ -348,6 +351,8 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	FmgrInfo *compareFunction = NULL;
 	bool hasUniformHashDistribution = false;
 	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(tableId);
+	char *delimiterCharacter = pstrdup("\t");
+	char *nullPrintCharacter = pstrdup("\\N");
 
 	int shardCount = 0;
 	List *shardIntervalList = NULL;
@@ -441,7 +446,10 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	executorExpressionContext = GetPerTupleExprContext(executorState);
 
 	copyOutState = (CopyOutState) palloc0(sizeof(CopyOutStateData));
-	copyOutState->binary = true;
+	copyOutState->delim = delimiterCharacter;
+	copyOutState->null_print = nullPrintCharacter;
+	copyOutState->null_print_client = nullPrintCharacter;
+	copyOutState->binary = BinaryCopyFormat(tupleDescriptor, copyOutState);
 	copyOutState->fe_msgbuf = makeStringInfo();
 	copyOutState->rowcontext = executorTupleContext;
 
@@ -528,17 +536,23 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 			if (!shardConnectionsFound)
 			{
 				/* open connections and initiate COPY on shard placements */
-				OpenCopyTransactions(copyStatement, shardConnections, false);
+				OpenCopyTransactions(copyStatement, shardConnections, false,
+									 copyOutState->binary);
 
 				/* send copy binary headers to shard placements */
-				SendCopyBinaryHeaders(copyOutState, shardConnections->connectionList);
+				if (copyOutState->binary)
+				{
+					SendCopyBinaryHeaders(copyOutState,
+										  shardConnections->connectionList);
+				}
 			}
 
 			/* replicate row to shard placements */
 			resetStringInfo(copyOutState->fe_msgbuf);
-			AppendCopyRowData(columnValues, columnNulls, tupleDescriptor,
-							  copyOutState, columnOutputFunctions);
+			AppendCopyRowData(columnValues, columnNulls, tupleDescriptor, copyOutState,
+							  columnOutputFunctions);
 			SendCopyDataToAll(copyOutState->fe_msgbuf, shardConnections->connectionList);
+
 
 			processedRowCount += 1;
 		}
@@ -546,7 +560,10 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 		connectionList = ConnectionList(shardConnectionHash);
 
 		/* send copy binary footers to all shard placements */
-		SendCopyBinaryFooters(copyOutState, connectionList);
+		if (copyOutState->binary)
+		{
+			SendCopyBinaryFooters(copyOutState, connectionList);
+		}
 
 		/* all lines have been copied, stop showing line number in errors */
 		error_context_stack = errorCallback.previous;
@@ -615,6 +632,9 @@ CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId)
 	MemoryContext executorTupleContext = GetPerTupleMemoryContext(executorState);
 	ExprContext *executorExpressionContext = GetPerTupleExprContext(executorState);
 
+	char *delimiterCharacter = pstrdup("\t");
+	char *nullPrintCharacter = pstrdup("\\N");
+
 	/*
 	 * Shard connections should be initialized before the PG_TRY, since it is
 	 * used in PG_CATCH. Otherwise, it may be undefined in the PG_CATCH
@@ -631,7 +651,10 @@ CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId)
 										copyStatement->options);
 
 	CopyOutState copyOutState = (CopyOutState) palloc0(sizeof(CopyOutStateData));
-	copyOutState->binary = true;
+	copyOutState->delim = delimiterCharacter;
+	copyOutState->null_print = nullPrintCharacter;
+	copyOutState->null_print_client = nullPrintCharacter;
+	copyOutState->binary = BinaryCopyFormat(tupleDescriptor, copyOutState);
 	copyOutState->fe_msgbuf = makeStringInfo();
 	copyOutState->rowcontext = executorTupleContext;
 
@@ -690,16 +713,21 @@ CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId)
 			if (copiedDataSizeInBytes == 0)
 			{
 				/* create shard and open connections to shard placements */
-				StartCopyToNewShard(shardConnections, copyStatement);
+				StartCopyToNewShard(shardConnections, copyStatement,
+									copyOutState->binary);
 
 				/* send copy binary headers to shard placements */
-				SendCopyBinaryHeaders(copyOutState, shardConnections->connectionList);
+				if (copyOutState->binary)
+				{
+					SendCopyBinaryHeaders(copyOutState,
+										  shardConnections->connectionList);
+				}
 			}
 
 			/* replicate row to shard placements */
 			resetStringInfo(copyOutState->fe_msgbuf);
-			AppendCopyRowData(columnValues, columnNulls, tupleDescriptor,
-							  copyOutState, columnOutputFunctions);
+			AppendCopyRowData(columnValues, columnNulls, tupleDescriptor, copyOutState,
+							  columnOutputFunctions);
 			SendCopyDataToAll(copyOutState->fe_msgbuf, shardConnections->connectionList);
 
 			messageBufferSize = copyOutState->fe_msgbuf->len;
@@ -713,7 +741,11 @@ CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId)
 			 * */
 			if (copiedDataSizeInBytes > shardMaxSizeInBytes)
 			{
-				SendCopyBinaryFooters(copyOutState, shardConnections->connectionList);
+				if (copyOutState->binary)
+				{
+					SendCopyBinaryFooters(copyOutState,
+										  shardConnections->connectionList);
+				}
 				FinalizeCopyToNewShard(shardConnections);
 				MasterUpdateShardStatistics(shardConnections->shardId);
 
@@ -731,7 +763,11 @@ CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId)
 		 */
 		if (copiedDataSizeInBytes > 0)
 		{
-			SendCopyBinaryFooters(copyOutState, shardConnections->connectionList);
+			if (copyOutState->binary)
+			{
+				SendCopyBinaryFooters(copyOutState,
+									  shardConnections->connectionList);
+			}
 			FinalizeCopyToNewShard(shardConnections);
 			MasterUpdateShardStatistics(shardConnections->shardId);
 		}
@@ -875,7 +911,7 @@ RemoveMasterOptions(CopyStmt *copyStatement)
  */
 static void
 OpenCopyTransactions(CopyStmt *copyStatement, ShardConnections *shardConnections,
-					 bool stopOnFailure)
+					 bool stopOnFailure, bool binaryCopyFormat)
 {
 	List *finalizedPlacementList = NIL;
 	List *failedPlacementList = NIL;
@@ -932,7 +968,8 @@ OpenCopyTransactions(CopyStmt *copyStatement, ShardConnections *shardConnections
 		}
 
 		PQclear(result);
-		copyCommand = ConstructCopyStatement(copyStatement, shardConnections->shardId);
+		copyCommand = ConstructCopyStatement(copyStatement, shardConnections->shardId,
+											 binaryCopyFormat);
 
 		result = PQexec(connection, copyCommand->data);
 		if (PQresultStatus(result) != PGRES_COPY_IN)
@@ -982,6 +1019,50 @@ OpenCopyTransactions(CopyStmt *copyStatement, ShardConnections *shardConnections
 	shardConnections->connectionList = connectionList;
 
 	MemoryContextReset(localContext);
+}
+
+
+/*
+ * BinaryCopyFormat iterates over columns of the relation given in rowOutputState and
+ * looks for a column whose type is array of user-defined type. If it founds that
+ * means we cannot use binary format for COPY and it return false.
+ */
+static bool
+BinaryCopyFormat(TupleDesc tupleDescription, CopyOutState rowOutputState)
+{
+	bool binaryCopyFormat = true;
+	uint32 totalColumnCount = (uint32) tupleDescription->natts;
+	uint32 columnIndex = 0;
+
+	MemoryContext oldContext = MemoryContextSwitchTo(rowOutputState->rowcontext);
+
+	for (columnIndex = 0; columnIndex < totalColumnCount; columnIndex++)
+	{
+		Form_pg_attribute currentColumn = tupleDescription->attrs[columnIndex];
+		Oid typeId = currentColumn->atttypid;
+		char typeCategory = '\0';
+		bool typePreferred = false;
+		bool builtInType = typeId < FirstNormalObjectId;
+        bool containsOid = false;
+
+		if (currentColumn->attisdropped)
+		{
+			continue;
+		}
+
+		get_type_category_preferred(typeId, &typeCategory, &typePreferred);
+		containsOid = typeCategory == TYPCATEGORY_ARRAY ||
+					  typeCategory == TYPCATEGORY_COMPOSITE;
+		if (!builtInType && containsOid)
+		{
+			binaryCopyFormat = false;
+			break;
+		}
+	}
+
+	MemoryContextSwitchTo(oldContext);
+
+	return binaryCopyFormat;
 }
 
 
@@ -1075,23 +1156,27 @@ SendCopyBinaryFooters(CopyOutState copyOutState, List *connectionList)
  * shard.
  */
 static StringInfo
-ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId)
+ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId, bool binaryCopyFormat)
 {
 	StringInfo command = makeStringInfo();
 
-	char *schemaName = copyStatement->relation->schemaname;
-	char *relationName = copyStatement->relation->relname;
-
-	char *shardName = pstrdup(relationName);
+	char *shardSchemaName = copyStatement->relation->schemaname;
+	char *shardTableName = copyStatement->relation->relname;
 	char *shardQualifiedName = NULL;
 
-	AppendShardIdToName(&shardName, shardId);
+	shardTableName = pstrdup(shardTableName);
+	AppendShardIdToName(&shardTableName, shardId);
+	shardQualifiedName = quote_qualified_identifier(shardSchemaName, shardTableName);
 
-	shardQualifiedName = quote_qualified_identifier(schemaName, shardName);
-
-	appendStringInfo(command,
-					 "COPY %s FROM STDIN WITH (FORMAT BINARY)",
-					 shardQualifiedName);
+	if (binaryCopyFormat)
+	{
+		appendStringInfo(command, "COPY %s FROM STDIN WITH (FORMAT BINARY)",
+						 shardQualifiedName);
+	}
+	else
+	{
+		appendStringInfo(command, "COPY %s FROM STDIN", shardQualifiedName);
+	}
 
 	return command;
 }
@@ -1259,7 +1344,8 @@ ColumnOutputFunctions(TupleDesc rowDescriptor, bool binaryFormat)
 		}
 		else if (binaryFormat)
 		{
-			getTypeBinaryOutputInfo(columnTypeId, &outputFunctionId, &typeVariableLength);
+			getTypeBinaryOutputInfo(columnTypeId, &outputFunctionId,
+									&typeVariableLength);
 		}
 		else
 		{
@@ -1430,7 +1516,8 @@ AppendCopyBinaryFooters(CopyOutState footerOutputState)
  * opens connections to shard placements.
  */
 static void
-StartCopyToNewShard(ShardConnections *shardConnections, CopyStmt *copyStatement)
+StartCopyToNewShard(ShardConnections *shardConnections, CopyStmt *copyStatement,
+					bool binaryCopyFormat)
 {
 	char *relationName = copyStatement->relation->relname;
 	char *schemaName = copyStatement->relation->schemaname;
@@ -1444,7 +1531,7 @@ StartCopyToNewShard(ShardConnections *shardConnections, CopyStmt *copyStatement)
 	shardConnections->connectionList = NIL;
 
 	/* connect to shards placements and start transactions */
-	OpenCopyTransactions(copyStatement, shardConnections, true);
+	OpenCopyTransactions(copyStatement, shardConnections, true, binaryCopyFormat);
 }
 
 
