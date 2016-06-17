@@ -92,6 +92,14 @@ PartiallyEvaluateExpressionWalker(Node *expression, bool *containsVar)
 }
 
 
+/*
+ * Used to evaluate functions during queries on the master before sending them to workers
+ *
+ * The idea isn't to evaluate every kind of expression, just the kinds whoes result might
+ * change between invocations (the idea is to allow users to use functions but still have
+ * consistent shard replicas, since we use statement replication). This means evaluating
+ * all nodes which invoke functions which might not be IMMUTABLE.
+ */
 Node *
 EvaluateExpression(Node *expression)
 {
