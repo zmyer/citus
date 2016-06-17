@@ -486,18 +486,32 @@ ContainsDisallowedFunctionCallsWalker(Node *expression, WalkerState *state)
 	if (IsA(expression, CaseExpr))
 	{
 		CaseExpr* expr = (CaseExpr *) expression;
+		ListCell *temp;
 
-		if (contain_mutable_functions((Node *) (expr->args)) ||
-			contain_mutable_functions((Node *) (expr->defresult)))
+		/*
+		 * contain_mutable_functions doesn't know what to do with CaseWhen so we
+		 * have to break it out ourselves
+		 */
+		foreach(temp, expr->args)
+		{
+			CaseWhen *when = (CaseWhen *) lfirst(temp);
+			Assert(IsA(when, CaseWhen));
+
+			if (contain_mutable_functions((Node *) when->expr) ||
+				contain_mutable_functions((Node *) when->result))
+			{
+				state->badCoalesce = true;
+				return true;
+			}
+		}
+
+		if (contain_mutable_functions((Node *) expr->defresult))
 		{
 			state->badCoalesce = true;
 			return true;
 		}
-		else
-		{
-			/* The args are fine, so we only need to check the testexpr */
-			return ContainsDisallowedFunctionCallsWalker((Node *) (expr->arg), state);
-		}
+
+		return ContainsDisallowedFunctionCallsWalker((Node *) (expr->arg), state);
 	}
 
 	if (IsA(expression, Var))

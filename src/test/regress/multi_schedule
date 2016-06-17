@@ -149,3 +149,8 @@ test: multi_drop_extension
 # multi_complex_count_distinct creates table lineitem_hash, creates shards and load data
 # ----------
 test: multi_complex_count_distinct
+
+# ----------
+# multi_function_evaluation tests edge-cases in master-side function pre-evaluation
+# ----------
+test: multi_function_evaluation
