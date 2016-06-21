@@ -369,11 +369,6 @@ ExecuteFunctions(Query *query)
 	{
 		query->jointree->quals = PartiallyEvaluateExpression(query->jointree->quals);
 	}
-	else
-	{
-		/* sanity check, since we're inside the router executor a WHERE is required */
-		Assert(commandType == CMD_INSERT);
-	}
 
 	foreach(targetEntryCell, query->targetList)
 	{
@@ -397,7 +392,10 @@ ExecuteFunctions(Query *query)
 		targetEntry->expr = (Expr *) modifiedNode;
 	}
 
-	Assert(!contain_mutable_functions((Node *) (query->jointree->quals)));
+	if(query->jointree)
+	{
+		Assert(!contain_mutable_functions((Node *) (query->jointree->quals)));
+	}
 	Assert(!contain_mutable_functions((Node *) (query->targetList)));
 }
 
