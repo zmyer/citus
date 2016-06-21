@@ -290,7 +290,7 @@ UPDATE limit_orders SET symbol = LOWER(symbol) WHERE id = 246;
 SELECT symbol, bidder_id FROM limit_orders WHERE id = 246;
 
 -- updates referencing STABLE functions are allowed
-UPDATE limit_orders SET placed_at = now() WHERE id = 246;
+UPDATE limit_orders SET placed_at = LEAST(placed_at, now()::timestamp) WHERE id = 246;
 -- so are binary operators
 UPDATE limit_orders SET array_of_values = 1 || array_of_values WHERE id = 246;
 
