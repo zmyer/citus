@@ -85,7 +85,7 @@ PartiallyEvaluateExpressionWalker(Node *expression, bool *containsVar)
 	}
 	else
 	{
-		copy = EvaluateExpression(expression);
+		copy = EvaluateExpression(copy);
 	}
 
 	return copy;

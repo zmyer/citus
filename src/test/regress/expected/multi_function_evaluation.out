@@ -73,5 +73,31 @@ UPDATE example SET value = NULLIF(
 	ROW(date '10-10-1000', 2) < ROW(time_col, 3), true
 ) WHERE key = 1;
 ERROR:  STABLE functions used in UPDATE queries cannot be called with column references
+-- DistinctExpr's are also checked for mutability. These are allowed:
+UPDATE example SET value = 1 IS DISTINCT FROM 2 WHERE key = 1;
+UPDATE example SET value = date '10-10-1000' IS DISTINCT FROM timestamptz '10-10-1000' WHERE key = 1;
+-- But this RowCompare references the STABLE = (date, timestamptz) operator
+UPDATE example SET value = date '10-10-1000' IS DISTINCT FROM time_col WHERE key = 1;
+ERROR:  STABLE functions used in UPDATE queries cannot be called with column references
+-- this ScalarArrayOpExpr ("scalar op ANY/ALL (array)") is allowed
+UPDATE example SET value = date '10-10-1000' = ANY ('{10-10-1000}'::date[]) WHERE key = 1;
+-- this ScalarArrayOpExpr is not, it invokes the STABLE = (timestamptz, date) operator
+UPDATE example SET value = time_col = ANY ('{10-10-1000}'::date[]) WHERE key = 1;
+ERROR:  STABLE functions used in UPDATE queries cannot be called with column references
+-- CoerceViaIO (typoutput -> typinput, a type coercion)
+ALTER TABLE example DROP value;
+ALTER TABLE example ADD value date;
+-- this one is allowed
+UPDATE example SET value = (timestamp '10-19-2000 13:29')::date WHERE key = 1;
+-- this one is not
+UPDATE example SET value = time_col::date WHERE key = 1;
+ERROR:  STABLE functions used in UPDATE queries cannot be called with column references
+-- ArrayCoerceExpr (applies elemfuncid to each elem)
+ALTER TABLE example DROP value;
+ALTER TABLE example ADD value date[];
+-- this one is allowed
+UPDATE example SET value = array[timestamptz '10-20-2013 10:20']::date[] WHERE key = 1;
+-- this one is not
+UPDATE example SET value = array[time_col]::date[] WHERE key = 1;
+ERROR:  STABLE functions used in UPDATE queries cannot be called with column references
 DROP TABLE example;
--- Test RowCompareExpr?
