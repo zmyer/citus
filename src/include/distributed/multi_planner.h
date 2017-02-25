@@ -13,14 +13,50 @@
 #include "nodes/plannodes.h"
 #include "nodes/relation.h"
 
+#include "distributed/citus_nodes.h"
+
+
+/* values used by jobs and tasks which do not require identifiers */
+#define INVALID_JOB_ID 0
+#define INVALID_TASK_ID 0
+
+
+typedef struct RelationRestrictionContext
+{
+	bool hasDistributedRelation;
+	bool hasLocalRelation;
+	bool allReferenceTables;
+	List *relationRestrictionList;
+} RelationRestrictionContext;
+
+typedef struct RelationRestriction
+{
+	Index index;
+	Oid relationId;
+	bool distributedRelation;
+	RangeTblEntry *rte;
+	RelOptInfo *relOptInfo;
+	PlannerInfo *plannerInfo;
+	List *prunedShardIntervalList;
+} RelationRestriction;
+
+typedef struct RelationShard
+{
+	CitusNode type;
+	Oid relationId;
+	uint64 shardId;
+} RelationShard;
+
+
 extern PlannedStmt * multi_planner(Query *parse, int cursorOptions,
 								   ParamListInfo boundParams);
 
 extern bool HasCitusToplevelNode(PlannedStmt *planStatement);
 struct MultiPlan;
-extern struct MultiPlan * CreatePhysicalPlan(Query *parse);
 extern struct MultiPlan * GetMultiPlan(PlannedStmt *planStatement);
-extern PlannedStmt * MultiQueryContainerNode(PlannedStmt *result,
-											 struct MultiPlan *multiPlan);
+extern void multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
+											Index index, RangeTblEntry *rte);
+extern bool IsModifyCommand(Query *query);
+extern void VerifyMultiPlanValidity(struct MultiPlan *multiPlan);
 
 #endif /* MULTI_PLANNER_H */

@@ -19,9 +19,10 @@
 
 #include "commands/dbcommands.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/connection_cache.h"
+#include "distributed/connection_management.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/remote_commands.h"
 
 #include <errno.h>
 #include <unistd.h>
@@ -38,7 +39,7 @@
 
 
 /* Local pool to track active connections */
-static PGconn *ClientConnectionArray[MAX_CONNECTION_COUNT];
+static MultiConnection *ClientConnectionArray[MAX_CONNECTION_COUNT];
 
 /*
  * The value at any position on ClientPollingStatusArray is only defined when
@@ -48,8 +49,8 @@ static PostgresPollingStatusType ClientPollingStatusArray[MAX_CONNECTION_COUNT];
 
 
 /* Local functions forward declarations */
-static void ClearRemainingResults(PGconn *connection);
-static bool ClientConnectionReady(PGconn *connection,
+static void ClearRemainingResults(MultiConnection *connection);
+static bool ClientConnectionReady(MultiConnection *connection,
 								  PostgresPollingStatusType pollingStatus);
 
 
@@ -63,7 +64,7 @@ AllocateConnectionId(void)
 	/* allocate connectionId from connection pool */
 	for (connIndex = 0; connIndex < MAX_CONNECTION_COUNT; connIndex++)
 	{
-		PGconn *connection = ClientConnectionArray[connIndex];
+		MultiConnection *connection = ClientConnectionArray[connIndex];
 		if (connection == NULL)
 		{
 			connectionId = connIndex;
@@ -87,12 +88,10 @@ int32
 MultiClientConnect(const char *nodeName, uint32 nodePort, const char *nodeDatabase,
 				   const char *userName)
 {
-	PGconn *connection = NULL;
-	char connInfoString[STRING_BUFFER_SIZE];
+	MultiConnection *connection = NULL;
 	ConnStatusType connStatusType = CONNECTION_OK;
 	int32 connectionId = AllocateConnectionId();
-	char *effectiveDatabaseName = NULL;
-	char *effectiveUserName = NULL;
+	int connectionFlags = FORCE_NEW_CONNECTION; /* no cached connections for now */
 
 	if (connectionId == INVALID_CONNECTION_ID)
 	{
@@ -100,40 +99,18 @@ MultiClientConnect(const char *nodeName, uint32 nodePort, const char *nodeDataba
 		return connectionId;
 	}
 
-	if (nodeDatabase == NULL)
+	if (XactModificationLevel > XACT_MODIFICATION_NONE)
 	{
-		effectiveDatabaseName = get_database_name(MyDatabaseId);
+		ereport(ERROR, (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+						errmsg("cannot open new connections after the first modification "
+							   "command within a transaction")));
 	}
-	else
-	{
-		effectiveDatabaseName = pstrdup(nodeDatabase);
-	}
-
-	if (userName == NULL)
-	{
-		effectiveUserName = CurrentUserName();
-	}
-	else
-	{
-		effectiveUserName = pstrdup(userName);
-	}
-
-	/*
-	 * FIXME: This code is bad on several levels. It completely forgoes any
-	 * escaping, it misses setting a number of parameters, it works with a
-	 * limited string size without erroring when it's too long. We shouldn't
-	 * even build a query string this way, there's PQconnectdbParams()!
-	 */
-
-	/* transcribe connection paremeters to string */
-	snprintf(connInfoString, STRING_BUFFER_SIZE, CONN_INFO_TEMPLATE,
-			 nodeName, nodePort,
-			 effectiveDatabaseName, effectiveUserName,
-			 CLIENT_CONNECT_TIMEOUT);
 
 	/* establish synchronous connection to worker node */
-	connection = PQconnectdb(connInfoString);
-	connStatusType = PQstatus(connection);
+	connection = GetNodeUserDatabaseConnection(connectionFlags, nodeName, nodePort,
+											   userName, nodeDatabase);
+
+	connStatusType = PQstatus(connection->pgConn);
 
 	if (connStatusType == CONNECTION_OK)
 	{
@@ -141,14 +118,10 @@ MultiClientConnect(const char *nodeName, uint32 nodePort, const char *nodeDataba
 	}
 	else
 	{
-		WarnRemoteError(connection, NULL);
-
-		PQfinish(connection);
+		ReportConnectionError(connection, WARNING);
+		CloseConnection(connection);
 		connectionId = INVALID_CONNECTION_ID;
 	}
-
-	pfree(effectiveDatabaseName);
-	pfree(effectiveUserName);
 
 	return connectionId;
 }
@@ -162,25 +135,27 @@ MultiClientConnect(const char *nodeName, uint32 nodePort, const char *nodeDataba
 int32
 MultiClientConnectStart(const char *nodeName, uint32 nodePort, const char *nodeDatabase)
 {
-	PGconn *connection = NULL;
-	char connInfoString[STRING_BUFFER_SIZE];
-	ConnStatusType connStatusType = CONNECTION_BAD;
-	char *userName = CurrentUserName();
-
+	MultiConnection *connection = NULL;
+	ConnStatusType connStatusType = CONNECTION_OK;
 	int32 connectionId = AllocateConnectionId();
+	int connectionFlags = FORCE_NEW_CONNECTION; /* no cached connections for now */
+
 	if (connectionId == INVALID_CONNECTION_ID)
 	{
 		ereport(WARNING, (errmsg("could not allocate connection in connection pool")));
 		return connectionId;
 	}
 
-	/* transcribe connection paremeters to string */
-	snprintf(connInfoString, STRING_BUFFER_SIZE, CONN_INFO_TEMPLATE,
-			 nodeName, nodePort, nodeDatabase, userName, CLIENT_CONNECT_TIMEOUT);
+	if (XactModificationLevel > XACT_MODIFICATION_NONE)
+	{
+		ereport(ERROR, (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+						errmsg("cannot open new connections after the first modification "
+							   "command within a transaction")));
+	}
 
 	/* prepare asynchronous request for worker node connection */
-	connection = PQconnectStart(connInfoString);
-	connStatusType = PQstatus(connection);
+	connection = StartNodeConnection(connectionFlags, nodeName, nodePort);
+	connStatusType = PQstatus(connection->pgConn);
 
 	/*
 	 * If prepared, we save the connection, and set its initial polling status
@@ -194,9 +169,9 @@ MultiClientConnectStart(const char *nodeName, uint32 nodePort, const char *nodeD
 	}
 	else
 	{
-		WarnRemoteError(connection, NULL);
+		ReportConnectionError(connection, WARNING);
+		CloseConnection(connection);
 
-		PQfinish(connection);
 		connectionId = INVALID_CONNECTION_ID;
 	}
 
@@ -208,7 +183,7 @@ MultiClientConnectStart(const char *nodeName, uint32 nodePort, const char *nodeD
 ConnectStatus
 MultiClientConnectPoll(int32 connectionId)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	PostgresPollingStatusType pollingStatus = PGRES_POLLING_OK;
 	ConnectStatus connectStatus = CLIENT_INVALID_CONNECT;
 
@@ -226,7 +201,7 @@ MultiClientConnectPoll(int32 connectionId)
 		bool readReady = ClientConnectionReady(connection, PGRES_POLLING_READING);
 		if (readReady)
 		{
-			ClientPollingStatusArray[connectionId] = PQconnectPoll(connection);
+			ClientPollingStatusArray[connectionId] = PQconnectPoll(connection->pgConn);
 			connectStatus = CLIENT_CONNECTION_BUSY;
 		}
 		else
@@ -239,7 +214,7 @@ MultiClientConnectPoll(int32 connectionId)
 		bool writeReady = ClientConnectionReady(connection, PGRES_POLLING_WRITING);
 		if (writeReady)
 		{
-			ClientPollingStatusArray[connectionId] = PQconnectPoll(connection);
+			ClientPollingStatusArray[connectionId] = PQconnectPoll(connection->pgConn);
 			connectStatus = CLIENT_CONNECTION_BUSY;
 		}
 		else
@@ -249,7 +224,7 @@ MultiClientConnectPoll(int32 connectionId)
 	}
 	else if (pollingStatus == PGRES_POLLING_FAILED)
 	{
-		WarnRemoteError(connection, NULL);
+		ReportConnectionError(connection, WARNING);
 
 		connectStatus = CLIENT_CONNECTION_BAD;
 	}
@@ -262,14 +237,14 @@ MultiClientConnectPoll(int32 connectionId)
 void
 MultiClientDisconnect(int32 connectionId)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	const int InvalidPollingStatus = -1;
 
 	Assert(connectionId != INVALID_CONNECTION_ID);
 	connection = ClientConnectionArray[connectionId];
 	Assert(connection != NULL);
 
-	PQfinish(connection);
+	CloseConnection(connection);
 
 	ClientConnectionArray[connectionId] = NULL;
 	ClientPollingStatusArray[connectionId] = InvalidPollingStatus;
@@ -283,7 +258,7 @@ MultiClientDisconnect(int32 connectionId)
 bool
 MultiClientConnectionUp(int32 connectionId)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	ConnStatusType connStatusType = CONNECTION_OK;
 	bool connectionUp = true;
 
@@ -291,7 +266,7 @@ MultiClientConnectionUp(int32 connectionId)
 	connection = ClientConnectionArray[connectionId];
 	Assert(connection != NULL);
 
-	connStatusType = PQstatus(connection);
+	connStatusType = PQstatus(connection->pgConn);
 	if (connStatusType == CONNECTION_BAD)
 	{
 		connectionUp = false;
@@ -301,11 +276,31 @@ MultiClientConnectionUp(int32 connectionId)
 }
 
 
+/* MultiClientExecute synchronously executes a query over the given connection. */
+bool
+MultiClientExecute(int32 connectionId, const char *query, void **queryResult,
+				   int *rowCount, int *columnCount)
+{
+	bool querySent = false;
+	bool queryOK = false;
+
+	querySent = MultiClientSendQuery(connectionId, query);
+	if (!querySent)
+	{
+		return false;
+	}
+
+	queryOK = MultiClientQueryResult(connectionId, queryResult, rowCount, columnCount);
+
+	return queryOK;
+}
+
+
 /* MultiClientSendQuery sends the given query over the given connection. */
 bool
 MultiClientSendQuery(int32 connectionId, const char *query)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	bool success = true;
 	int querySent = 0;
 
@@ -313,10 +308,10 @@ MultiClientSendQuery(int32 connectionId, const char *query)
 	connection = ClientConnectionArray[connectionId];
 	Assert(connection != NULL);
 
-	querySent = PQsendQuery(connection, query);
+	querySent = PQsendQuery(connection->pgConn, query);
 	if (querySent == 0)
 	{
-		char *errorMessage = PQerrorMessage(connection);
+		char *errorMessage = PQerrorMessage(connection->pgConn);
 		ereport(WARNING, (errmsg("could not send remote query \"%s\"", query),
 						  errdetail("Client error: %s", errorMessage)));
 
@@ -331,7 +326,7 @@ MultiClientSendQuery(int32 connectionId, const char *query)
 bool
 MultiClientCancel(int32 connectionId)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	PGcancel *cancelObject = NULL;
 	int cancelSent = 0;
 	bool canceled = true;
@@ -341,7 +336,7 @@ MultiClientCancel(int32 connectionId)
 	connection = ClientConnectionArray[connectionId];
 	Assert(connection != NULL);
 
-	cancelObject = PQgetCancel(connection);
+	cancelObject = PQgetCancel(connection->pgConn);
 
 	cancelSent = PQcancel(cancelObject, errorBuffer, sizeof(errorBuffer));
 	if (cancelSent == 0)
@@ -362,7 +357,7 @@ MultiClientCancel(int32 connectionId)
 ResultStatus
 MultiClientResultStatus(int32 connectionId)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	int consumed = 0;
 	ConnStatusType connStatusType = CONNECTION_OK;
 	ResultStatus resultStatus = CLIENT_INVALID_RESULT_STATUS;
@@ -371,7 +366,7 @@ MultiClientResultStatus(int32 connectionId)
 	connection = ClientConnectionArray[connectionId];
 	Assert(connection != NULL);
 
-	connStatusType = PQstatus(connection);
+	connStatusType = PQstatus(connection->pgConn);
 	if (connStatusType == CONNECTION_BAD)
 	{
 		ereport(WARNING, (errmsg("could not maintain connection to worker node")));
@@ -379,10 +374,10 @@ MultiClientResultStatus(int32 connectionId)
 	}
 
 	/* consume input to allow status change */
-	consumed = PQconsumeInput(connection);
+	consumed = PQconsumeInput(connection->pgConn);
 	if (consumed != 0)
 	{
-		int connectionBusy = PQisBusy(connection);
+		int connectionBusy = PQisBusy(connection->pgConn);
 		if (connectionBusy == 0)
 		{
 			resultStatus = CLIENT_RESULT_READY;
@@ -407,7 +402,7 @@ bool
 MultiClientQueryResult(int32 connectionId, void **queryResult, int *rowCount,
 					   int *columnCount)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	PGresult *result = NULL;
 	ConnStatusType connStatusType = CONNECTION_OK;
 	ExecStatusType resultStatus = PGRES_COMMAND_OK;
@@ -416,14 +411,14 @@ MultiClientQueryResult(int32 connectionId, void **queryResult, int *rowCount,
 	connection = ClientConnectionArray[connectionId];
 	Assert(connection != NULL);
 
-	connStatusType = PQstatus(connection);
+	connStatusType = PQstatus(connection->pgConn);
 	if (connStatusType == CONNECTION_BAD)
 	{
 		ereport(WARNING, (errmsg("could not maintain connection to worker node")));
 		return false;
 	}
 
-	result = PQgetResult(connection);
+	result = PQgetResult(connection->pgConn);
 	resultStatus = PQresultStatus(result);
 	if (resultStatus == PGRES_TUPLES_OK)
 	{
@@ -433,8 +428,10 @@ MultiClientQueryResult(int32 connectionId, void **queryResult, int *rowCount,
 	}
 	else
 	{
-		WarnRemoteError(connection, result);
+		ReportResultError(connection, result, WARNING);
 		PQclear(result);
+
+		return false;
 	}
 
 	/* clear extra result objects */
@@ -457,7 +454,7 @@ BatchQueryStatus
 MultiClientBatchResult(int32 connectionId, void **queryResult, int *rowCount,
 					   int *columnCount)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	PGresult *result = NULL;
 	ConnStatusType connStatusType = CONNECTION_OK;
 	ExecStatusType resultStatus = PGRES_COMMAND_OK;
@@ -472,14 +469,14 @@ MultiClientBatchResult(int32 connectionId, void **queryResult, int *rowCount,
 	(*rowCount) = -1;
 	(*columnCount) = -1;
 
-	connStatusType = PQstatus(connection);
+	connStatusType = PQstatus(connection->pgConn);
 	if (connStatusType == CONNECTION_BAD)
 	{
 		ereport(WARNING, (errmsg("could not maintain connection to worker node")));
 		return CLIENT_BATCH_QUERY_FAILED;
 	}
 
-	result = PQgetResult(connection);
+	result = PQgetResult(connection->pgConn);
 	if (result == NULL)
 	{
 		return CLIENT_BATCH_QUERY_DONE;
@@ -500,7 +497,7 @@ MultiClientBatchResult(int32 connectionId, void **queryResult, int *rowCount,
 	}
 	else
 	{
-		WarnRemoteError(connection, result);
+		ReportResultError(connection, result, WARNING);
 		PQclear(result);
 		queryStatus = CLIENT_BATCH_QUERY_FAILED;
 	}
@@ -518,6 +515,15 @@ MultiClientGetValue(void *queryResult, int rowIndex, int columnIndex)
 }
 
 
+/* MultiClientValueIsNull returns whether the value at the given position is null. */
+bool
+MultiClientValueIsNull(void *queryResult, int rowIndex, int columnIndex)
+{
+	bool isNull = PQgetisnull((PGresult *) queryResult, rowIndex, columnIndex);
+	return isNull;
+}
+
+
 /* MultiClientClearResult free's the memory associated with a PGresult. */
 void
 MultiClientClearResult(void *queryResult)
@@ -530,7 +536,7 @@ MultiClientClearResult(void *queryResult)
 QueryStatus
 MultiClientQueryStatus(int32 connectionId)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	PGresult *result = NULL;
 	int tupleCount PG_USED_FOR_ASSERTS_ONLY = 0;
 	bool copyResults = false;
@@ -542,7 +548,7 @@ MultiClientQueryStatus(int32 connectionId)
 	connection = ClientConnectionArray[connectionId];
 	Assert(connection != NULL);
 
-	connStatusType = PQstatus(connection);
+	connStatusType = PQstatus(connection->pgConn);
 	if (connStatusType == CONNECTION_BAD)
 	{
 		ereport(WARNING, (errmsg("could not maintain connection to worker node")));
@@ -554,7 +560,7 @@ MultiClientQueryStatus(int32 connectionId)
 	 * isn't ready yet (the caller didn't wait for the connection to be ready),
 	 * we will block on this call.
 	 */
-	result = PQgetResult(connection);
+	result = PQgetResult(connection->pgConn);
 	resultStatus = PQresultStatus(result);
 
 	if (resultStatus == PGRES_COMMAND_OK)
@@ -585,7 +591,7 @@ MultiClientQueryStatus(int32 connectionId)
 			copyResults = true;
 		}
 
-		WarnRemoteError(connection, result);
+		ReportResultError(connection, result, WARNING);
 	}
 
 	/* clear the result object */
@@ -608,7 +614,7 @@ MultiClientQueryStatus(int32 connectionId)
 CopyStatus
 MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	char *receiveBuffer = NULL;
 	int consumed = 0;
 	int receiveLength = 0;
@@ -623,7 +629,7 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 	 * Consume input to handle the case where previous copy operation might have
 	 * received zero bytes.
 	 */
-	consumed = PQconsumeInput(connection);
+	consumed = PQconsumeInput(connection->pgConn);
 	if (consumed == 0)
 	{
 		ereport(WARNING, (errmsg("could not read data from worker node")));
@@ -631,7 +637,7 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 	}
 
 	/* receive copy data message in an asynchronous manner */
-	receiveLength = PQgetCopyData(connection, &receiveBuffer, asynchronous);
+	receiveLength = PQgetCopyData(connection->pgConn, &receiveBuffer, asynchronous);
 	while (receiveLength > 0)
 	{
 		/* received copy data; append these data to file */
@@ -652,7 +658,7 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 
 		PQfreemem(receiveBuffer);
 
-		receiveLength = PQgetCopyData(connection, &receiveBuffer, asynchronous);
+		receiveLength = PQgetCopyData(connection->pgConn, &receiveBuffer, asynchronous);
 	}
 
 	/* we now check the last received length returned by copy data */
@@ -664,7 +670,7 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 	else if (receiveLength == -1)
 	{
 		/* received copy done message */
-		PGresult *result = PQgetResult(connection);
+		PGresult *result = PQgetResult(connection->pgConn);
 		ExecStatusType resultStatus = PQresultStatus(result);
 
 		if (resultStatus == PGRES_COMMAND_OK)
@@ -675,7 +681,7 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 		{
 			copyStatus = CLIENT_COPY_FAILED;
 
-			WarnRemoteError(connection, result);
+			ReportResultError(connection, result, WARNING);
 		}
 
 		PQclear(result);
@@ -685,7 +691,7 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 		/* received an error */
 		copyStatus = CLIENT_COPY_FAILED;
 
-		WarnRemoteError(connection, NULL);
+		ReportConnectionError(connection, WARNING);
 	}
 
 	/* if copy out completed, make sure we drain all results from libpq */
@@ -748,7 +754,7 @@ void
 MultiClientRegisterWait(WaitInfo *waitInfo, TaskExecutionStatus executionStatus,
 						int32 connectionId)
 {
-	PGconn *connection = NULL;
+	MultiConnection *connection = NULL;
 	struct pollfd *pollfd = NULL;
 
 	Assert(waitInfo->registeredWaiters < waitInfo->maxWaiters);
@@ -766,7 +772,7 @@ MultiClientRegisterWait(WaitInfo *waitInfo, TaskExecutionStatus executionStatus,
 
 	connection = ClientConnectionArray[connectionId];
 	pollfd = &waitInfo->pollfds[waitInfo->registeredWaiters];
-	pollfd->fd = PQsocket(connection);
+	pollfd->fd = PQsocket(connection->pgConn);
 	if (executionStatus == TASK_STATUS_SOCKET_READ)
 	{
 		pollfd->events = POLLERR | POLLIN;
@@ -786,14 +792,14 @@ MultiClientRegisterWait(WaitInfo *waitInfo, TaskExecutionStatus executionStatus,
 void
 MultiClientWait(WaitInfo *waitInfo)
 {
-	long sleepIntervalPerCycle = RemoteTaskCheckInterval * 1000L;
-
 	/*
 	 * If we had a failure, we always want to sleep for a bit, to prevent
 	 * flooding the other system, probably making the situation worse.
 	 */
 	if (waitInfo->haveFailedWaiter)
 	{
+		long sleepIntervalPerCycle = RemoteTaskCheckInterval * 1000L;
+
 		pg_usleep(sleepIntervalPerCycle);
 		return;
 	}
@@ -814,7 +820,7 @@ MultiClientWait(WaitInfo *waitInfo)
 		 * times as long.
 		 */
 		int rc = poll(waitInfo->pollfds, waitInfo->registeredWaiters,
-					  sleepIntervalPerCycle * 10);
+					  RemoteTaskCheckInterval * 10);
 
 		if (rc < 0)
 		{
@@ -838,7 +844,7 @@ MultiClientWait(WaitInfo *waitInfo)
 		}
 		else if (rc == 0)
 		{
-			ereport(DEBUG2,
+			ereport(DEBUG5,
 					(errmsg("waiting for activity on tasks took longer than %ld ms",
 							(long) RemoteTaskCheckInterval * 10)));
 		}
@@ -858,13 +864,13 @@ MultiClientWait(WaitInfo *waitInfo)
  * query.
  */
 static void
-ClearRemainingResults(PGconn *connection)
+ClearRemainingResults(MultiConnection *connection)
 {
-	PGresult *result = PQgetResult(connection);
+	PGresult *result = PQgetResult(connection->pgConn);
 	while (result != NULL)
 	{
 		PQclear(result);
-		result = PQgetResult(connection);
+		result = PQgetResult(connection->pgConn);
 	}
 }
 
@@ -875,7 +881,8 @@ ClearRemainingResults(PGconn *connection)
  * and libpq_select() at libpqwalreceiver.c.
  */
 static bool
-ClientConnectionReady(PGconn *connection, PostgresPollingStatusType pollingStatus)
+ClientConnectionReady(MultiConnection *connection,
+					  PostgresPollingStatusType pollingStatus)
 {
 	bool clientConnectionReady = false;
 	int pollResult = 0;
@@ -896,7 +903,7 @@ ClientConnectionReady(PGconn *connection, PostgresPollingStatusType pollingStatu
 		pollEventMask = POLLERR | POLLOUT;
 	}
 
-	pollFileDescriptor.fd = PQsocket(connection);
+	pollFileDescriptor.fd = PQsocket(connection->pgConn);
 	pollFileDescriptor.events = pollEventMask;
 	pollFileDescriptor.revents = 0;
 

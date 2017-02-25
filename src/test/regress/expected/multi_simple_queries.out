@@ -25,13 +25,6 @@ SELECT master_create_distributed_table('articles_single_shard', 'author_id', 'ha
  
 (1 row)
 
--- test when a table is distributed but no shards created yet
-SELECT count(*) from articles;
- count 
--------
-      
-(1 row)
-
 SELECT master_create_worker_shards('articles', 2, 1);
  master_create_worker_shards 
 -----------------------------
@@ -97,18 +90,15 @@ INSERT INTO articles VALUES (49,  9, 'anyone', 2681);
 INSERT INTO articles VALUES (50, 10, 'anjanette', 19519);
 -- insert a single row for the test
 INSERT INTO articles_single_shard VALUES (50, 10, 'anjanette', 19519);
--- first, test zero-shard SELECT, which should return an empty row
-SELECT COUNT(*) FROM articles WHERE author_id = 1 AND author_id = 2;
- count 
--------
-      
-(1 row)
-
 -- zero-shard modifications should fail
 UPDATE articles SET title = '' WHERE author_id = 1 AND author_id = 2;
 ERROR:  distributed modifications must target exactly one shard
+DETAIL:  This command modifies no shards.
+HINT:  Consider using an equality filter on partition column "author_id". You can use master_modify_multiple_shards() to perform multi-shard delete or update operations.
 DELETE FROM articles WHERE author_id = 1 AND author_id = 2;
 ERROR:  distributed modifications must target exactly one shard
+DETAIL:  This command modifies no shards.
+HINT:  Consider using an equality filter on partition column "author_id". You can use master_modify_multiple_shards() to perform multi-shard delete or update operations.
 -- single-shard tests
 -- test simple select for a single row
 SELECT * FROM articles WHERE author_id = 10 AND id = 50;
@@ -170,28 +160,32 @@ SELECT title, author_id FROM articles
  alkylic     |         8
 (10 rows)
 
--- add in some grouping expressions, still on same shard
--- having queries unsupported in Citus
+-- add in some grouping expressions
 SELECT author_id, sum(word_count) AS corpus_size FROM articles
-	WHERE author_id = 1 OR author_id = 7 OR author_id = 8 OR author_id = 10
+	WHERE author_id = 1 OR author_id = 2 OR author_id = 8 OR author_id = 10
 	GROUP BY author_id
 	HAVING sum(word_count) > 40000
 	ORDER BY sum(word_count) DESC;
-ERROR:  cannot perform distributed planning on this query
-DETAIL:  Having qual is currently unsupported
--- UNION/INTERSECT queries are unsupported
+ author_id | corpus_size 
+-----------+-------------
+         2 |       61782
+        10 |       59955
+         8 |       55410
+(3 rows)
+
+-- UNION/INTERSECT queries are unsupported if on multiple shards
 SELECT * FROM articles WHERE author_id = 10 UNION
-SELECT * FROM articles WHERE author_id = 1; 
-ERROR:  cannot perform distributed planning on this query
-DETAIL:  Union, Intersect, or Except are currently unsupported
+SELECT * FROM articles WHERE author_id = 2; 
+ERROR:  could not run distributed query with UNION, INTERSECT, or EXCEPT
+HINT:  Consider using an equality filter on the distributed table's partition column.
 -- queries using CTEs are unsupported
 WITH long_names AS ( SELECT id FROM authors WHERE char_length(name) > 15 )
 SELECT title FROM articles;
 ERROR:  cannot plan queries that include both regular and partitioned relations
 -- queries which involve functions in FROM clause are unsupported.
 SELECT * FROM articles, position('om' in 'Thomas');
-ERROR:  cannot perform distributed planning on this query
-DETAIL:  Complex table expressions are currently unsupported
+ERROR:  could not run distributed query with complex table expressions
+HINT:  Consider using an equality filter on the distributed table's partition column.
 -- subqueries are not supported in WHERE clause in Citus
 SELECT * FROM articles WHERE author_id IN (SELECT id FROM authors WHERE name LIKE '%a');
 ERROR:  cannot plan queries that include both regular and partitioned relations
@@ -254,10 +248,10 @@ ORDER BY articles.id;
 (50 rows)
 
 -- subqueries are not supported in SELECT clause
-SELECT a.title AS name, (SELECT a2.id FROM authors a2 WHERE a.id = a2.id  LIMIT 1)
+SELECT a.title AS name, (SELECT a2.id FROM articles_single_shard a2 WHERE a.id = a2.id  LIMIT 1)
 						 AS special_price FROM articles a;
-ERROR:  cannot perform distributed planning on this query
-DETAIL:  Subqueries other than in from-clause are currently unsupported
+ERROR:  could not run distributed query with subquery outside the FROM clause
+HINT:  Consider using an equality filter on the distributed table's partition column.
 -- joins are not supported between local and distributed tables
 SELECT title, authors.name FROM authors, articles WHERE authors.id = articles.author_id;
 ERROR:  cannot plan queries that include both regular and partitioned relations
@@ -300,21 +294,91 @@ SELECT FROM articles WHERE word_count = 65500;
 --
 (0 rows)
 
--- having queries unsupported in Citus
+-- having queries supported in Citus
 SELECT author_id, sum(word_count) AS corpus_size FROM articles
 	GROUP BY author_id
 	HAVING sum(word_count) > 25000
 	ORDER BY sum(word_count) DESC
 	LIMIT 5;
-ERROR:  cannot perform distributed planning on this query
-DETAIL:  Having qual is currently unsupported
--- more proof Citus doesn't support having clauses
+ author_id | corpus_size 
+-----------+-------------
+         4 |       66325
+         2 |       61782
+        10 |       59955
+         8 |       55410
+         6 |       50867
+(5 rows)
+
 SELECT author_id FROM articles
 	GROUP BY author_id
 	HAVING sum(word_count) > 50000
 	ORDER BY author_id;
-ERROR:  cannot perform distributed planning on this query
-DETAIL:  Having qual is currently unsupported
+ author_id 
+-----------
+         2
+         4
+         6
+         8
+        10
+(5 rows)
+
+SELECT author_id FROM articles
+	GROUP BY author_id
+	HAVING sum(word_count) > 50000 AND author_id < 5
+	ORDER BY author_id;
+ author_id 
+-----------
+         2
+         4
+(2 rows)
+
+SELECT author_id FROM articles
+	GROUP BY author_id
+	HAVING sum(word_count) > 50000 OR author_id < 5
+	ORDER BY author_id;
+ author_id 
+-----------
+         1
+         2
+         3
+         4
+         6
+         8
+        10
+(7 rows)
+
+SELECT author_id FROM articles
+	GROUP BY author_id
+	HAVING author_id <= 2 OR author_id = 8
+	ORDER BY author_id;
+ author_id 
+-----------
+         1
+         2
+         8
+(3 rows)
+
+SELECT o_orderstatus, count(*), avg(o_totalprice) FROM orders 
+	GROUP BY o_orderstatus
+	HAVING count(*) > 1450 OR avg(o_totalprice) > 150000
+	ORDER BY o_orderstatus;
+ o_orderstatus | count |         avg         
+---------------+-------+---------------------
+ O             |  1460 | 143355.847013698630
+ P             |    75 | 164847.914533333333
+(2 rows)
+
+SELECT o_orderstatus, sum(l_linenumber), avg(l_linenumber) FROM lineitem, orders
+	WHERE l_orderkey = o_orderkey AND l_orderkey > 9030
+	GROUP BY o_orderstatus
+	HAVING sum(l_linenumber) > 1000
+	ORDER BY o_orderstatus;
+ o_orderstatus | sum  |        avg         
+---------------+------+--------------------
+ F             | 8559 | 3.0126715945089757
+ O             | 8901 | 3.0050641458474004
+(2 rows)
+
 -- now, test the cases where Citus do or do not need to create
 -- the master queries
 SET citus.large_table_shard_count TO 2;
@@ -324,8 +388,8 @@ SET citus.task_executor_type TO 'real-time';
 SELECT *
 	FROM articles
 	WHERE author_id = 1;
-DEBUG:  Creating router plan
 DEBUG:  predicate pruning for shardId 850001
+DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
  id | author_id |    title     | word_count 
 ----+-----------+--------------+------------
@@ -341,6 +405,7 @@ SELECT *
 	FROM articles
 	WHERE author_id = 1 OR author_id = 17;
 DEBUG:  predicate pruning for shardId 850001
+DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
  id | author_id |    title     | word_count 
 ----+-----------+--------------+------------
@@ -368,8 +433,8 @@ SELECT *
 SELECT id as article_id, word_count * id as random_value
 	FROM articles
 	WHERE author_id = 1;
-DEBUG:  Creating router plan
 DEBUG:  predicate pruning for shardId 850001
+DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
  article_id | random_value 
 ------------+--------------
@@ -386,9 +451,9 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles a, articles b
 	WHERE a.author_id = 10 and a.author_id = b.author_id
 	LIMIT 3;
-DEBUG:  push down of limit count: 3
 DEBUG:  predicate pruning for shardId 850001
-DEBUG:  join prunable for intervals [-2147483648,-1] and [0,2147483647]
+DEBUG:  predicate pruning for shardId 850001
+DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
  first_author | second_word_count 
 --------------+-------------------
@@ -403,8 +468,9 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles a, articles_single_shard b
 	WHERE a.author_id = 10 and a.author_id = b.author_id
 	LIMIT 3;
-DEBUG:  push down of limit count: 3
 DEBUG:  predicate pruning for shardId 850001
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
  first_author | second_word_count 
 --------------+-------------------
            10 |             19519
@@ -417,8 +483,8 @@ SELECT *
 	FROM articles
 	WHERE author_id = 1
 	LIMIT 2;
-DEBUG:  Creating router plan
 DEBUG:  predicate pruning for shardId 850001
+DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
  id | author_id |  title   | word_count 
 ----+-----------+----------+------------
@@ -432,29 +498,31 @@ DEBUG:  Plan is router executable
 SELECT id
 	FROM articles
 	WHERE author_id = 1
-	GROUP BY id;
-DEBUG:  Creating router plan
+	GROUP BY id
+	ORDER BY id;
 DEBUG:  predicate pruning for shardId 850001
+DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
  id 
 ----
- 41
- 11
- 31
   1
+ 11
  21
+ 31
+ 41
 (5 rows)
 
 -- copying from a single shard table does not require the master query
 COPY articles_single_shard TO stdout;
+DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
 50	10	anjanette	19519
 -- error out for queries with aggregates
 SELECT avg(word_count)
 	FROM articles
 	WHERE author_id = 2;
-DEBUG:  Creating router plan
 DEBUG:  predicate pruning for shardId 850000
+DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
         avg         
 --------------------
@@ -467,8 +535,8 @@ SELECT max(word_count) as max, min(word_count) as min,
 	   sum(word_count) as sum, count(word_count) as cnt
 	FROM articles
 	WHERE author_id = 2;
-DEBUG:  Creating router plan
 DEBUG:  predicate pruning for shardId 850000
+DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
   max  | min  |  sum  | cnt 
 -------+------+-------+-----
@@ -479,6 +547,7 @@ DEBUG:  Plan is router executable
 SELECT *
 	FROM articles a, articles b
 	WHERE a.id = b.id  AND a.author_id = 1;
+DEBUG:  predicate pruning for shardId 850001
 DEBUG:  predicate pruning for shardId 850001
 DEBUG:  join prunable for task partitionId 0 and 1
 DEBUG:  join prunable for task partitionId 0 and 2
@@ -510,4 +579,20 @@ DEBUG:  pruning merge fetch taskId 11
 DETAIL:  Creating dependency on merge taskId 14
 ERROR:  cannot use real time executor with repartition jobs
 HINT:  Set citus.task_executor_type to "task-tracker".
+-- system columns from shard tables can be queried and retrieved
+SELECT count(*) FROM (
+    SELECT tableoid, ctid, cmin, cmax, xmin, xmax
+        FROM articles
+        WHERE tableoid IS NOT NULL OR
+                  ctid IS NOT NULL OR
+                  cmin IS NOT NULL OR
+                  cmax IS NOT NULL OR
+                  xmin IS NOT NULL OR
+                  xmax IS NOT NULL
+) x;
+ count 
+-------
+    50
+(1 row)
+
 SET client_min_messages to 'NOTICE';

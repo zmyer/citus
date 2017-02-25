@@ -24,8 +24,8 @@ CREATE TABLE lineitem (
 	l_comment varchar(44) not null,
 	PRIMARY KEY(l_orderkey, l_linenumber) );
 SELECT master_create_distributed_table('lineitem', 'l_orderkey', 'append');
-WARNING:  table "lineitem" has a unique constraint
-DETAIL:  Unique constraints and primary keys on append-partitioned tables cannot be enforced.
+WARNING:  table "lineitem" has a UNIQUE or EXCLUDE constraint
+DETAIL:  UNIQUE constraints, EXCLUDE constraints, and PRIMARY KEYs on append-partitioned tables cannot be enforced.
 HINT:  Consider using hash partitioning.
  master_create_distributed_table 
 ---------------------------------
@@ -33,6 +33,8 @@ HINT:  Consider using hash partitioning.
 (1 row)
 
 CREATE INDEX lineitem_time_index ON lineitem (l_shipdate);
+NOTICE:  using one-phase commit for distributed DDL commands
+HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 CREATE TABLE orders (
 	o_orderkey bigint not null,
 	o_custkey integer not null,
@@ -45,8 +47,8 @@ CREATE TABLE orders (
 	o_comment varchar(79) not null,
 	PRIMARY KEY(o_orderkey) );
 SELECT master_create_distributed_table('orders', 'o_orderkey', 'append');
-WARNING:  table "orders" has a unique constraint
-DETAIL:  Unique constraints and primary keys on append-partitioned tables cannot be enforced.
+WARNING:  table "orders" has a UNIQUE or EXCLUDE constraint
+DETAIL:  UNIQUE constraints, EXCLUDE constraints, and PRIMARY KEYs on append-partitioned tables cannot be enforced.
 HINT:  Consider using hash partitioning.
  master_create_distributed_table 
 ---------------------------------
@@ -73,9 +75,15 @@ CREATE TABLE nation (
 	n_name char(25) not null,
 	n_regionkey integer not null,
 	n_comment varchar(152));
+\COPY nation FROM STDIN WITH CSV
 SELECT master_create_distributed_table('nation', 'n_nationkey', 'append');
- master_create_distributed_table 
----------------------------------
+ERROR:  cannot distribute relation "nation"
+DETAIL:  Relation "nation" contains data.
+HINT:  Empty your table before distributing it.
+TRUNCATE nation;
+SELECT create_reference_table('nation');
+ create_reference_table 
+------------------------
  
 (1 row)
 
@@ -105,92 +113,266 @@ CREATE TABLE supplier
 	s_acctbal decimal(15,2) not null,
 	s_comment varchar(101) not null
 );
-SELECT master_create_distributed_table('supplier', 's_suppkey', 'append');
+SELECT create_reference_table('supplier');
+ create_reference_table 
+------------------------
+ 
+(1 row)
+
+-- create a single shard supplier table which is not 
+-- a reference table
+CREATE TABLE supplier_single_shard
+(
+	s_suppkey integer not null,
+ 	s_name char(25) not null,
+ 	s_address varchar(40) not null,
+ 	s_nationkey integer,
+ 	s_phone char(15) not null,
+  	s_acctbal decimal(15,2) not null,
+  	s_comment varchar(101) not null
+);
+SELECT master_create_distributed_table('supplier_single_shard', 's_suppkey', 'append');
  master_create_distributed_table 
 ---------------------------------
  
 (1 row)
 
--- now test that Citus cannot distribute unique constraints that do not include
--- the partition column
-CREATE TABLE primary_key_on_non_part_col
-(
-	partition_col integer,
-	other_col integer PRIMARY KEY
-);
-SELECT master_create_distributed_table('primary_key_on_non_part_col', 'partition_col', 'hash');
-ERROR:  cannot distribute relation: "primary_key_on_non_part_col"
-DETAIL:  Distributed relations cannot have UNIQUE constraints or PRIMARY KEYs that do not include the partition column.
-CREATE TABLE unique_const_on_non_part_col
-(
-	partition_col integer,
-	other_col integer UNIQUE
-);
-SELECT master_create_distributed_table('primary_key_on_non_part_col', 'partition_col', 'hash');
-ERROR:  cannot distribute relation: "primary_key_on_non_part_col"
-DETAIL:  Distributed relations cannot have UNIQUE constraints or PRIMARY KEYs that do not include the partition column.
--- now show that Citus can distribute unique constrints that include
--- the partition column
-CREATE TABLE primary_key_on_part_col
-(
-	partition_col integer PRIMARY KEY,
-	other_col integer
-);
-SELECT master_create_distributed_table('primary_key_on_part_col', 'partition_col', 'hash');
+CREATE TABLE mx_table_test (col1 int, col2 text);
+-- Since we're superuser, we can set the replication model to 'streaming' to
+-- create a one-off MX table... but if we forget to set the replication factor to one,
+-- we should see an error reminding us to fix that
+SET citus.replication_model TO 'streaming';
+SELECT create_distributed_table('mx_table_test', 'col1');
+ERROR:  replication factors above one are incompatible with the streaming replication model
+HINT:  Try again after reducing "citus.shard_replication_factor" to one or setting "citus.replication_model" to "statement".
+-- ok, so now actually create the one-off MX table
+SET citus.shard_replication_factor TO 1;
+SELECT create_distributed_table('mx_table_test', 'col1');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='mx_table_test'::regclass;
+ repmodel 
+----------
+ s
+(1 row)
+
+DROP TABLE mx_table_test;
+-- Show that master_create_distributed_table ignores citus.replication_model GUC
+CREATE TABLE s_table(a int);
+SELECT master_create_distributed_table('s_table', 'a', 'hash');
+NOTICE:  using statement-based replication
+DETAIL:  The current replication_model setting is 'streaming', which is not supported by master_create_distributed_table.
+HINT:  Use create_distributed_table to use the streaming replication model.
  master_create_distributed_table 
 ---------------------------------
  
 (1 row)
 
-CREATE TABLE unique_const_on_part_col
-(
-	partition_col integer UNIQUE,
-	other_col integer
-);
-SELECT master_create_distributed_table('unique_const_on_part_col', 'partition_col', 'hash');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='s_table'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+-- Show that master_create_worker_shards complains when RF>1 and replication model is streaming
+UPDATE pg_dist_partition SET repmodel = 's' WHERE logicalrelid='s_table'::regclass;
+SELECT master_create_worker_shards('s_table', 4, 2);
+ERROR:  using replication factor 2 with the streaming replication model is not supported
+DETAIL:  The table s_table is marked as streaming replicated and the shard replication factor of streaming replicated tables must be 1.
+HINT:  Use replication factor 1.
+DROP TABLE s_table;
+RESET citus.replication_model;
+-- Show that create_distributed_table with append and range distributions ignore 
+-- citus.replication_model GUC
+SET citus.shard_replication_factor TO 2;
+SET citus.replication_model TO streaming;
+CREATE TABLE repmodel_test (a int);
+SELECT create_distributed_table('repmodel_test', 'a', 'append');
+NOTICE:  using statement-based replication
+DETAIL:  Streaming replication is supported only for hash-distributed tables.
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+DROP TABLE repmodel_test;
+CREATE TABLE repmodel_test (a int);
+SELECT create_distributed_table('repmodel_test', 'a', 'range');
+NOTICE:  using statement-based replication
+DETAIL:  Streaming replication is supported only for hash-distributed tables.
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+DROP TABLE repmodel_test;
+-- Show that master_create_distributed_table created statement replicated tables no matter
+-- what citus.replication_model set to
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'hash');
+NOTICE:  using statement-based replication
+DETAIL:  The current replication_model setting is 'streaming', which is not supported by master_create_distributed_table.
+HINT:  Use create_distributed_table to use the streaming replication model.
  master_create_distributed_table 
 ---------------------------------
  
 (1 row)
 
-CREATE TABLE unique_const_on_two_columns
-(
-	partition_col integer,
-	other_col integer,
-	UNIQUE (partition_col, other_col)
-);
-SELECT master_create_distributed_table('unique_const_on_two_columns', 'partition_col', 'hash');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+DROP TABLE repmodel_test;
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'append');
+NOTICE:  using statement-based replication
+DETAIL:  The current replication_model setting is 'streaming', which is not supported by master_create_distributed_table.
+HINT:  Use create_distributed_table to use the streaming replication model.
  master_create_distributed_table 
 ---------------------------------
  
 (1 row)
 
-CREATE TABLE unique_const_append_partitioned_tables
-(
-	partition_col integer UNIQUE,
-	other_col integer
-);
-SELECT master_create_distributed_table('unique_const_append_partitioned_tables', 'partition_col', 'append');
-WARNING:  table "unique_const_append_partitioned_tables" has a unique constraint
-DETAIL:  Unique constraints and primary keys on append-partitioned tables cannot be enforced.
-HINT:  Consider using hash partitioning.
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+DROP TABLE repmodel_test;
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'range');
+NOTICE:  using statement-based replication
+DETAIL:  The current replication_model setting is 'streaming', which is not supported by master_create_distributed_table.
+HINT:  Use create_distributed_table to use the streaming replication model.
  master_create_distributed_table 
 ---------------------------------
  
 (1 row)
 
-CREATE TABLE unique_const_range_partitioned_tables
-(
-	partition_col integer UNIQUE,
-	other_col integer
-);
-SELECT master_create_distributed_table('unique_const_range_partitioned_tables', 'partition_col', 'range');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+DROP TABLE repmodel_test;
+-- Check that the replication_model overwrite behavior is the same with RF=1
+SET citus.shard_replication_factor TO 1;
+CREATE TABLE repmodel_test (a int);
+SELECT create_distributed_table('repmodel_test', 'a', 'append');
+NOTICE:  using statement-based replication
+DETAIL:  Streaming replication is supported only for hash-distributed tables.
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+DROP TABLE repmodel_test;
+CREATE TABLE repmodel_test (a int);
+SELECT create_distributed_table('repmodel_test', 'a', 'range');
+NOTICE:  using statement-based replication
+DETAIL:  Streaming replication is supported only for hash-distributed tables.
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+DROP TABLE repmodel_test;
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'hash');
+NOTICE:  using statement-based replication
+DETAIL:  The current replication_model setting is 'streaming', which is not supported by master_create_distributed_table.
+HINT:  Use create_distributed_table to use the streaming replication model.
  master_create_distributed_table 
 ---------------------------------
  
 (1 row)
 
--- drop unnecessary tables
-DROP TABLE primary_key_on_non_part_col, unique_const_on_non_part_col CASCADE;
-DROP TABLE primary_key_on_part_col, unique_const_on_part_col, unique_const_on_two_columns CASCADE;
-DROP TABLE unique_const_range_partitioned_tables CASCADE;
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+DROP TABLE repmodel_test;
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'append');
+NOTICE:  using statement-based replication
+DETAIL:  The current replication_model setting is 'streaming', which is not supported by master_create_distributed_table.
+HINT:  Use create_distributed_table to use the streaming replication model.
+ master_create_distributed_table 
+---------------------------------
+ 
+(1 row)
+
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+DROP TABLE repmodel_test;
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'range');
+NOTICE:  using statement-based replication
+DETAIL:  The current replication_model setting is 'streaming', which is not supported by master_create_distributed_table.
+HINT:  Use create_distributed_table to use the streaming replication model.
+ master_create_distributed_table 
+---------------------------------
+ 
+(1 row)
+
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+ repmodel 
+----------
+ c
+(1 row)
+
+DROP TABLE repmodel_test;
+RESET citus.replication_model;
+SET citus.shard_replication_factor TO default;
+SET citus.shard_count to 4;
+CREATE TABLE lineitem_hash_part (like lineitem);
+SELECT create_distributed_table('lineitem_hash_part', 'l_orderkey');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+CREATE TABLE orders_hash_part (like orders);
+SELECT create_distributed_table('orders_hash_part', 'o_orderkey');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+

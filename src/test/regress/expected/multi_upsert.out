@@ -1,6 +1,4 @@
 -- this test file aims to test UPSERT feature on Citus
--- note that output of this file for postgresql 9.4 will
--- be full syntax errors, which is expected.
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 980000;
 ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 980000;
 CREATE TABLE upsert_test
@@ -103,6 +101,23 @@ SELECT * FROM upsert_test;
  part_key | other_col | third_col 
 ----------+-----------+-----------
         1 |         5 |       872
+(1 row)
+
+-- Test upsert, with returning:
+INSERT INTO upsert_test (part_key, other_col) VALUES (2, 2)
+	ON CONFLICT (part_key) DO UPDATE SET other_col = 3
+        RETURNING *;
+ part_key | other_col | third_col 
+----------+-----------+-----------
+        2 |         2 |          
+(1 row)
+
+INSERT INTO upsert_test (part_key, other_col) VALUES (2, 2)
+	ON CONFLICT (part_key) DO UPDATE SET other_col = 3
+        RETURNING *;
+ part_key | other_col | third_col 
+----------+-----------+-----------
+        2 |         3 |          
 (1 row)
 
 -- create another table
@@ -208,6 +223,8 @@ SELECT master_create_worker_shards('dropcol_distributed', 4, 1);
 INSERT INTO dropcol_distributed AS dropcol (key, keep1, keep2) VALUES (1, '5', 5) ON CONFLICT(key)
 	DO UPDATE SET keep1 = dropcol.keep1;
 ALTER TABLE dropcol_distributed DROP COLUMN drop2;
+NOTICE:  using one-phase commit for distributed DDL commands
+HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 INSERT INTO dropcol_distributed (key, keep1, keep2) VALUES (1, '5', 5) ON CONFLICT(key)
 	DO UPDATE SET keep1 = dropcol_distributed.keep1;
 ALTER TABLE dropcol_distributed DROP COLUMN keep2;
@@ -220,20 +237,19 @@ INSERT INTO dropcol_distributed AS dropcol (key, keep1) VALUES (1, '5') ON CONFL
 -- subquery in the SET clause
 INSERT INTO upsert_test (part_key, other_col) VALUES (1, 1) ON CONFLICT (part_key) DO
 	UPDATE SET other_col = (SELECT count(*) from upsert_test);
-ERROR:  cannot perform distributed planning for the given modification
-DETAIL:  Subqueries are not supported in distributed modifications.
+ERROR:  subqueries are not supported in distributed modifications
 -- non mutable function call in the SET
 INSERT INTO upsert_test (part_key, other_col) VALUES (1, 1) ON CONFLICT (part_key) DO
 	UPDATE SET other_col = random()::int;
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
+ERROR:  functions used in the DO UPDATE SET clause of INSERTs on distributed tables must be marked IMMUTABLE
 -- non mutable function call in the WHERE
 INSERT INTO upsert_test (part_key, other_col) VALUES (1, 1) ON CONFLICT (part_key) DO
 	UPDATE SET other_col = 5 WHERE upsert_test.other_col = random()::int;
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
+ERROR:  functions used in the WHERE clause of the ON CONFLICT clause of INSERTs on distributed tables must be marked IMMUTABLE
 -- non mutable function call in the arbiter WHERE
 INSERT INTO upsert_test (part_key, other_col) VALUES (1, 1) ON CONFLICT (part_key)  WHERE part_key = random()::int
 	DO UPDATE SET other_col = 5;
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
+ERROR:  functions used in the WHERE clause of the ON CONFLICT clause of INSERTs on distributed tables must be marked IMMUTABLE
 -- error out on attempt to update the partition key
 INSERT INTO upsert_test (part_key, other_col) VALUES (1, 1) ON CONFLICT (part_key) DO
 	UPDATE SET part_key = 15;

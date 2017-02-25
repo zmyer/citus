@@ -112,7 +112,8 @@ extern void MultiLogicalPlanOptimize(MultiTreeRoot *multiTree);
 extern char PartitionMethod(Oid relationId);
 
 /* Function declaration for getting oid for the given function name */
-extern Oid FunctionOid(const char *functionName, int argumentCount);
+extern Oid FunctionOid(const char *schemaName, const char *functionName,
+					   int argumentCount);
 
 /* Function declaration for helper functions in subquery pushdown */
 extern List * SubqueryMultiTableList(MultiNode *multiNode);
@@ -121,6 +122,9 @@ extern bool ExtractQueryWalker(Node *node, List **queryList);
 extern bool LeafQuery(Query *queryTree);
 extern List * PartitionColumnOpExpressionList(Query *query);
 extern List * ReplaceColumnsInOpExpressionList(List *opExpressionList, Var *newColumn);
+extern bool IsPartitionColumn(Expr *columnExpression, Query *query);
+extern void FindReferencedTableColumn(Expr *columnExpression, List *parentQueryList,
+									  Query *query, Oid *relationId, Var **column);
 
 
 #endif   /* MULTI_LOGICAL_OPTIMIZER_H */

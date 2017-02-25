@@ -12,10 +12,20 @@ CREATE TABLE limit_orders (
 	kind order_side NOT NULL,
 	limit_price decimal NOT NULL DEFAULT 0.00 CHECK (limit_price >= 0.00)
 );
+CREATE TABLE multiple_hash (
+	category text NOT NULL,
+	data text NOT NULL
+);
 CREATE TABLE insufficient_shards ( LIKE limit_orders );
 CREATE TABLE range_partitioned ( LIKE limit_orders );
 CREATE TABLE append_partitioned ( LIKE limit_orders );
 SELECT master_create_distributed_table('limit_orders', 'id', 'hash');
+ master_create_distributed_table 
+---------------------------------
+ 
+(1 row)
+
+SELECT master_create_distributed_table('multiple_hash', 'category', 'hash');
  master_create_distributed_table 
 ---------------------------------
  
@@ -40,6 +50,12 @@ SELECT master_create_distributed_table('append_partitioned', 'id', 'append');
 (1 row)
 
 SELECT master_create_worker_shards('limit_orders', 2, 2);
+ master_create_worker_shards 
+-----------------------------
+ 
+(1 row)
+
+SELECT master_create_worker_shards('multiple_hash', 2, 2);
  master_create_worker_shards 
 -----------------------------
  
@@ -81,10 +97,18 @@ SELECT COUNT(*) FROM limit_orders WHERE id = 32743;
      1
 (1 row)
 
+-- basic single-row INSERT with RETURNING
+INSERT INTO limit_orders VALUES (32744, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy', 20.69) RETURNING *;
+  id   | symbol | bidder_id |        placed_at         | kind | limit_price 
+-------+--------+-----------+--------------------------+------+-------------
+ 32744 | AAPL   |      9580 | Tue Oct 19 10:23:54 2004 | buy  |       20.69
+(1 row)
+
 -- try a single-row INSERT with no shard to receive it
 INSERT INTO insufficient_shards VALUES (32743, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy',
 										20.69);
-ERROR:  distributed modifications must target exactly one shard
+ERROR:  cannot find shard interval
+DETAIL:  Hash of the partition column value does not fall into any shards.
 -- try an insert to a range-partitioned table
 INSERT INTO range_partitioned VALUES (32743, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy',
 									  20.69);
@@ -95,7 +119,7 @@ INSERT INTO append_partitioned VALUES (414123, 'AAPL', 9580, '2004-10-19 10:23:5
 SET client_min_messages TO 'DEBUG2';
 SET citus.task_executor_type TO 'real-time';
 SELECT * FROM range_partitioned WHERE id = 32743;
-DEBUG:  predicate pruning for shardId 750004
+DEBUG:  predicate pruning for shardId 750006
 DEBUG:  Plan is router executable
   id   | symbol | bidder_id |        placed_at         | kind | limit_price 
 -------+--------+-----------+--------------------------+------+-------------
@@ -103,7 +127,7 @@ DEBUG:  Plan is router executable
 (1 row)
 
 SELECT * FROM append_partitioned WHERE id = 414123;
-DEBUG:  predicate pruning for shardId 750006
+DEBUG:  predicate pruning for shardId 750008
 DEBUG:  Plan is router executable
    id   | symbol | bidder_id |        placed_at         | kind | limit_price 
 --------+--------+-----------+--------------------------+------+-------------
@@ -116,10 +140,14 @@ SET citus.task_executor_type TO DEFAULT;
 INSERT INTO range_partitioned VALUES (999999, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy',
 									  20.69);
 ERROR:  distributed modifications must target exactly one shard
+DETAIL:  This command modifies no shards.
+HINT:  Make sure the value for partition column "id" falls into a single shard.
 -- and insert into an append-partitioned table with a value that spans shards:
 INSERT INTO append_partitioned VALUES (500000, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy',
 									   20.69);
 ERROR:  distributed modifications must target exactly one shard
+DETAIL:  This command modifies all shards.
+HINT:  Make sure the value for partition column "id" falls into a single shard.
 -- INSERT with DEFAULT in the target list
 INSERT INTO limit_orders VALUES (12756, 'MSFT', 10959, '2013-05-08 07:29:23', 'sell',
 								 DEFAULT);
@@ -157,38 +185,38 @@ INSERT INTO limit_orders VALUES (32743, 'LUV', 5994, '2001-04-16 03:37:28', 'buy
 ERROR:  duplicate key value violates unique constraint "limit_orders_pkey_750001"
 DETAIL:  Key (id)=(32743) already exists.
 CONTEXT:  while executing command on localhost:57638
+-- INSERT violating primary key constraint, with RETURNING specified.
+INSERT INTO limit_orders VALUES (32743, 'LUV', 5994, '2001-04-16 03:37:28', 'buy', 0.58) RETURNING *;
+ERROR:  duplicate key value violates unique constraint "limit_orders_pkey_750001"
+DETAIL:  Key (id)=(32743) already exists.
+CONTEXT:  while executing command on localhost:57638
+-- INSERT, with RETURNING specified, failing with a non-constraint error
+INSERT INTO limit_orders VALUES (34153, 'LEE', 5994, '2001-04-16 03:37:28', 'buy', 0.58) RETURNING id / 0;
+ERROR:  could not modify any active placements
 SET client_min_messages TO DEFAULT;
 -- commands with non-constant partition values are unsupported
 INSERT INTO limit_orders VALUES (random() * 100, 'ORCL', 152, '2011-08-25 11:50:45',
 								 'sell', 0.58);
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
--- commands with expressions that cannot be collapsed are unsupported
+ERROR:  values given for the partition column must be constants or constant expressions
+-- values for other columns are totally fine
 INSERT INTO limit_orders VALUES (2036, 'GOOG', 5634, now(), 'buy', random());
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
 -- commands with mutable functions in their quals
 DELETE FROM limit_orders WHERE id = 246 AND bidder_id = (random() * 1000);
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
--- commands with mutable but non-volatilte functions(ie: stable func.) in their quals
-DELETE FROM limit_orders WHERE id = 246 AND placed_at = current_timestamp;
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
+ERROR:  functions used in the WHERE clause of modification queries on distributed tables must not be VOLATILE
+-- commands with mutable but non-volatile functions(ie: stable func.) in their quals
+-- (the cast to timestamp is because the timestamp_eq_timestamptz operator is stable)
+DELETE FROM limit_orders WHERE id = 246 AND placed_at = current_timestamp::timestamp;
 -- commands with multiple rows are unsupported
 INSERT INTO limit_orders VALUES (DEFAULT), (DEFAULT);
 ERROR:  cannot perform distributed planning for the given modification
 DETAIL:  Multi-row INSERTs to distributed tables are not supported.
+-- Who says that? :)
 -- INSERT ... SELECT ... FROM commands are unsupported
-INSERT INTO limit_orders SELECT * FROM limit_orders;
-ERROR:  cannot perform distributed planning for the given modifications
-DETAIL:  Subqueries are not supported in distributed modifications.
--- commands with a RETURNING clause are unsupported
-INSERT INTO limit_orders VALUES (7285, 'AMZN', 3278, '2016-01-05 02:07:36', 'sell', 0.00)
-						 RETURNING *;
-ERROR:  cannot perform distributed planning for the given modification
-DETAIL:  RETURNING clauses are not supported in distributed modifications.
+-- INSERT INTO limit_orders SELECT * FROM limit_orders;
 -- commands containing a CTE are unsupported
 WITH deleted_orders AS (DELETE FROM limit_orders RETURNING *)
 INSERT INTO limit_orders DEFAULT VALUES;
-ERROR:  cannot perform distributed planning for the given modification
-DETAIL:  Common table expressions are not supported in distributed modifications.
+ERROR:  common table expressions are not supported in distributed modifications
 -- test simple DELETE
 INSERT INTO limit_orders VALUES (246, 'TSLA', 162, '2007-07-02 16:32:15', 'sell', 20.69);
 SELECT COUNT(*) FROM limit_orders WHERE id = 246;
@@ -199,6 +227,19 @@ SELECT COUNT(*) FROM limit_orders WHERE id = 246;
 
 DELETE FROM limit_orders WHERE id = 246;
 SELECT COUNT(*) FROM limit_orders WHERE id = 246;
+ count 
+-------
+     0
+(1 row)
+
+-- test simple DELETE with RETURNING
+DELETE FROM limit_orders WHERE id = 430 RETURNING *;
+ id  | symbol | bidder_id |        placed_at         | kind |   limit_price   
+-----+--------+-----------+--------------------------+------+-----------------
+ 430 | IBM    |       214 | Tue Jan 28 15:31:17 2003 | buy  | 1.4142135623731
+(1 row)
+
+SELECT COUNT(*) FROM limit_orders WHERE id = 430;
  count 
 -------
      0
@@ -222,24 +263,23 @@ SELECT COUNT(*) FROM limit_orders WHERE id = 246;
 -- commands with no constraints on the partition key are not supported
 DELETE FROM limit_orders WHERE bidder_id = 162;
 ERROR:  distributed modifications must target exactly one shard
+DETAIL:  This command modifies all shards.
+HINT:  Consider using an equality filter on partition column "id". You can use master_modify_multiple_shards() to perform multi-shard delete or update operations.
 -- commands with a USING clause are unsupported
 CREATE TABLE bidders ( name text, id bigint );
 DELETE FROM limit_orders USING bidders WHERE limit_orders.id = 246 AND
 											 limit_orders.bidder_id = bidders.id AND
 											 bidders.name = 'Bernie Madoff';
 ERROR:  cannot plan queries that include both regular and partitioned relations
--- commands with a RETURNING clause are unsupported
-DELETE FROM limit_orders WHERE id = 246 RETURNING *;
-ERROR:  cannot perform distributed planning for the given modification
-DETAIL:  RETURNING clauses are not supported in distributed modifications.
 -- commands containing a CTE are unsupported
 WITH deleted_orders AS (INSERT INTO limit_orders DEFAULT VALUES RETURNING *)
 DELETE FROM limit_orders;
-ERROR:  cannot perform distributed planning for the given modification
-DETAIL:  Common table expressions are not supported in distributed modifications.
+ERROR:  common table expressions are not supported in distributed modifications
 -- cursors are not supported
 DELETE FROM limit_orders WHERE CURRENT OF cursor_name;
 ERROR:  distributed modifications must target exactly one shard
+DETAIL:  This command modifies all shards.
+HINT:  Consider using an equality filter on partition column "id". You can use master_modify_multiple_shards() to perform multi-shard delete or update operations.
 INSERT INTO limit_orders VALUES (246, 'TSLA', 162, '2007-07-02 16:32:15', 'sell', 20.69);
 -- simple UPDATE
 UPDATE limit_orders SET symbol = 'GM' WHERE id = 246;
@@ -247,6 +287,13 @@ SELECT symbol FROM limit_orders WHERE id = 246;
  symbol 
 --------
  GM
+(1 row)
+
+-- simple UPDATE with RETURNING
+UPDATE limit_orders SET symbol = 'GM' WHERE id = 246 RETURNING *;
+ id  | symbol | bidder_id |        placed_at         | kind | limit_price 
+-----+--------+-----------+--------------------------+------+-------------
+ 246 | GM     |       162 | Mon Jul 02 16:32:15 2007 | sell |       20.69
 (1 row)
 
 -- expression UPDATE
@@ -257,12 +304,26 @@ SELECT bidder_id FROM limit_orders WHERE id = 246;
         18
 (1 row)
 
+-- expression UPDATE with RETURNING
+UPDATE limit_orders SET bidder_id = 6 * 5 WHERE id = 246 RETURNING *;
+ id  | symbol | bidder_id |        placed_at         | kind | limit_price 
+-----+--------+-----------+--------------------------+------+-------------
+ 246 | GM     |        30 | Mon Jul 02 16:32:15 2007 | sell |       20.69
+(1 row)
+
 -- multi-column UPDATE
 UPDATE limit_orders SET (kind, limit_price) = ('buy', DEFAULT) WHERE id = 246;
 SELECT kind, limit_price FROM limit_orders WHERE id = 246;
  kind | limit_price 
 ------+-------------
  buy  |        0.00
+(1 row)
+
+-- multi-column UPDATE with RETURNING
+UPDATE limit_orders SET (kind, limit_price) = ('buy', 999) WHERE id = 246 RETURNING *;
+ id  | symbol | bidder_id |        placed_at         | kind | limit_price 
+-----+--------+-----------+--------------------------+------+-------------
+ 246 | GM     |        30 | Mon Jul 02 16:32:15 2007 | buy  |         999
 (1 row)
 
 -- Test that on unique contraint violations, we fail fast
@@ -280,7 +341,7 @@ ALTER TABLE limit_orders_750000 RENAME TO renamed_orders;
 \c - - - :master_port
 -- Fourth: Perform an INSERT on the remaining node
 INSERT INTO limit_orders VALUES (276, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
-WARNING:  relation "limit_orders_750000" does not exist
+WARNING:  relation "public.limit_orders_750000" does not exist
 CONTEXT:  while executing command on localhost:57638
 -- Last: Verify the insert worked but the deleted placement is now unhealthy
 SELECT count(*) FROM limit_orders WHERE id = 276;
@@ -311,7 +372,7 @@ ALTER TABLE limit_orders_750000 RENAME TO renamed_orders;
 \c - - - :master_port
 -- Fourth: Perform an INSERT on the remaining node
 INSERT INTO limit_orders VALUES (276, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
-WARNING:  relation "limit_orders_750000" does not exist
+WARNING:  relation "public.limit_orders_750000" does not exist
 CONTEXT:  while executing command on localhost:57637
 ERROR:  could not modify any active placements
 -- Last: Verify worker is still healthy
@@ -338,28 +399,31 @@ ALTER TABLE renamed_orders RENAME TO limit_orders_750000;
 -- commands with no constraints on the partition key are not supported
 UPDATE limit_orders SET limit_price = 0.00;
 ERROR:  distributed modifications must target exactly one shard
+DETAIL:  This command modifies all shards.
+HINT:  Consider using an equality filter on partition column "id". You can use master_modify_multiple_shards() to perform multi-shard delete or update operations.
 -- attempting to change the partition key is unsupported
 UPDATE limit_orders SET id = 0 WHERE id = 246;
 ERROR:  modifying the partition value of rows is not allowed
+UPDATE limit_orders SET id = 0 WHERE id = 0 OR id = 246;
+ERROR:  modifying the partition value of rows is not allowed
+-- setting the partition column value to itself is allowed
+UPDATE limit_orders SET id = 246 WHERE id = 246;
+UPDATE limit_orders SET id = 246 WHERE id = 246 AND symbol = 'GM';
+UPDATE limit_orders SET id = limit_orders.id WHERE id = 246;
 -- UPDATEs with a FROM clause are unsupported
 UPDATE limit_orders SET limit_price = 0.00 FROM bidders
 					WHERE limit_orders.id = 246 AND
 						  limit_orders.bidder_id = bidders.id AND
 						  bidders.name = 'Bernie Madoff';
 ERROR:  cannot plan queries that include both regular and partitioned relations
--- commands with a RETURNING clause are unsupported
-UPDATE limit_orders SET symbol = 'GM' WHERE id = 246 RETURNING *;
-ERROR:  cannot perform distributed planning for the given modification
-DETAIL:  RETURNING clauses are not supported in distributed modifications.
 -- commands containing a CTE are unsupported
 WITH deleted_orders AS (INSERT INTO limit_orders DEFAULT VALUES RETURNING *)
 UPDATE limit_orders SET symbol = 'GM';
-ERROR:  cannot perform distributed planning for the given modification
-DETAIL:  Common table expressions are not supported in distributed modifications.
+ERROR:  common table expressions are not supported in distributed modifications
 SELECT symbol, bidder_id FROM limit_orders WHERE id = 246;
  symbol | bidder_id 
 --------+-----------
- GM     |        18
+ GM     |        30
 (1 row)
 
 -- updates referencing just a var are supported
@@ -374,9 +438,203 @@ SELECT symbol, bidder_id FROM limit_orders WHERE id = 246;
  gm     |       247
 (1 row)
 
--- updates referencing non-IMMUTABLE functions are unsupported
-UPDATE limit_orders SET placed_at = now() WHERE id = 246;
-ERROR:  functions used in modification queries on distributed tables must be marked IMMUTABLE
+-- IMMUTABLE functions are allowed -- even in returning
+UPDATE limit_orders SET symbol = UPPER(symbol) WHERE id = 246 RETURNING id, LOWER(symbol), symbol;
+ id  | lower | symbol 
+-----+-------+--------
+ 246 | gm    | GM
+(1 row)
+
+ALTER TABLE limit_orders ADD COLUMN array_of_values integer[];
+NOTICE:  using one-phase commit for distributed DDL commands
+HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
+-- updates referencing STABLE functions are allowed
+UPDATE limit_orders SET placed_at = LEAST(placed_at, now()::timestamp) WHERE id = 246;
+-- so are binary operators
+UPDATE limit_orders SET array_of_values = 1 || array_of_values WHERE id = 246;
+CREATE FUNCTION immutable_append(old_values int[], new_value int)
+RETURNS int[] AS $$ SELECT old_values || new_value $$ LANGUAGE SQL IMMUTABLE;
+\c - - - :worker_1_port
+CREATE FUNCTION immutable_append(old_values int[], new_value int)
+RETURNS int[] AS $$ SELECT old_values || new_value $$ LANGUAGE SQL IMMUTABLE;
+\c - - - :worker_2_port
+CREATE FUNCTION immutable_append(old_values int[], new_value int)
+RETURNS int[] AS $$ SELECT old_values || new_value $$ LANGUAGE SQL IMMUTABLE;
+\c - - - :master_port
+-- immutable function calls with vars are also allowed
+UPDATE limit_orders
+SET array_of_values = immutable_append(array_of_values, 2) WHERE id = 246;
+CREATE FUNCTION stable_append(old_values int[], new_value int)
+RETURNS int[] AS $$ BEGIN RETURN old_values || new_value; END; $$
+LANGUAGE plpgsql STABLE;
+-- but STABLE function calls with vars are not allowed
+UPDATE limit_orders
+SET array_of_values = stable_append(array_of_values, 3) WHERE id = 246;
+ERROR:  STABLE functions used in UPDATE queries cannot be called with column references
+SELECT array_of_values FROM limit_orders WHERE id = 246;
+ array_of_values 
+-----------------
+ {1,2}
+(1 row)
+
+-- STRICT functions work as expected
+CREATE FUNCTION temp_strict_func(integer,integer) RETURNS integer AS
+'SELECT COALESCE($1, 2) + COALESCE($1, 3);' LANGUAGE SQL STABLE STRICT;
+UPDATE limit_orders SET bidder_id = temp_strict_func(1, null) WHERE id = 246;
+ERROR:  null value in column "bidder_id" violates not-null constraint
+DETAIL:  Failing row contains (246, GM, null, 2007-07-02 16:32:15, buy, 999, {1,2}).
+CONTEXT:  while executing command on localhost:57637
+SELECT array_of_values FROM limit_orders WHERE id = 246;
+ array_of_values 
+-----------------
+ {1,2}
+(1 row)
+
+ALTER TABLE limit_orders DROP array_of_values;
+NOTICE:  using one-phase commit for distributed DDL commands
+HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
+-- even in RETURNING
+UPDATE limit_orders SET placed_at = placed_at WHERE id = 246 RETURNING NOW();
+ERROR:  non-IMMUTABLE functions are not allowed in the RETURNING clause
 -- cursors are not supported
 UPDATE limit_orders SET symbol = 'GM' WHERE CURRENT OF cursor_name;
 ERROR:  distributed modifications must target exactly one shard
+DETAIL:  This command modifies all shards.
+HINT:  Consider using an equality filter on partition column "id". You can use master_modify_multiple_shards() to perform multi-shard delete or update operations.
+-- check that multi-row UPDATE/DELETEs with RETURNING work
+INSERT INTO multiple_hash VALUES ('0', '1');
+INSERT INTO multiple_hash VALUES ('0', '2');
+INSERT INTO multiple_hash VALUES ('0', '3');
+INSERT INTO multiple_hash VALUES ('0', '4');
+INSERT INTO multiple_hash VALUES ('0', '5');
+INSERT INTO multiple_hash VALUES ('0', '6');
+UPDATE multiple_hash SET data = data ||'-1' WHERE category = '0' RETURNING *;
+ category | data 
+----------+------
+ 0        | 1-1
+ 0        | 2-1
+ 0        | 3-1
+ 0        | 4-1
+ 0        | 5-1
+ 0        | 6-1
+(6 rows)
+
+DELETE FROM multiple_hash WHERE category = '0' RETURNING *;
+ category | data 
+----------+------
+ 0        | 1-1
+ 0        | 2-1
+ 0        | 3-1
+ 0        | 4-1
+ 0        | 5-1
+ 0        | 6-1
+(6 rows)
+
+-- ensure returned row counters are correct
+\set QUIET off
+INSERT INTO multiple_hash VALUES ('1', '1');
+INSERT 0 1
+INSERT INTO multiple_hash VALUES ('1', '2');
+INSERT 0 1
+INSERT INTO multiple_hash VALUES ('1', '3');
+INSERT 0 1
+INSERT INTO multiple_hash VALUES ('2', '1');
+INSERT 0 1
+INSERT INTO multiple_hash VALUES ('2', '2');
+INSERT 0 1
+INSERT INTO multiple_hash VALUES ('2', '3');
+INSERT 0 1
+INSERT INTO multiple_hash VALUES ('2', '3') RETURNING *;
+ category | data 
+----------+------
+ 2        | 3
+(1 row)
+
+INSERT 0 1
+-- check that update return the right number of rows
+-- one row
+UPDATE multiple_hash SET data = data ||'-1' WHERE category = '1' AND data = '1';
+UPDATE 1
+-- three rows
+UPDATE multiple_hash SET data = data ||'-2' WHERE category = '1';
+UPDATE 3
+-- three rows, with RETURNING
+UPDATE multiple_hash SET data = data ||'-2' WHERE category = '1' RETURNING category;
+ category 
+----------
+ 1
+ 1
+ 1
+(3 rows)
+
+UPDATE 3
+-- check
+SELECT * FROM multiple_hash WHERE category = '1' ORDER BY category, data;
+ category |  data   
+----------+---------
+ 1        | 1-1-2-2
+ 1        | 2-2-2
+ 1        | 3-2-2
+(3 rows)
+
+-- check that deletes return the right number of rows
+-- one row
+DELETE FROM multiple_hash WHERE category = '2' AND data = '1';
+DELETE 1
+-- two rows
+DELETE FROM multiple_hash WHERE category = '2';
+DELETE 3
+-- three rows, with RETURNING
+DELETE FROM multiple_hash WHERE category = '1' RETURNING category;
+ category 
+----------
+ 1
+ 1
+ 1
+(3 rows)
+
+DELETE 3
+-- check
+SELECT * FROM multiple_hash WHERE category = '1' ORDER BY category, data;
+ category | data 
+----------+------
+(0 rows)
+
+SELECT * FROM multiple_hash WHERE category = '2' ORDER BY category, data;
+ category | data 
+----------+------
+(0 rows)
+
+-- verify interaction of default values, SERIAL, and RETURNING
+\set QUIET on
+CREATE TABLE app_analytics_events (id serial, app_id integer, name text);
+SELECT master_create_distributed_table('app_analytics_events', 'app_id', 'hash');
+ master_create_distributed_table 
+---------------------------------
+ 
+(1 row)
+
+SELECT master_create_worker_shards('app_analytics_events', 4, 1);
+ master_create_worker_shards 
+-----------------------------
+ 
+(1 row)
+
+INSERT INTO app_analytics_events VALUES (DEFAULT, 101, 'Fauxkemon Geaux') RETURNING id;
+ id 
+----
+  1
+(1 row)
+
+INSERT INTO app_analytics_events (app_id, name) VALUES (102, 'Wayz') RETURNING id;
+ id 
+----
+  2
+(1 row)
+
+INSERT INTO app_analytics_events (app_id, name) VALUES (103, 'Mynt') RETURNING *;
+ id | app_id | name 
+----+--------+------
+  3 |    103 | Mynt
+(1 row)
+

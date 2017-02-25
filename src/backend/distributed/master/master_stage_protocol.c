@@ -17,17 +17,26 @@
 #include "postgres.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "libpq-fe.h"
 
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "commands/tablecmds.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
+#include "distributed/colocation_utils.h"
+#include "distributed/connection_management.h"
+#include "distributed/multi_client_executor.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
+#include "distributed/placement_connection.h"
+#include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/transaction_management.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
 #include "utils/builtins.h"
@@ -40,16 +49,9 @@
 
 
 /* Local functions forward declarations */
-static bool WorkerCreateShard(char *nodeName, uint32 nodePort, uint64 shardId,
-							  char *newShardOwner, List *ddlCommandList);
-static bool WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId,
+static bool WorkerShardStats(ShardPlacement *placement, Oid relationId,
 							 char *shardName, uint64 *shardSize,
 							 text **shardMinValue, text **shardMaxValue);
-static uint64 WorkerTableSize(char *nodeName, uint32 nodePort, Oid relationId,
-							  char *tableName);
-static StringInfo WorkerPartitionValue(char *nodeName, uint32 nodePort, Oid relationId,
-									   char *shardName, char *selectQuery);
-
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_create_empty_shard);
@@ -70,8 +72,7 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 	text *relationNameText = PG_GETARG_TEXT_P(0);
 	char *relationName = text_to_cstring(relationNameText);
 	List *workerNodeList = WorkerNodeList();
-	Datum shardIdDatum = 0;
-	int64 shardId = INVALID_SHARD_ID;
+	uint64 shardId = INVALID_SHARD_ID;
 	List *ddlEventList = NULL;
 	uint32 attemptableNodeCount = 0;
 	uint32 liveNodeCount = 0;
@@ -86,6 +87,7 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 	Oid relationId = ResolveRelationId(relationNameText);
 	char relationKind = get_rel_relkind(relationId);
 	char *relationOwner = TableOwner(relationId);
+	char replicationModel = REPLICATION_MODEL_INVALID;
 
 	EnsureTablePermissions(relationId, ACL_INSERT);
 	CheckDistributedTable(relationId);
@@ -118,10 +120,20 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 						errdetail("We currently don't support creating shards "
 								  "on hash-partitioned tables")));
 	}
+	else if (partitionMethod == DISTRIBUTE_BY_NONE)
+	{
+		ereport(ERROR, (errmsg("relation \"%s\" is a reference table",
+							   relationName),
+						errdetail("We currently don't support creating shards "
+								  "on reference tables")));
+	}
+
+	replicationModel = TableReplicationModel(relationId);
+
+	EnsureReplicationSettings(relationId, replicationModel);
 
 	/* generate new and unique shardId from sequence */
-	shardIdDatum = master_get_new_shardid(NULL);
-	shardId = DatumGetInt64(shardIdDatum);
+	shardId = GetNextShardId();
 
 	/* get table DDL commands to replay on the worker node */
 	ddlEventList = GetTableDDLEvents(relationId);
@@ -167,7 +179,7 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 		candidateNodeIndex++;
 	}
 
-	CreateShardPlacements(shardId, ddlEventList, relationOwner,
+	CreateShardPlacements(relationId, shardId, ddlEventList, relationOwner,
 						  candidateNodeList, 0, ShardReplicationFactor);
 
 	InsertShardRow(relationId, shardId, storageType, nullMinValue, nullMaxValue);
@@ -200,10 +212,7 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 	char *shardTableName = NULL;
 	char *shardQualifiedName = NULL;
 	List *shardPlacementList = NIL;
-	List *succeededPlacementList = NIL;
-	List *failedPlacementList = NIL;
 	ListCell *shardPlacementCell = NULL;
-	ListCell *failedPlacementCell = NULL;
 	uint64 newShardSize = 0;
 	uint64 shardMaxSizeInBytes = 0;
 	float4 shardFillLevel = 0.0;
@@ -224,31 +233,26 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 	}
 
 	partitionMethod = PartitionMethod(relationId);
-	if (partitionMethod == DISTRIBUTE_BY_HASH)
+	if (partitionMethod == DISTRIBUTE_BY_HASH || partitionMethod == DISTRIBUTE_BY_NONE)
 	{
 		ereport(ERROR, (errmsg("cannot append to shardId " UINT64_FORMAT, shardId),
 						errdetail("We currently don't support appending to shards "
-								  "in hash-partitioned tables")));
+								  "in hash-partitioned or reference tables")));
 	}
 
-	/*
-	 * We lock on the shardId, but do not unlock. When the function returns, and
-	 * the transaction for this function commits, this lock will automatically
-	 * be released. This ensures appends to a shard happen in a serial manner.
-	 */
-	LockShardResource(shardId, AccessExclusiveLock);
+	/* ensure that the shard placement metadata does not change during the append */
+	LockShardDistributionMetadata(shardId, ShareLock);
+
+	/* serialize appends to the same shard */
+	LockShardResource(shardId, ExclusiveLock);
 
 	/* get schame name of the target shard */
 	shardSchemaOid = get_rel_namespace(relationId);
 	shardSchemaName = get_namespace_name(shardSchemaOid);
 
-	/* if shard doesn't have an alias, extend regular table name */
-	shardTableName = LoadShardAlias(relationId, shardId);
-	if (shardTableName == NULL)
-	{
-		shardTableName = get_rel_name(relationId);
-		AppendShardIdToName(&shardTableName, shardId);
-	}
+	/* Build shard table name. */
+	shardTableName = get_rel_name(relationId);
+	AppendShardIdToName(&shardTableName, shardId);
 
 	shardQualifiedName = quote_qualified_identifier(shardSchemaName, shardTableName);
 
@@ -260,13 +264,16 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 						errhint("Try running master_create_empty_shard() first")));
 	}
 
+	BeginOrContinueCoordinatedTransaction();
+
 	/* issue command to append table to each shard placement */
 	foreach(shardPlacementCell, shardPlacementList)
 	{
 		ShardPlacement *shardPlacement = (ShardPlacement *) lfirst(shardPlacementCell);
-		char *workerName = shardPlacement->nodeName;
-		uint32 workerPort = shardPlacement->nodePort;
-		List *queryResultList = NIL;
+		MultiConnection *connection = GetPlacementConnection(FOR_DML, shardPlacement,
+															 NULL);
+		PGresult *queryResult = NULL;
+		int executeResult = 0;
 
 		StringInfo workerAppendQuery = makeStringInfo();
 		appendStringInfo(workerAppendQuery, WORKER_APPEND_TABLE_TO_SHARD,
@@ -274,47 +281,20 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 						 quote_literal_cstr(sourceTableName),
 						 quote_literal_cstr(sourceNodeName), sourceNodePort);
 
-		/* inserting data should be performed by the current user */
-		queryResultList = ExecuteRemoteQuery(workerName, workerPort, NULL,
-											 workerAppendQuery);
-		if (queryResultList != NIL)
+		RemoteTransactionBeginIfNecessary(connection);
+
+		executeResult = ExecuteOptionalRemoteCommand(connection, workerAppendQuery->data,
+													 &queryResult);
+		PQclear(queryResult);
+		ForgetResults(connection);
+
+		if (executeResult != 0)
 		{
-			succeededPlacementList = lappend(succeededPlacementList, shardPlacement);
-		}
-		else
-		{
-			failedPlacementList = lappend(failedPlacementList, shardPlacement);
+			MarkRemoteTransactionFailed(connection, false);
 		}
 	}
 
-	/* before updating metadata, check that we appended to at least one shard */
-	if (succeededPlacementList == NIL)
-	{
-		ereport(ERROR, (errmsg("could not append table to any shard placement")));
-	}
-
-	/* make sure we don't process cancel signals */
-	HOLD_INTERRUPTS();
-
-	/* mark shard placements that we couldn't append to as inactive */
-	foreach(failedPlacementCell, failedPlacementList)
-	{
-		ShardPlacement *placement = (ShardPlacement *) lfirst(failedPlacementCell);
-		char *workerName = placement->nodeName;
-		uint32 workerPort = placement->nodePort;
-		uint64 oldShardLength = placement->shardLength;
-
-		DeleteShardPlacementRow(shardId, workerName, workerPort);
-		InsertShardPlacementRow(shardId, FILE_INACTIVE, oldShardLength,
-								workerName, workerPort);
-
-		ereport(WARNING, (errmsg("could not append table to shard \"%s\" on node "
-								 "\"%s:%u\"", shardQualifiedName, workerName,
-								 workerPort),
-						  errdetail("Marking this shard placement as inactive")));
-	}
-
-	RESUME_INTERRUPTS();
+	MarkFailedShardPlacements();
 
 	/* update shard statistics and get new shard size */
 	newShardSize = UpdateShardStatistics(shardId);
@@ -377,8 +357,9 @@ CheckDistributedTable(Oid relationId)
  * nodes if some DDL commands had been successful).
  */
 void
-CreateShardPlacements(int64 shardId, List *ddlEventList, char *newPlacementOwner,
-					  List *workerNodeList, int workerStartIndex, int replicationFactor)
+CreateShardPlacements(Oid relationId, int64 shardId, List *ddlEventList,
+					  char *newPlacementOwner, List *workerNodeList,
+					  int workerStartIndex, int replicationFactor)
 {
 	int attemptCount = replicationFactor;
 	int workerNodeCount = list_length(workerNodeList);
@@ -397,15 +378,21 @@ CreateShardPlacements(int64 shardId, List *ddlEventList, char *newPlacementOwner
 		WorkerNode *workerNode = (WorkerNode *) list_nth(workerNodeList, workerNodeIndex);
 		char *nodeName = workerNode->workerName;
 		uint32 nodePort = workerNode->workerPort;
+		List *foreignConstraintCommandList = GetTableForeignConstraintCommands(
+			relationId);
+		int shardIndex = -1; /* not used in this code path */
+		bool created = false;
 
-		bool created = WorkerCreateShard(nodeName, nodePort, shardId, newPlacementOwner,
-										 ddlEventList);
+		created = WorkerCreateShard(relationId, nodeName, nodePort, shardIndex,
+									shardId, newPlacementOwner, ddlEventList,
+									foreignConstraintCommandList);
 		if (created)
 		{
 			const RelayFileState shardState = FILE_FINALIZED;
 			const uint64 shardSize = 0;
 
-			InsertShardPlacementRow(shardId, shardState, shardSize, nodeName, nodePort);
+			InsertShardPlacementRow(shardId, INVALID_PLACEMENT_ID, shardState, shardSize,
+									nodeName, nodePort);
 			placementsCreated++;
 		}
 		else
@@ -434,25 +421,95 @@ CreateShardPlacements(int64 shardId, List *ddlEventList, char *newPlacementOwner
  * shard on the worker node. Note that this function opens a new connection for
  * each DDL command, and could leave the shard in an half-initialized state.
  */
-static bool
-WorkerCreateShard(char *nodeName, uint32 nodePort, uint64 shardId,
-				  char *newShardOwner, List *ddlCommandList)
+bool
+WorkerCreateShard(Oid relationId, char *nodeName, uint32 nodePort,
+				  int shardIndex, uint64 shardId, char *newShardOwner,
+				  List *ddlCommandList, List *foreignConstraintCommandList)
 {
+	Oid schemaId = get_rel_namespace(relationId);
+	char *schemaName = get_namespace_name(schemaId);
+	char *escapedSchemaName = quote_literal_cstr(schemaName);
 	bool shardCreated = true;
 	ListCell *ddlCommandCell = NULL;
+	ListCell *foreignConstraintCommandCell = NULL;
 
 	foreach(ddlCommandCell, ddlCommandList)
 	{
 		char *ddlCommand = (char *) lfirst(ddlCommandCell);
 		char *escapedDDLCommand = quote_literal_cstr(ddlCommand);
 		List *queryResultList = NIL;
-
 		StringInfo applyDDLCommand = makeStringInfo();
-		appendStringInfo(applyDDLCommand, WORKER_APPLY_SHARD_DDL_COMMAND,
-						 shardId, escapedDDLCommand);
+
+		if (strcmp(schemaName, "public") != 0)
+		{
+			appendStringInfo(applyDDLCommand, WORKER_APPLY_SHARD_DDL_COMMAND, shardId,
+							 escapedSchemaName, escapedDDLCommand);
+		}
+		else
+		{
+			appendStringInfo(applyDDLCommand,
+							 WORKER_APPLY_SHARD_DDL_COMMAND_WITHOUT_SCHEMA, shardId,
+							 escapedDDLCommand);
+		}
 
 		queryResultList = ExecuteRemoteQuery(nodeName, nodePort, newShardOwner,
 											 applyDDLCommand);
+		if (queryResultList == NIL)
+		{
+			shardCreated = false;
+			break;
+		}
+	}
+
+	foreach(foreignConstraintCommandCell, foreignConstraintCommandList)
+	{
+		char *command = (char *) lfirst(foreignConstraintCommandCell);
+		char *escapedCommand = quote_literal_cstr(command);
+
+		Oid referencedRelationId = InvalidOid;
+		Oid referencedSchemaId = InvalidOid;
+		char *referencedSchemaName = NULL;
+		char *escapedReferencedSchemaName = NULL;
+		uint64 referencedShardId = INVALID_SHARD_ID;
+
+		List *queryResultList = NIL;
+		StringInfo applyForeignConstraintCommand = makeStringInfo();
+
+		/* we need to parse the foreign constraint command to get referencing table id */
+		referencedRelationId = ForeignConstraintGetReferencedTableId(command);
+		if (referencedRelationId == InvalidOid)
+		{
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("cannot create foreign key constraint"),
+							errdetail("Referenced relation cannot be found.")));
+		}
+
+		referencedSchemaId = get_rel_namespace(referencedRelationId);
+		referencedSchemaName = get_namespace_name(referencedSchemaId);
+		escapedReferencedSchemaName = quote_literal_cstr(referencedSchemaName);
+
+		/*
+		 * In case of self referencing shards, relation itself might not be distributed
+		 * already. Therefore we cannot use ColocatedShardIdInRelation which assumes
+		 * given relation is distributed. Besides, since we know foreign key references
+		 * itself, referencedShardId is actual shardId anyway.
+		 */
+		if (relationId == referencedRelationId)
+		{
+			referencedShardId = shardId;
+		}
+		else
+		{
+			referencedShardId = ColocatedShardIdInRelation(referencedRelationId,
+														   shardIndex);
+		}
+
+		appendStringInfo(applyForeignConstraintCommand,
+						 WORKER_APPLY_INTER_SHARD_DDL_COMMAND, shardId, escapedSchemaName,
+						 referencedShardId, escapedReferencedSchemaName, escapedCommand);
+
+		queryResultList = ExecuteRemoteQuery(nodeName, nodePort, newShardOwner,
+											 applyForeignConstraintCommand);
 		if (queryResultList == NIL)
 		{
 			shardCreated = false;
@@ -483,19 +540,14 @@ UpdateShardStatistics(int64 shardId)
 	text *minValue = NULL;
 	text *maxValue = NULL;
 
-	/* if shard doesn't have an alias, extend regular table name */
-	shardQualifiedName = LoadShardAlias(relationId, shardId);
-	if (shardQualifiedName == NULL)
-	{
-		char *shardName = get_rel_name(relationId);
+	/* Build shard qualified name. */
+	char *shardName = get_rel_name(relationId);
+	Oid schemaId = get_rel_namespace(relationId);
+	char *schemaName = get_namespace_name(schemaId);
 
-		Oid schemaId = get_rel_namespace(relationId);
-		char *schemaName = get_namespace_name(schemaId);
+	AppendShardIdToName(&shardName, shardId);
 
-		AppendShardIdToName(&shardName, shardId);
-
-		shardQualifiedName = quote_qualified_identifier(schemaName, shardName);
-	}
+	shardQualifiedName = quote_qualified_identifier(schemaName, shardName);
 
 	shardPlacementList = FinalizedShardPlacementList(shardId);
 
@@ -503,10 +555,8 @@ UpdateShardStatistics(int64 shardId)
 	foreach(shardPlacementCell, shardPlacementList)
 	{
 		ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
-		char *workerName = placement->nodeName;
-		uint32 workerPort = placement->nodePort;
 
-		statsOK = WorkerShardStats(workerName, workerPort, relationId, shardQualifiedName,
+		statsOK = WorkerShardStats(placement, relationId, shardQualifiedName,
 								   &shardSize, &minValue, &maxValue);
 		if (statsOK)
 		{
@@ -536,11 +586,12 @@ UpdateShardStatistics(int64 shardId)
 	foreach(shardPlacementCell, shardPlacementList)
 	{
 		ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
+		uint64 placementId = placement->placementId;
 		char *workerName = placement->nodeName;
 		uint32 workerPort = placement->nodePort;
 
 		DeleteShardPlacementRow(shardId, workerName, workerPort);
-		InsertShardPlacementRow(shardId, FILE_FINALIZED, shardSize,
+		InsertShardPlacementRow(shardId, placementId, FILE_FINALIZED, shardSize,
 								workerName, workerPort);
 	}
 
@@ -568,112 +619,142 @@ UpdateShardStatistics(int64 shardId)
  * we assume have changed after new table data have been appended to the shard.
  */
 static bool
-WorkerShardStats(char *nodeName, uint32 nodePort, Oid relationId, char *shardName,
+WorkerShardStats(ShardPlacement *placement, Oid relationId, char *shardName,
 				 uint64 *shardSize, text **shardMinValue, text **shardMaxValue)
 {
-	bool shardStatsOK = true;
-
-	PG_TRY();
-	{
-		uint64 tableSize = WorkerTableSize(nodeName, nodePort, relationId, shardName);
-		StringInfo minValue = WorkerPartitionValue(nodeName, nodePort, relationId,
-												   shardName, SHARD_MIN_VALUE_QUERY);
-		StringInfo maxValue = WorkerPartitionValue(nodeName, nodePort, relationId,
-												   shardName, SHARD_MAX_VALUE_QUERY);
-
-		(*shardSize) = tableSize;
-		(*shardMinValue) = cstring_to_text_with_len(minValue->data, minValue->len);
-		(*shardMaxValue) = cstring_to_text_with_len(maxValue->data, maxValue->len);
-	}
-	PG_CATCH();
-	{
-		shardStatsOK = false;
-	}
-	PG_END_TRY();
-
-	return shardStatsOK;
-}
-
-
-/*
- * WorkerTableSize queries the worker node to extract the disk space used by the
- * given relation. The function assumes the relation represents a regular table or
- * a cstore_fdw table.
- */
-static uint64
-WorkerTableSize(char *nodeName, uint32 nodePort, Oid relationId, char *tableName)
-{
-	uint64 tableSize = 0;
-	List *queryResultList = NIL;
-	StringInfo tableSizeString = NULL;
-	char *tableSizeStringEnd = NULL;
-	char *quotedTableName = quote_literal_cstr(tableName);
-	bool cstoreTable = CStoreTable(relationId);
+	char *quotedShardName = NULL;
+	bool cstoreTable = false;
 	StringInfo tableSizeQuery = makeStringInfo();
 
+	const uint32 unusedTableId = 1;
+	char partitionType = PartitionMethod(relationId);
+	Var *partitionColumn = NULL;
+	char *partitionColumnName = NULL;
+	StringInfo partitionValueQuery = makeStringInfo();
 
+	PGresult *queryResult = NULL;
+	const int minValueIndex = 0;
+	const int maxValueIndex = 1;
+
+	uint64 tableSize = 0;
+	char *tableSizeString = NULL;
+	char *tableSizeStringEnd = NULL;
+	bool minValueIsNull = false;
+	bool maxValueIsNull = false;
+
+	int connectionFlags = 0;
+	int executeCommand = 0;
+
+	MultiConnection *connection = GetPlacementConnection(connectionFlags, placement,
+														 NULL);
+
+	*shardSize = 0;
+	*shardMinValue = NULL;
+	*shardMaxValue = NULL;
+
+	quotedShardName = quote_literal_cstr(shardName);
+
+	cstoreTable = CStoreTable(relationId);
 	if (cstoreTable)
 	{
-		appendStringInfo(tableSizeQuery, SHARD_CSTORE_TABLE_SIZE_QUERY, quotedTableName);
+		appendStringInfo(tableSizeQuery, SHARD_CSTORE_TABLE_SIZE_QUERY, quotedShardName);
 	}
 	else
 	{
-		appendStringInfo(tableSizeQuery, SHARD_TABLE_SIZE_QUERY, quotedTableName);
+		appendStringInfo(tableSizeQuery, SHARD_TABLE_SIZE_QUERY, quotedShardName);
 	}
 
-	queryResultList = ExecuteRemoteQuery(nodeName, nodePort, NULL, tableSizeQuery);
-	if (queryResultList == NIL)
+	executeCommand = ExecuteOptionalRemoteCommand(connection, tableSizeQuery->data,
+												  &queryResult);
+	if (executeCommand != 0)
 	{
-		ereport(ERROR, (errmsg("could not receive table size from node "
-							   "\"%s:%u\"", nodeName, nodePort)));
+		return false;
 	}
 
-	tableSizeString = (StringInfo) linitial(queryResultList);
+	tableSizeString = PQgetvalue(queryResult, 0, 0);
+	if (tableSizeString == NULL)
+	{
+		PQclear(queryResult);
+		ForgetResults(connection);
+		return false;
+	}
 
 	errno = 0;
-	tableSize = strtoull(tableSizeString->data, &tableSizeStringEnd, 0);
+	tableSize = strtoull(tableSizeString, &tableSizeStringEnd, 0);
 	if (errno != 0 || (*tableSizeStringEnd) != '\0')
 	{
-		ereport(ERROR, (errmsg("could not extract table size for table \"%s\"",
-							   quotedTableName)));
+		PQclear(queryResult);
+		ForgetResults(connection);
+		return false;
 	}
 
-	return tableSize;
+	*shardSize = tableSize;
+
+	PQclear(queryResult);
+	ForgetResults(connection);
+
+	if (partitionType != DISTRIBUTE_BY_APPEND)
+	{
+		/* we don't need min/max for non-append distributed tables */
+		return true;
+	}
+
+	/* fill in the partition column name and shard name in the query. */
+	partitionColumn = PartitionColumn(relationId, unusedTableId);
+	partitionColumnName = get_attname(relationId, partitionColumn->varattno);
+
+	appendStringInfo(partitionValueQuery, SHARD_RANGE_QUERY,
+					 partitionColumnName, partitionColumnName, shardName);
+
+	executeCommand = ExecuteOptionalRemoteCommand(connection, partitionValueQuery->data,
+												  &queryResult);
+	if (executeCommand != 0)
+	{
+		return false;
+	}
+
+	minValueIsNull = PQgetisnull(queryResult, 0, minValueIndex);
+	maxValueIsNull = PQgetisnull(queryResult, 0, maxValueIndex);
+
+	if (!minValueIsNull && !maxValueIsNull)
+	{
+		char *minValueResult = PQgetvalue(queryResult, 0, minValueIndex);
+		char *maxValueResult = PQgetvalue(queryResult, 0, maxValueIndex);
+
+		*shardMinValue = cstring_to_text(minValueResult);
+		*shardMaxValue = cstring_to_text(maxValueResult);
+	}
+
+	PQclear(queryResult);
+	ForgetResults(connection);
+
+	return true;
 }
 
 
 /*
- * WorkerPartitionValue helps in extracting partition column's min or max value
- * from the given shard. For this, the function resolves the given distributed
- * relation's partition column, connects to the worker node, and runs a select
- * query on the given shard.
+ * ForeignConstraintGetReferencedTableId parses given foreign constraint query and
+ * extracts referenced table id from it.
  */
-static StringInfo
-WorkerPartitionValue(char *nodeName, uint32 nodePort, Oid relationId,
-					 char *shardName, char *selectQuery)
+Oid
+ForeignConstraintGetReferencedTableId(char *queryString)
 {
-	StringInfo partitionValue = NULL;
-	List *queryResultList = NIL;
-	uint32 unusedTableId = 1;
+	Node *queryNode = ParseTreeNode(queryString);
+	AlterTableStmt *foreignConstraintStmt = (AlterTableStmt *) queryNode;
+	AlterTableCmd *command = (AlterTableCmd *) linitial(foreignConstraintStmt->cmds);
 
-	Var *partitionColumn = PartitionColumn(relationId, unusedTableId);
-	char *partitionColumnName = get_attname(relationId, partitionColumn->varattno);
-
-	StringInfo partitionValueQuery = makeStringInfo();
-	appendStringInfo(partitionValueQuery, selectQuery, partitionColumnName, shardName);
-
-	/*
-	 * Note that the following call omits the partition column value's size, and
-	 * simply casts the results to a (char *). If the user partitioned the table
-	 * on a binary byte array, this approach fails and should be fixed.
-	 */
-	queryResultList = ExecuteRemoteQuery(nodeName, nodePort, NULL, partitionValueQuery);
-	if (queryResultList == NIL)
+	if (command->subtype == AT_AddConstraint)
 	{
-		ereport(ERROR, (errmsg("could not receive shard min/max values from node "
-							   "\"%s:%u\"", nodeName, nodePort)));
+		Constraint *constraint = (Constraint *) command->def;
+		if (constraint->contype == CONSTR_FOREIGN)
+		{
+			RangeVar *referencedTable = constraint->pktable;
+			LOCKMODE lockmode = AlterTableGetLockLevel(foreignConstraintStmt->cmds);
+
+			return RangeVarGetRelid(referencedTable, lockmode,
+									foreignConstraintStmt->missing_ok);
+		}
 	}
 
-	partitionValue = (StringInfo) linitial(queryResultList);
-	return partitionValue;
+	return InvalidOid;
 }

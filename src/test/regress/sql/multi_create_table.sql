@@ -2,10 +2,8 @@
 -- MULTI_CREATE_TABLE
 --
 
-
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 360000;
 ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 360000;
-
 
 -- Create new table definitions for use in testing in distributed planning and
 -- execution functionality. Also create indexes to boost performance.
@@ -61,7 +59,20 @@ CREATE TABLE nation (
 	n_name char(25) not null,
 	n_regionkey integer not null,
 	n_comment varchar(152));
+
+\COPY nation FROM STDIN WITH CSV
+1,'name',1,'comment_1'
+2,'name',2,'comment_2'
+3,'name',3,'comment_3'
+4,'name',4,'comment_4'
+5,'name',5,'comment_5'
+\.
+
 SELECT master_create_distributed_table('nation', 'n_nationkey', 'append');
+
+TRUNCATE nation;
+
+SELECT create_reference_table('nation');
 
 CREATE TABLE part (
 	p_partkey integer not null,
@@ -85,66 +96,117 @@ CREATE TABLE supplier
 	s_acctbal decimal(15,2) not null,
 	s_comment varchar(101) not null
 );
-SELECT master_create_distributed_table('supplier', 's_suppkey', 'append');
+SELECT create_reference_table('supplier');
 
-
--- now test that Citus cannot distribute unique constraints that do not include
--- the partition column
-CREATE TABLE primary_key_on_non_part_col
+-- create a single shard supplier table which is not 
+-- a reference table
+CREATE TABLE supplier_single_shard
 (
-	partition_col integer,
-	other_col integer PRIMARY KEY
+	s_suppkey integer not null,
+ 	s_name char(25) not null,
+ 	s_address varchar(40) not null,
+ 	s_nationkey integer,
+ 	s_phone char(15) not null,
+  	s_acctbal decimal(15,2) not null,
+  	s_comment varchar(101) not null
 );
-SELECT master_create_distributed_table('primary_key_on_non_part_col', 'partition_col', 'hash');
+SELECT master_create_distributed_table('supplier_single_shard', 's_suppkey', 'append');
 
-CREATE TABLE unique_const_on_non_part_col
-(
-	partition_col integer,
-	other_col integer UNIQUE
-);
-SELECT master_create_distributed_table('primary_key_on_non_part_col', 'partition_col', 'hash');
+CREATE TABLE mx_table_test (col1 int, col2 text);
 
--- now show that Citus can distribute unique constrints that include
--- the partition column
-CREATE TABLE primary_key_on_part_col
-(
-	partition_col integer PRIMARY KEY,
-	other_col integer
-);
-SELECT master_create_distributed_table('primary_key_on_part_col', 'partition_col', 'hash');
+-- Since we're superuser, we can set the replication model to 'streaming' to
+-- create a one-off MX table... but if we forget to set the replication factor to one,
+-- we should see an error reminding us to fix that
+SET citus.replication_model TO 'streaming';
+SELECT create_distributed_table('mx_table_test', 'col1');
 
-CREATE TABLE unique_const_on_part_col
-(
-	partition_col integer UNIQUE,
-	other_col integer
-);
-SELECT master_create_distributed_table('unique_const_on_part_col', 'partition_col', 'hash');
+-- ok, so now actually create the one-off MX table
+SET citus.shard_replication_factor TO 1;
+SELECT create_distributed_table('mx_table_test', 'col1');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='mx_table_test'::regclass;
+DROP TABLE mx_table_test;
 
-CREATE TABLE unique_const_on_two_columns
-(
-	partition_col integer,
-	other_col integer,
-	UNIQUE (partition_col, other_col)
-);
-SELECT master_create_distributed_table('unique_const_on_two_columns', 'partition_col', 'hash');
+-- Show that master_create_distributed_table ignores citus.replication_model GUC
+CREATE TABLE s_table(a int);
+SELECT master_create_distributed_table('s_table', 'a', 'hash');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='s_table'::regclass;
 
-CREATE TABLE unique_const_append_partitioned_tables
-(
-	partition_col integer UNIQUE,
-	other_col integer
-);
-SELECT master_create_distributed_table('unique_const_append_partitioned_tables', 'partition_col', 'append');
+-- Show that master_create_worker_shards complains when RF>1 and replication model is streaming
+UPDATE pg_dist_partition SET repmodel = 's' WHERE logicalrelid='s_table'::regclass;
+SELECT master_create_worker_shards('s_table', 4, 2);
 
-CREATE TABLE unique_const_range_partitioned_tables
-(
-	partition_col integer UNIQUE,
-	other_col integer
-);
-SELECT master_create_distributed_table('unique_const_range_partitioned_tables', 'partition_col', 'range');
+DROP TABLE s_table;
 
--- drop unnecessary tables
-DROP TABLE primary_key_on_non_part_col, unique_const_on_non_part_col CASCADE;
-DROP TABLE primary_key_on_part_col, unique_const_on_part_col, unique_const_on_two_columns CASCADE;
-DROP TABLE unique_const_range_partitioned_tables CASCADE;
+RESET citus.replication_model;
 
+-- Show that create_distributed_table with append and range distributions ignore 
+-- citus.replication_model GUC
+SET citus.shard_replication_factor TO 2;
+SET citus.replication_model TO streaming;
 
+CREATE TABLE repmodel_test (a int);
+SELECT create_distributed_table('repmodel_test', 'a', 'append');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+DROP TABLE repmodel_test;
+
+CREATE TABLE repmodel_test (a int);
+SELECT create_distributed_table('repmodel_test', 'a', 'range');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+DROP TABLE repmodel_test;
+
+-- Show that master_create_distributed_table created statement replicated tables no matter
+-- what citus.replication_model set to
+
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'hash');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+DROP TABLE repmodel_test;
+
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'append');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+DROP TABLE repmodel_test;
+
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'range');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+DROP TABLE repmodel_test;
+
+-- Check that the replication_model overwrite behavior is the same with RF=1
+SET citus.shard_replication_factor TO 1;
+
+CREATE TABLE repmodel_test (a int);
+SELECT create_distributed_table('repmodel_test', 'a', 'append');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+DROP TABLE repmodel_test;
+
+CREATE TABLE repmodel_test (a int);
+SELECT create_distributed_table('repmodel_test', 'a', 'range');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+DROP TABLE repmodel_test;
+
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'hash');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+DROP TABLE repmodel_test;
+
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'append');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+DROP TABLE repmodel_test;
+
+CREATE TABLE repmodel_test (a int);
+SELECT master_create_distributed_table('repmodel_test', 'a', 'range');
+SELECT repmodel FROM pg_dist_partition WHERE logicalrelid='repmodel_test'::regclass;
+DROP TABLE repmodel_test;
+
+RESET citus.replication_model;
+SET citus.shard_replication_factor TO default;
+
+SET citus.shard_count to 4;
+
+CREATE TABLE lineitem_hash_part (like lineitem);
+SELECT create_distributed_table('lineitem_hash_part', 'l_orderkey');
+
+CREATE TABLE orders_hash_part (like orders);
+SELECT create_distributed_table('orders_hash_part', 'o_orderkey');

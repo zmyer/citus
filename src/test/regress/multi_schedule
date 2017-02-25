@@ -16,24 +16,33 @@
 # Tests around schema changes, these are run first, so there's no preexisting objects.
 # ---
 test: multi_extension
+test: multi_cluster_management
 test: multi_table_ddl
+test: multi_name_lengths
+test: multi_metadata_access
 
 # ----------
 # The following distributed tests depend on creating a partitioned table and
 # uploading data to it.
 # ----------
 test: multi_create_table
+test: multi_create_table_constraints
 test: multi_master_protocol
-test: multi_stage_data
+test: multi_load_data
+
+test: multi_insert_select
 
 # ----------
 # Miscellaneous tests to check our query planning behavior
 # ----------
+test: multi_deparse_shard_query
 test: multi_basic_queries multi_complex_expressions multi_verify_no_subquery
 test: multi_explain
 test: multi_subquery
+test: multi_reference_table
+test: multi_outer_join_reference
 test: multi_single_relation_subquery
-test: multi_agg_distinct multi_limit_clause multi_limit_clause_approximate
+test: multi_agg_distinct multi_agg_approximate_distinct multi_limit_clause multi_limit_clause_approximate
 test: multi_average_expression multi_working_columns
 test: multi_array_agg
 test: multi_agg_type_conversion multi_count_type_conversion
@@ -44,9 +53,10 @@ test: multi_query_directory_cleanup
 test: multi_task_assignment_policy
 test: multi_utility_statements
 test: multi_dropped_column_aliases
-test: multi_verify_no_join_with_alias
 test: multi_binary_master_copy_format
 test: multi_prepare_sql multi_prepare_plsql
+test: multi_sql_function
+test: multi_view
 
 # ----------
 # Parallel TPC-H tests to check our distributed execution behavior
@@ -56,26 +66,26 @@ test: multi_tpch_query12 multi_tpch_query14 multi_tpch_query19
 test: multi_tpch_query7 multi_tpch_query7_nested
 
 # ----------
-# Parallel tests to check our join order planning logic. Note that we stage data
+# Parallel tests to check our join order planning logic. Note that we load data
 # below; and therefore these tests should come after the execution tests.
 # ----------
 test: multi_join_order_tpch_small multi_join_order_additional
-test: multi_stage_more_data
+test: multi_load_more_data
 test: multi_join_order_tpch_large
 
 # ----------
-# Tests for large-table join planning and execution.
-# Be careful when staging new data before these tests, as they
-# expect specific shard identifiers in the output.
+# Tests for large-table join planning and execution. Be careful when creating
+# new shards before these tests, as they expect specific shard identifiers in
+# the output.
 # ----------
 test: multi_large_table_join_planning
 test: multi_large_table_pruning
 test: multi_large_table_task_assignment
 
 # ----------
-# Tests to check our large record staging and shard deletion behavior
+# Tests to check our large record loading and shard deletion behavior
 # ----------
-test: multi_stage_large_records
+test: multi_load_large_records
 test: multi_master_delete_protocol
 test: multi_shard_modify
 
@@ -86,7 +96,7 @@ test: multi_index_statements
 test: multi_alter_table_statements
 
 # ----------
-# multi_create_schema tests creation, staging and querying of a table in a new
+# multi_create_schema tests creation, loading, and querying of a table in a new
 # schema (namespace).
 # ----------
 test: multi_create_schema
@@ -98,13 +108,13 @@ test: multi_create_schema
 test: multi_utility_warnings
 
 # ---------
-# multi_append_table_to_shard stages shards in a way that forces
+# multi_append_table_to_shard loads data to create shards in a way that forces
 # shard caching.
 # ---------
 test: multi_append_table_to_shard
 
 # ---------
-# multi_outer_join stages shards to create different mappings for outer joins
+# multi_outer_join loads data to create shards to test outer join mappings
 # ---------
 test: multi_outer_join
 
@@ -116,7 +126,7 @@ test: multi_outer_join
 # is independed from the rest of the group, it is added to increase parallelism.
 # ---
 test: multi_create_fdw
-test: multi_connection_cache multi_complex_count_distinct
+test: multi_complex_count_distinct
 test: multi_distribution_metadata
 test: multi_generate_ddl_commands
 test: multi_create_shards
@@ -125,10 +135,13 @@ test: multi_repair_shards
 test: multi_modifications
 test: multi_upsert
 test: multi_simple_queries
-test: multi_utilities
 test: multi_create_insert_proxy
 test: multi_data_types
+test: multi_utilities
+test: multi_repartition_udt
 test: multi_repartitioned_subquery_udf
+test: multi_modifying_xacts
+test: multi_transaction_recovery
 
 # ---------
 # multi_copy creates hash and range-partitioned tables and performs COPY
@@ -141,7 +154,7 @@ test: multi_copy
 test: multi_router_planner
 
 # ----------
-# multi_large_shardid stages more shards into lineitem
+# multi_large_shardid loads more lineitem data using high shard identifiers
 # ----------
 test: multi_large_shardid
 
@@ -151,6 +164,59 @@ test: multi_large_shardid
 test: multi_drop_extension
 
 # ----------
+# multi_metadata_sync tests the propagation of mx-related metadata changes to metadata workers 
+# multi_unsupported_worker_operations tests that unsupported operations error out on metadata workers
+# ----------
+test: multi_metadata_sync
+test: multi_unsupported_worker_operations
+
+# ----------
 # multi_schema_support makes sure we can work with tables in schemas other than public with no problem
 # ----------
 test: multi_schema_support
+
+# ----------
+# multi_function_evaluation tests edge-cases in master-side function pre-evaluation
+# ----------
+test: multi_function_evaluation
+
+# ----------
+# multi_truncate tests truncate functionality for distributed tables
+# ----------
+test: multi_truncate
+
+# ----------
+# multi_expire_table_cache tests for broadcast tables
+# ----------
+test: multi_expire_table_cache
+
+# ----------
+# multi_colocation_utils tests utility functions written for co-location feature & internal API
+# multi_colocated_shard_transfer tests master_copy_shard_placement with colocated tables.
+# ----------
+test: multi_colocation_utils
+test: multi_colocated_shard_transfer
+
+# ----------
+# multi_citus_tools tests utility functions written for citus tools
+# ----------
+test: multi_citus_tools
+
+# ----------
+# multi_foreign_key tests foreign key push down on distributed tables
+# ----------
+test: multi_foreign_key
+
+# ----------
+# multi_upgrade_reference_table tests for upgrade_reference_table UDF
+# multi_replicate_reference_table tests replicating reference tables to new nodes after we add new nodes
+# multi_remove_node_reference_table tests metadata changes after master_remove_node
+# ----------
+test: multi_upgrade_reference_table
+test: multi_replicate_reference_table
+test: multi_remove_node_reference_table
+
+# ----------
+# multi_transactional_drop_shards tests for dropping shards using connection API
+# ----------
+test: multi_transactional_drop_shards

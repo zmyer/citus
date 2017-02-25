@@ -14,6 +14,8 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/multi_planner.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/worker_protocol.h"
@@ -21,10 +23,37 @@
 #include "utils/memutils.h"
 
 
-static ShardInterval * SearchCachedShardInterval(Datum partitionColumnValue,
-												 ShardInterval **shardIntervalCache,
-												 int shardCount,
-												 FmgrInfo *compareFunction);
+static int FindShardIntervalIndex(Datum searchedValue, ShardInterval **shardIntervalCache,
+								  int shardCount, char partitionMethod,
+								  FmgrInfo *compareFunction, bool useBinarySearch);
+static int SearchCachedShardInterval(Datum partitionColumnValue,
+									 ShardInterval **shardIntervalCache,
+									 int shardCount, FmgrInfo *compareFunction);
+
+
+/*
+ * LowestShardIntervalById returns the shard interval with the lowest shard
+ * ID from a list of shard intervals.
+ */
+ShardInterval *
+LowestShardIntervalById(List *shardIntervalList)
+{
+	ShardInterval *lowestShardInterval = NULL;
+	ListCell *shardIntervalCell = NULL;
+
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+
+		if (lowestShardInterval == NULL ||
+			lowestShardInterval->shardId > shardInterval->shardId)
+		{
+			lowestShardInterval = shardInterval;
+		}
+	}
+
+	return lowestShardInterval;
+}
 
 
 /*
@@ -107,33 +136,173 @@ CompareShardIntervalsById(const void *leftElement, const void *rightElement)
 
 
 /*
+ * CompareRelationShards is a comparison function for sorting relation
+ * to shard mappings by their relation ID and then shard ID.
+ */
+int
+CompareRelationShards(const void *leftElement, const void *rightElement)
+{
+	RelationShard *leftRelationShard = *((RelationShard **) leftElement);
+	RelationShard *rightRelationShard = *((RelationShard **) rightElement);
+	Oid leftRelationId = leftRelationShard->relationId;
+	Oid rightRelationId = rightRelationShard->relationId;
+	int64 leftShardId = leftRelationShard->shardId;
+	int64 rightShardId = rightRelationShard->shardId;
+
+	if (leftRelationId > rightRelationId)
+	{
+		return 1;
+	}
+	else if (leftRelationId < rightRelationId)
+	{
+		return -1;
+	}
+	else if (leftShardId > rightShardId)
+	{
+		return 1;
+	}
+	else if (leftShardId < rightShardId)
+	{
+		return -1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+
+/*
+ * ShardIndex finds the index of given shard in sorted shard interval array.
+ *
+ * For hash partitioned tables, it calculates hash value of a number in its
+ * range (e.g. min value) and finds which shard should contain the hashed
+ * value. For reference tables, it simply returns 0. For distribution methods
+ * other than hash and reference, the function errors out.
+ */
+int
+ShardIndex(ShardInterval *shardInterval)
+{
+	int shardIndex = INVALID_SHARD_INDEX;
+	Oid distributedTableId = shardInterval->relationId;
+	Datum shardMinValue = shardInterval->minValue;
+
+	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
+	ShardInterval **shardIntervalCache = cacheEntry->sortedShardIntervalArray;
+	int shardCount = cacheEntry->shardIntervalArrayLength;
+	char partitionMethod = cacheEntry->partitionMethod;
+	FmgrInfo *compareFunction = cacheEntry->shardIntervalCompareFunction;
+	bool hasUniformHashDistribution = cacheEntry->hasUniformHashDistribution;
+	bool useBinarySearch = false;
+
+	/*
+	 * Note that, we can also support append and range distributed tables, but
+	 * currently it is not required.
+	 */
+	if (partitionMethod != DISTRIBUTE_BY_HASH && partitionMethod != DISTRIBUTE_BY_NONE)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("finding index of a given shard is only supported for "
+							   "hash distributed and reference tables")));
+	}
+
+	/* short-circuit for reference tables */
+	if (partitionMethod == DISTRIBUTE_BY_NONE)
+	{
+		/* reference tables has only a single shard, so the index is fixed to 0 */
+		shardIndex = 0;
+
+		return shardIndex;
+	}
+
+	/* determine whether to use binary search */
+	if (partitionMethod != DISTRIBUTE_BY_HASH || !hasUniformHashDistribution)
+	{
+		useBinarySearch = true;
+	}
+
+	shardIndex = FindShardIntervalIndex(shardMinValue, shardIntervalCache,
+										shardCount, partitionMethod,
+										compareFunction, useBinarySearch);
+
+	return shardIndex;
+}
+
+
+/*
  * FindShardInterval finds a single shard interval in the cache for the
- * given partition column value.
+ * given partition column value. Note that reference tables do not have
+ * partition columns, thus, pass partitionColumnValue and compareFunction
+ * as NULL for them.
  */
 ShardInterval *
 FindShardInterval(Datum partitionColumnValue, ShardInterval **shardIntervalCache,
 				  int shardCount, char partitionMethod, FmgrInfo *compareFunction,
 				  FmgrInfo *hashFunction, bool useBinarySearch)
 {
-	ShardInterval *shardInterval = NULL;
+	Datum searchedValue = partitionColumnValue;
+	int shardIndex = INVALID_SHARD_INDEX;
 
 	if (partitionMethod == DISTRIBUTE_BY_HASH)
 	{
-		int hashedValue = DatumGetInt32(FunctionCall1(hashFunction,
-													  partitionColumnValue));
+		searchedValue = FunctionCall1(hashFunction, partitionColumnValue);
+	}
+
+	shardIndex = FindShardIntervalIndex(searchedValue, shardIntervalCache,
+										shardCount, partitionMethod,
+										compareFunction, useBinarySearch);
+
+	if (shardIndex == INVALID_SHARD_INDEX)
+	{
+		return NULL;
+	}
+
+	return shardIntervalCache[shardIndex];
+}
+
+
+/*
+ * FindShardIntervalIndex finds the index of the shard interval which covers
+ * the searched value. Note that the searched value must be the hashed value
+ * of the original value if the distribution method is hash.
+ *
+ * Note that, if the searched value can not be found for hash partitioned tables,
+ * we error out. This should only happen if something is terribly wrong, either
+ * metadata tables are corrupted or we have a bug somewhere. Such as a hash
+ * function which returns a value not in the range of [INT32_MIN, INT32_MAX] can
+ * fire this.
+ */
+static int
+FindShardIntervalIndex(Datum searchedValue, ShardInterval **shardIntervalCache,
+					   int shardCount, char partitionMethod, FmgrInfo *compareFunction,
+					   bool useBinarySearch)
+{
+	int shardIndex = INVALID_SHARD_INDEX;
+
+	if (partitionMethod == DISTRIBUTE_BY_HASH)
+	{
 		if (useBinarySearch)
 		{
 			Assert(compareFunction != NULL);
 
-			shardInterval = SearchCachedShardInterval(Int32GetDatum(hashedValue),
-													  shardIntervalCache, shardCount,
-													  compareFunction);
+			shardIndex = SearchCachedShardInterval(searchedValue, shardIntervalCache,
+												   shardCount, compareFunction);
+
+			/* we should always return a valid shard index for hash partitioned tables */
+			if (shardIndex == INVALID_SHARD_INDEX)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
+								errmsg("cannot find shard interval"),
+								errdetail("Hash of the partition column value "
+										  "does not fall into any shards.")));
+			}
 		}
 		else
 		{
+			int hashedValue = DatumGetInt32(searchedValue);
 			uint64 hashTokenIncrement = HASH_TOKEN_COUNT / shardCount;
-			int shardIndex = (uint32) (hashedValue - INT32_MIN) / hashTokenIncrement;
 
+			shardIndex = (uint32) (hashedValue - INT32_MIN) / hashTokenIncrement;
 			Assert(shardIndex <= shardCount);
 
 			/*
@@ -145,28 +314,34 @@ FindShardInterval(Datum partitionColumnValue, ShardInterval **shardIntervalCache
 			{
 				shardIndex = shardCount - 1;
 			}
-
-			shardInterval = shardIntervalCache[shardIndex];
 		}
+	}
+	else if (partitionMethod == DISTRIBUTE_BY_NONE)
+	{
+		/* reference tables has a single shard, all values mapped to that shard */
+		Assert(shardCount == 1);
+
+		shardIndex = 0;
 	}
 	else
 	{
 		Assert(compareFunction != NULL);
 
-		shardInterval = SearchCachedShardInterval(partitionColumnValue,
-												  shardIntervalCache, shardCount,
-												  compareFunction);
+		shardIndex = SearchCachedShardInterval(searchedValue, shardIntervalCache,
+											   shardCount, compareFunction);
 	}
 
-	return shardInterval;
+	return shardIndex;
 }
 
 
 /*
- * SearchCachedShardInterval performs a binary search for a shard interval matching a
- * given partition column value and returns it.
+ * SearchCachedShardInterval performs a binary search for a shard interval
+ * matching a given partition column value and returns it's index in the cached
+ * array. If it can not find any shard interval with the given value, it returns
+ * INVALID_SHARD_INDEX.
  */
-static ShardInterval *
+static int
 SearchCachedShardInterval(Datum partitionColumnValue, ShardInterval **shardIntervalCache,
 						  int shardCount, FmgrInfo *compareFunction)
 {
@@ -197,11 +372,38 @@ SearchCachedShardInterval(Datum partitionColumnValue, ShardInterval **shardInter
 
 		if (DatumGetInt32(maxValueComparison) <= 0)
 		{
-			return shardIntervalCache[middleIndex];
+			return middleIndex;
 		}
 
 		lowerBoundIndex = middleIndex + 1;
 	}
 
-	return NULL;
+	return INVALID_SHARD_INDEX;
+}
+
+
+/*
+ * SingleReplicatedTable checks whether all shards of a distributed table, do not have
+ * more than one replica. If even one shard has more than one replica, this function
+ * returns false, otherwise it returns true.
+ */
+bool
+SingleReplicatedTable(Oid relationId)
+{
+	List *shardIntervalList = LoadShardList(relationId);
+	ListCell *shardIntervalCell = NULL;
+
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		uint64 *shardIdPointer = (uint64 *) lfirst(shardIntervalCell);
+		uint64 shardId = (*shardIdPointer);
+		List *shardPlacementList = ShardPlacementList(shardId);
+
+		if (shardPlacementList->length > 1)
+		{
+			return false;
+		}
+	}
+
+	return true;
 }

@@ -52,28 +52,27 @@ multi_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		MultiExecutorType executorType = MULTI_EXECUTOR_INVALID_FIRST;
 		Job *workerJob = multiPlan->workerJob;
 
+		/* ensure plan is executable */
+		VerifyMultiPlanValidity(multiPlan);
+
 		ExecCheckRTPerms(planStatement->rtable, true);
 
 		executorType = JobExecutorType(multiPlan);
 		if (executorType == MULTI_EXECUTOR_ROUTER)
 		{
-			Task *task = NULL;
 			List *taskList = workerJob->taskList;
+			TupleDesc tupleDescriptor = ExecCleanTypeFromTL(
+				planStatement->planTree->targetlist, false);
 			List *dependendJobList PG_USED_FOR_ASSERTS_ONLY = workerJob->dependedJobList;
-			List *workerTargetList = multiPlan->workerJob->jobQuery->targetList;
-			TupleDesc tupleDescriptor = ExecCleanTypeFromTL(workerTargetList, false);
 
-			/* router executor can only execute distributed plans with a single task */
-			Assert(list_length(taskList) == 1);
+			/* router executor cannot execute task with depencencies */
 			Assert(dependendJobList == NIL);
-
-			task = (Task *) linitial(taskList);
 
 			/* we need to set tupleDesc in executorStart */
 			queryDesc->tupDesc = tupleDescriptor;
 
 			/* drop into the router executor */
-			RouterExecutorStart(queryDesc, eflags, task);
+			RouterExecutorStart(queryDesc, eflags, taskList);
 		}
 		else
 		{
@@ -87,7 +86,7 @@ multi_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			 * We create a directory on the master node to keep task execution results.
 			 * We also register this directory for automatic cleanup on portal delete.
 			 */
-			jobDirectoryName = JobDirectoryName(workerJob->jobId);
+			jobDirectoryName = MasterJobDirectoryName(workerJob->jobId);
 			CreateDirectory(jobDirectoryName);
 
 			ResourceOwnerEnlargeJobDirectories(CurrentResourceOwner);
@@ -200,24 +199,14 @@ CopyQueryResults(List *masterCopyStmtList)
 
 /* Execute query plan. */
 void
-multi_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count)
+multi_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, tuplecount_t count)
 {
 	int eflags = queryDesc->estate->es_top_eflags;
 
 	if (eflags & EXEC_FLAG_CITUS_ROUTER_EXECUTOR)
 	{
-		Task *task = NULL;
-		PlannedStmt *planStatement = queryDesc->plannedstmt;
-		MultiPlan *multiPlan = GetMultiPlan(planStatement);
-		List *taskList = multiPlan->workerJob->taskList;
-
-		/* router executor can only execute distributed plans with a single task */
-		Assert(list_length(taskList) == 1);
-
-		task = (Task *) linitial(taskList);
-
 		/* drop into the router executor */
-		RouterExecutorRun(queryDesc, direction, count, task);
+		RouterExecutorRun(queryDesc, direction, count);
 	}
 	else
 	{

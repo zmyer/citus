@@ -18,9 +18,6 @@
 #include "funcapi.h"
 
 #include <arpa/inet.h>
-#ifdef HAVE_INTTYPES_H
-#include <inttypes.h>
-#endif
 #include <netinet/in.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -28,6 +25,7 @@
 #include "access/hash.h"
 #include "access/htup_details.h"
 #include "access/nbtree.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_collation.h"
 #include "commands/copy.h"
 #include "commands/defrem.h"
@@ -444,25 +442,41 @@ ClosePartitionFiles(FileOutputStream *partitionFileArray, uint32 fileCount)
 }
 
 
-/* Constructs a standardized job directory path for the given job id. */
+/*
+ * MasterJobDirectoryName constructs a standardized job
+ * directory path for the given job id on the master node.
+ */
 StringInfo
-JobDirectoryName(uint64 jobId)
+MasterJobDirectoryName(uint64 jobId)
 {
+	StringInfo jobDirectoryName = makeStringInfo();
+
 	/*
 	 * We use the default tablespace in {datadir}/base. Further, we need to
 	 * apply padding on our 64-bit job id, and hence can't use UINT64_FORMAT.
 	 */
-#ifdef HAVE_INTTYPES_H
+	appendStringInfo(jobDirectoryName, "base/%s/%s%0*" INT64_MODIFIER "u",
+					 PG_JOB_CACHE_DIR, MASTER_JOB_DIRECTORY_PREFIX,
+					 MIN_JOB_DIRNAME_WIDTH, jobId);
+
+	return jobDirectoryName;
+}
+
+
+/*
+ * JobDirectoryName Constructs a standardized job
+ * directory path for the given job id on the worker nodes.
+ */
+StringInfo
+JobDirectoryName(uint64 jobId)
+{
+	/*
+	 * We use the default tablespace in {datadir}/base.
+	 */
 	StringInfo jobDirectoryName = makeStringInfo();
-	appendStringInfo(jobDirectoryName, "base/%s/%s%0*" PRIu64,
+	appendStringInfo(jobDirectoryName, "base/%s/%s%0*" INT64_MODIFIER "u",
 					 PG_JOB_CACHE_DIR, JOB_DIRECTORY_PREFIX,
 					 MIN_JOB_DIRNAME_WIDTH, jobId);
-#else
-	StringInfo jobDirectoryName = makeStringInfo();
-	appendStringInfo(jobDirectoryName, "base/%s/%s%0*llu",
-					 PG_JOB_CACHE_DIR, JOB_DIRECTORY_PREFIX,
-					 MIN_JOB_DIRNAME_WIDTH, jobId);
-#endif
 
 	return jobDirectoryName;
 }

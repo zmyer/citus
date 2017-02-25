@@ -586,6 +586,8 @@ PACKAGE_URL=''
 
 ac_subst_vars='LTLIBOBJS
 LIBOBJS
+POSTGRES_BUILDDIR
+POSTGRES_SRCDIR
 CITUS_CFLAGS
 OBJEXT
 EXEEXT
@@ -597,6 +599,7 @@ CC
 vpath_build
 PATH
 PG_CONFIG
+FLEX
 SED
 target_alias
 host_alias
@@ -639,6 +642,7 @@ SHELL'
 ac_subst_files=''
 ac_user_opts='
 enable_option_checking
+enable_coverage
 '
       ac_precious_vars='build_alias
 host_alias
@@ -1255,6 +1259,12 @@ if test -n "$ac_init_help"; then
    esac
   cat <<\_ACEOF
 
+Optional Features:
+  --disable-option-checking  ignore unrecognized --enable/--with options
+  --disable-FEATURE       do not include FEATURE (same as --enable-FEATURE=no)
+  --enable-FEATURE[=ARG]  include FEATURE [ARG=yes]
+  --enable-coverage       build with coverage testing instrumentation
+
 Some influential environment variables:
   PG_CONFIG   Location to find pg_config for target PostgreSQL instalation
               (default PATH)
@@ -1810,6 +1820,50 @@ $as_echo "$ac_cv_path_SED" >&6; }
   rm -f conftest.sed
 
 
+# Re-check for flex. That allows to compile citus against a postgres
+# which was built without flex available (possible because generated
+# files are included)
+# Extract the first word of "flex", so it can be a program name with args.
+set dummy flex; ac_word=$2
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
+$as_echo_n "checking for $ac_word... " >&6; }
+if ${ac_cv_path_FLEX+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  case $FLEX in
+  [\\/]* | ?:[\\/]*)
+  ac_cv_path_FLEX="$FLEX" # Let the user override the test with a path.
+  ;;
+  *)
+  as_save_IFS=$IFS; IFS=$PATH_SEPARATOR
+for as_dir in $PATH
+do
+  IFS=$as_save_IFS
+  test -z "$as_dir" && as_dir=.
+    for ac_exec_ext in '' $ac_executable_extensions; do
+  if as_fn_executable_p "$as_dir/$ac_word$ac_exec_ext"; then
+    ac_cv_path_FLEX="$as_dir/$ac_word$ac_exec_ext"
+    $as_echo "$as_me:${as_lineno-$LINENO}: found $as_dir/$ac_word$ac_exec_ext" >&5
+    break 2
+  fi
+done
+  done
+IFS=$as_save_IFS
+
+  ;;
+esac
+fi
+FLEX=$ac_cv_path_FLEX
+if test -n "$FLEX"; then
+  { $as_echo "$as_me:${as_lineno-$LINENO}: result: $FLEX" >&5
+$as_echo "$FLEX" >&6; }
+else
+  { $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
+$as_echo "no" >&6; }
+fi
+
+
+
 # Locate pg_config binary
 
 
@@ -1870,7 +1924,7 @@ if test -z "$version_num"; then
   as_fn_error $? "Could not detect PostgreSQL version from pg_config." "$LINENO" 5
 fi
 
-if test "$version_num" != '9.4' -a "$version_num" != '9.5'; then
+if test "$version_num" != '9.5' -a "$version_num" != '9.6'; then
    as_fn_error $? "Citus is not compatible with the detected PostgreSQL version ${version_num}." "$LINENO" 5
 else
    { $as_echo "$as_me:${as_lineno-$LINENO}: building against PostgreSQL $version_num" >&5
@@ -2495,6 +2549,14 @@ ac_compiler_gnu=$ac_cv_c_compiler_gnu
 
 CFLAGS="$SAVE_CFLAGS"
 
+
+# Locate source and build directory of the postgres we're building
+# against. Can't rely on either still being present, but e.g. optional
+# test infrastructure can rely on it.
+POSTGRES_SRCDIR=$(grep ^abs_top_srcdir $(dirname $($PG_CONFIG --pgxs))/../Makefile.global|cut -d ' ' -f3-)
+POSTGRES_BUILDDIR=$(grep ^abs_top_builddir $(dirname $($PG_CONFIG --pgxs))/../Makefile.global|cut -d ' ' -f3-)
+
+
 # check for a number of CFLAGS that make development easier
 
 # CITUSAC_PROG_CC_CFLAGS_OPT
@@ -2891,7 +2953,23 @@ if test x"$citusac_cv_prog_cc_cflags__Wmissing_prototypes" = x"yes"; then
 fi
 
 
+#
+# --enable-coverage enables generation of code coverage metrics with gcov
+#
+# Check whether --enable-coverage was given.
+if test "${enable_coverage+set}" = set; then :
+  enableval=$enable_coverage;
+fi
+
+if test "$enable_coverage" = yes; then
+    CITUS_CFLAGS="$CITUS_CFLAGS -fprofile-arcs -ftest-coverage"
+fi
+
 CITUS_CFLAGS="$CITUS_CFLAGS"
+
+POSTGRES_SRCDIR="$POSTGRES_SRCDIR"
+
+POSTGRES_BUILDDIR="$POSTGRES_BUILDDIR"
 
 
 ac_config_files="$ac_config_files Makefile.global"

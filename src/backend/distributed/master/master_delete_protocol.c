@@ -13,34 +13,49 @@
  *-------------------------------------------------------------------------
  */
 
-
 #include "postgres.h"
-#include "funcapi.h"
+#include "c.h"
+#include "fmgr.h"
+#include "libpq-fe.h"
 #include "miscadmin.h"
+#include "port.h"
+
+#include <stddef.h>
 
 #include "access/xact.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_class.h"
 #include "commands/dbcommands.h"
-#include "commands/event_trigger.h"
-#include "distributed/master_metadata_utility.h"
+#include "distributed/connection_management.h"
 #include "distributed/master_protocol.h"
-#include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/multi_client_executor.h"
+#include "distributed/multi_join_order.h"
+#include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_server_executor.h"
-#include "distributed/pg_dist_shard.h"
+#include "distributed/multi_utility.h"
 #include "distributed/pg_dist_partition.h"
+#include "distributed/pg_dist_shard.h"
+#include "distributed/placement_connection.h"
+#include "distributed/relay_utility.h"
+#include "distributed/remote_commands.h"
 #include "distributed/worker_protocol.h"
+#include "distributed/worker_transaction.h"
+#include "lib/stringinfo.h"
+#include "nodes/nodes.h"
+#include "nodes/parsenodes.h"
+#include "nodes/pg_list.h"
+#include "nodes/primnodes.h"
+#include "nodes/relation.h"
 #include "optimizer/clauses.h"
 #include "optimizer/predtest.h"
 #include "optimizer/restrictinfo.h"
-#include "optimizer/var.h"
-#include "nodes/makefuncs.h"
+#include "storage/lock.h"
 #include "tcop/tcopprot.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
-#include "utils/datum.h"
-#include "utils/inval.h"
+#include "utils/elog.h"
+#include "utils/errcodes.h"
 #include "utils/lsyscache.h"
 
 
@@ -52,13 +67,12 @@ static List * ShardsMatchingDeleteCriteria(Oid relationId, List *shardList,
 										   Node *deleteCriteria);
 static int DropShards(Oid relationId, char *schemaName, char *relationName,
 					  List *deletableShardIntervalList);
-static bool ExecuteRemoteCommand(const char *nodeName, uint32 nodePort,
-								 StringInfo queryString);
 
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_apply_delete_command);
 PG_FUNCTION_INFO_V1(master_drop_all_shards);
+PG_FUNCTION_INFO_V1(master_drop_sequences);
 
 
 /*
@@ -96,9 +110,8 @@ master_apply_delete_command(PG_FUNCTION_ARGS)
 	bool dontWait = false;
 	char partitionMethod = 0;
 	bool failOK = false;
-	bool isTopLevel = true;
 
-	PreventTransactionChain(isTopLevel, "master_apply_delete_command");
+	EnsureCoordinator();
 
 	queryTreeNode = ParseTreeNode(queryString);
 	if (!IsA(queryTreeNode, DeleteStmt))
@@ -113,6 +126,13 @@ master_apply_delete_command(PG_FUNCTION_ARGS)
 	relationName = deleteStatement->relation->relname;
 	relationId = RangeVarGetRelid(deleteStatement->relation, NoLock, failOK);
 
+	/* schema-prefix if it is not specified already */
+	if (schemaName == NULL)
+	{
+		Oid schemaId = get_rel_namespace(relationId);
+		schemaName = get_namespace_name(schemaId);
+	}
+
 	CheckDistributedTable(relationId);
 	EnsureTablePermissions(relationId, ACL_DELETE);
 
@@ -125,13 +145,23 @@ master_apply_delete_command(PG_FUNCTION_ARGS)
 	deleteCriteria = eval_const_expressions(NULL, whereClause);
 
 	partitionMethod = PartitionMethod(relationId);
-	if ((partitionMethod == DISTRIBUTE_BY_HASH) && (deleteCriteria != NULL))
+	if (partitionMethod == DISTRIBUTE_BY_HASH)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot delete from hash distributed table with this "
+							   "command"),
+						errdetail("Delete statements on hash-partitioned tables "
+								  "are not supported with master_apply_delete_command."),
+						errhint("Use master_modify_multiple_shards command instead.")));
+	}
+	else if (partitionMethod == DISTRIBUTE_BY_NONE)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot delete from distributed table"),
-						errdetail("Delete statements on hash-partitioned tables "
-								  "with where clause is not supported")));
+						errdetail("Delete statements on reference tables "
+								  "are not supported.")));
 	}
+
 
 	CheckDeleteCriteria(deleteCriteria);
 	CheckPartitionColumn(relationId, deleteCriteria);
@@ -174,51 +204,109 @@ master_drop_all_shards(PG_FUNCTION_ARGS)
 	text *schemaNameText = PG_GETARG_TEXT_P(1);
 	text *relationNameText = PG_GETARG_TEXT_P(2);
 
-	char *schemaName = NULL;
-	char *relationName = NULL;
-	bool isTopLevel = true;
 	List *shardIntervalList = NIL;
 	int droppedShardCount = 0;
 
-	PreventTransactionChain(isTopLevel, "DROP distributed table");
+	char *schemaName = text_to_cstring(schemaNameText);
+	char *relationName = text_to_cstring(relationNameText);
 
-	relationName = get_rel_name(relationId);
+	EnsureCoordinator();
 
-	if (relationName != NULL)
-	{
-		/* ensure proper values are used if the table exists */
-		Oid schemaId = get_rel_namespace(relationId);
-		schemaName = get_namespace_name(schemaId);
-
-		/*
-		 * Only allow the owner to drop all shards, this is more akin to DDL
-		 * than DELETE.
-		 */
-		EnsureTableOwner(relationId);
-	}
-	else
-	{
-		/* table has been dropped, rely on user-supplied values */
-		schemaName = text_to_cstring(schemaNameText);
-		relationName = text_to_cstring(relationNameText);
-
-		/*
-		 * Verify that this only is run as superuser - that's how it's used in
-		 * our drop event trigger, and we can't verify permissions for an
-		 * already dropped relation.
-		 */
-		if (!superuser())
-		{
-			ereport(ERROR, (errmsg("cannot drop all shards of a dropped table as "
-								   "non-superuser")));
-		}
-	}
+	CheckTableSchemaNameForDrop(relationId, &schemaName, &relationName);
 
 	shardIntervalList = LoadShardIntervalList(relationId);
 	droppedShardCount = DropShards(relationId, schemaName, relationName,
 								   shardIntervalList);
 
 	PG_RETURN_INT32(droppedShardCount);
+}
+
+
+/*
+ * master_drop_sequences attempts to drop a list of sequences on worker nodes.
+ * The "IF EXISTS" clause is used to permit dropping sequences even if they may not
+ * exist. If the commands fail on the workers, the operation is rolled back.
+ * If ddl propagation (citus.enable_ddl_propagation) is set to off, then the function
+ * returns without doing anything.
+ */
+Datum
+master_drop_sequences(PG_FUNCTION_ARGS)
+{
+	ArrayType *sequenceNamesArray = PG_GETARG_ARRAYTYPE_P(0);
+	ArrayIterator sequenceIterator = NULL;
+	Datum sequenceText = 0;
+	bool isNull = false;
+	StringInfo dropSeqCommand = makeStringInfo();
+	bool coordinator = IsCoordinator();
+
+	/* do nothing if DDL propagation is switched off or this is not the coordinator */
+	if (!EnableDDLPropagation || !coordinator)
+	{
+		PG_RETURN_VOID();
+	}
+
+	/* iterate over sequence names to build single command to DROP them all */
+	sequenceIterator = array_create_iterator(sequenceNamesArray, 0, NULL);
+	while (array_iterate(sequenceIterator, &sequenceText, &isNull))
+	{
+		if (isNull)
+		{
+			ereport(ERROR, (errmsg("unexpected NULL sequence name"),
+							errcode(ERRCODE_INVALID_PARAMETER_VALUE)));
+		}
+
+		/* append command portion if we haven't added any sequence names yet */
+		if (dropSeqCommand->len == 0)
+		{
+			appendStringInfoString(dropSeqCommand, "DROP SEQUENCE IF EXISTS");
+		}
+		else
+		{
+			/* otherwise, add a comma to separate subsequent sequence names */
+			appendStringInfoChar(dropSeqCommand, ',');
+		}
+
+		appendStringInfo(dropSeqCommand, " %s", TextDatumGetCString(sequenceText));
+	}
+
+	if (dropSeqCommand->len != 0)
+	{
+		appendStringInfoString(dropSeqCommand, " CASCADE");
+
+		SendCommandToWorkers(ALL_WORKERS, DISABLE_DDL_PROPAGATION);
+		SendCommandToWorkers(ALL_WORKERS, dropSeqCommand->data);
+	}
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * CheckTableSchemaNameForDrop errors out if the current user does not
+ * have permission to undistribute the given relation, taking into
+ * account that it may be called from the drop trigger. If the table exists,
+ * the function rewrites the given table and schema name.
+ */
+void
+CheckTableSchemaNameForDrop(Oid relationId, char **schemaName, char **tableName)
+{
+	char *tempTableName = get_rel_name(relationId);
+
+	if (tempTableName != NULL)
+	{
+		/* ensure proper values are used if the table exists */
+		Oid schemaId = get_rel_namespace(relationId);
+		(*schemaName) = get_namespace_name(schemaId);
+		(*tableName) = tempTableName;
+
+		EnsureTableOwner(relationId);
+	}
+	else if (!superuser())
+	{
+		/* table does not exist, must be called from drop trigger */
+		ereport(ERROR, (errmsg("cannot drop distributed table metadata as a "
+							   "non-superuser")));
+	}
 }
 
 
@@ -237,35 +325,36 @@ DropShards(Oid relationId, char *schemaName, char *relationName,
 	ListCell *shardIntervalCell = NULL;
 	int droppedShardCount = 0;
 
+	if (XactModificationLevel != XACT_MODIFICATION_NONE)
+	{
+		ereport(ERROR, (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+						errmsg("shard drop operations must not appear in "
+							   "transaction blocks containing other distributed "
+							   "modifications")));
+	}
+
+	BeginOrContinueCoordinatedTransaction();
+
+	/* At this point we intentionally decided to not use 2PC for reference tables */
+	if (MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC)
+	{
+		CoordinatedTransactionUse2PC();
+	}
+
 	foreach(shardIntervalCell, deletableShardIntervalList)
 	{
 		List *shardPlacementList = NIL;
-		List *droppedPlacementList = NIL;
-		List *lingeringPlacementList = NIL;
 		ListCell *shardPlacementCell = NULL;
-		ListCell *droppedPlacementCell = NULL;
-		ListCell *lingeringPlacementCell = NULL;
 		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 		uint64 shardId = shardInterval->shardId;
-		char *shardAlias = NULL;
 		char *quotedShardName = NULL;
-		StringInfo shardName = makeStringInfo();
+		char *shardRelationName = pstrdup(relationName);
 
 		Assert(shardInterval->relationId == relationId);
 
-		/* if shard doesn't have an alias, extend regular table name */
-		shardAlias = LoadShardAlias(relationId, shardId);
-		if (shardAlias == NULL)
-		{
-			appendStringInfoString(shardName, relationName);
-			AppendShardIdToStringInfo(shardName, shardId);
-		}
-		else
-		{
-			appendStringInfoString(shardName, shardAlias);
-		}
-
-		quotedShardName = quote_qualified_identifier(schemaName, shardName->data);
+		/* Build shard relation name. */
+		AppendShardIdToName(&shardRelationName, shardId);
+		quotedShardName = quote_qualified_identifier(schemaName, shardRelationName);
 
 		shardPlacementList = ShardPlacementList(shardId);
 		foreach(shardPlacementCell, shardPlacementList)
@@ -274,8 +363,10 @@ DropShards(Oid relationId, char *schemaName, char *relationName,
 				(ShardPlacement *) lfirst(shardPlacementCell);
 			char *workerName = shardPlacement->nodeName;
 			uint32 workerPort = shardPlacement->nodePort;
-			bool dropSuccessful = false;
 			StringInfo workerDropQuery = makeStringInfo();
+			MultiConnection *connection = NULL;
+			uint32 connectionFlags = FOR_DDL;
+			char *extensionOwner = CitusExtensionOwnerName();
 
 			char storageType = shardInterval->storageType;
 			if (storageType == SHARD_STORAGE_TABLE)
@@ -290,57 +381,34 @@ DropShards(Oid relationId, char *schemaName, char *relationName,
 								 quotedShardName);
 			}
 
-			dropSuccessful = ExecuteRemoteCommand(workerName, workerPort,
-												  workerDropQuery);
-			if (dropSuccessful)
-			{
-				droppedPlacementList = lappend(droppedPlacementList, shardPlacement);
-			}
-			else
-			{
-				lingeringPlacementList = lappend(lingeringPlacementList, shardPlacement);
-			}
-		}
+			connection = GetNodeUserDatabaseConnection(connectionFlags, workerName,
+													   workerPort, extensionOwner, NULL);
 
-		/* make sure we don't process cancel signals */
-		HOLD_INTERRUPTS();
+			RemoteTransactionBeginIfNecessary(connection);
 
-		foreach(droppedPlacementCell, droppedPlacementList)
-		{
-			ShardPlacement *placement = (ShardPlacement *) lfirst(droppedPlacementCell);
-			char *workerName = placement->nodeName;
-			uint32 workerPort = placement->nodePort;
+			if (PQstatus(connection->pgConn) != CONNECTION_OK)
+			{
+				uint64 placementId = shardPlacement->placementId;
+
+				ereport(WARNING, (errmsg("could not connect to shard \"%s\" on node "
+										 "\"%s:%u\"", shardRelationName, workerName,
+										 workerPort),
+								  errdetail("Marking this shard placement for "
+											"deletion")));
+
+				UpdateShardPlacementState(placementId, FILE_TO_DELETE);
+
+				continue;
+			}
+
+			MarkRemoteTransactionCritical(connection);
+
+			ExecuteCriticalRemoteCommand(connection, workerDropQuery->data);
 
 			DeleteShardPlacementRow(shardId, workerName, workerPort);
-		}
-
-		/* mark shard placements that we couldn't drop as to be deleted */
-		foreach(lingeringPlacementCell, lingeringPlacementList)
-		{
-			ShardPlacement *placement = (ShardPlacement *) lfirst(lingeringPlacementCell);
-			char *workerName = placement->nodeName;
-			uint32 workerPort = placement->nodePort;
-			uint64 oldShardLength = placement->shardLength;
-
-			DeleteShardPlacementRow(shardId, workerName, workerPort);
-			InsertShardPlacementRow(shardId, FILE_TO_DELETE, oldShardLength,
-									workerName, workerPort);
-
-			ereport(WARNING, (errmsg("could not delete shard \"%s\" on node \"%s:%u\"",
-									 shardName->data, workerName, workerPort),
-							  errdetail("Marking this shard placement for deletion")));
 		}
 
 		DeleteShardRow(shardId);
-
-		if (QueryCancelPending)
-		{
-			ereport(WARNING, (errmsg("cancel requests are ignored during shard "
-									 "deletion")));
-			QueryCancelPending = false;
-		}
-
-		RESUME_INTERRUPTS();
 	}
 
 	droppedShardCount = list_length(deletableShardIntervalList);
@@ -494,63 +562,4 @@ ShardsMatchingDeleteCriteria(Oid relationId, List *shardIntervalList,
 	}
 
 	return dropShardIntervalList;
-}
-
-
-/*
- * ExecuteRemoteCommand executes the given SQL command. This command could be an
- * Insert, Update, or Delete statement, or a utility command that returns
- * nothing. If query is successfuly executed, the function returns true.
- * Otherwise, it returns false.
- */
-static bool
-ExecuteRemoteCommand(const char *nodeName, uint32 nodePort, StringInfo queryString)
-{
-	char *nodeDatabase = get_database_name(MyDatabaseId);
-	int32 connectionId = -1;
-	QueryStatus queryStatus = CLIENT_INVALID_QUERY;
-	bool querySent = false;
-	bool queryReady = false;
-	bool queryDone = false;
-
-	connectionId = MultiClientConnect(nodeName, nodePort, nodeDatabase, NULL);
-	if (connectionId == INVALID_CONNECTION_ID)
-	{
-		return false;
-	}
-
-	querySent = MultiClientSendQuery(connectionId, queryString->data);
-	if (!querySent)
-	{
-		MultiClientDisconnect(connectionId);
-		return false;
-	}
-
-	while (!queryReady)
-	{
-		ResultStatus resultStatus = MultiClientResultStatus(connectionId);
-		if (resultStatus == CLIENT_RESULT_READY)
-		{
-			queryReady = true;
-		}
-		else if (resultStatus == CLIENT_RESULT_BUSY)
-		{
-			long sleepIntervalPerCycle = RemoteTaskCheckInterval * 1000L;
-			pg_usleep(sleepIntervalPerCycle);
-		}
-		else
-		{
-			MultiClientDisconnect(connectionId);
-			return false;
-		}
-	}
-
-	queryStatus = MultiClientQueryStatus(connectionId);
-	if (queryStatus == CLIENT_QUERY_DONE)
-	{
-		queryDone = true;
-	}
-
-	MultiClientDisconnect(connectionId);
-	return queryDone;
 }

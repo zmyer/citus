@@ -23,7 +23,11 @@
 #include "catalog/namespace.h"
 #include "commands/copy.h"
 #include "commands/dbcommands.h"
+#include "commands/extension.h"
+#include "commands/sequence.h"
+#include "distributed/citus_ruleutils.h"
 #include "distributed/master_protocol.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_server_executor.h"
@@ -54,24 +58,28 @@ static void DeleteFile(const char *filename);
 static void FetchTableCommon(text *tableName, uint64 remoteTableSize,
 							 ArrayType *nodeNameObject, ArrayType *nodePortObject,
 							 bool (*FetchTableFunction)(const char *, uint32,
-														StringInfo));
+														const char *));
 static uint64 LocalTableSize(Oid relationId);
-static uint64 ExtractShardId(StringInfo tableName);
+static uint64 ExtractShardId(const char *tableName);
 static bool FetchRegularTable(const char *nodeName, uint32 nodePort,
-							  StringInfo tableName);
+							  const char *tableName);
 static bool FetchForeignTable(const char *nodeName, uint32 nodePort,
-							  StringInfo tableName);
+							  const char *tableName);
 static const char * RemoteTableOwner(const char *nodeName, uint32 nodePort,
-									 StringInfo tableName);
+									 const char *tableName);
 static StringInfo ForeignFilePath(const char *nodeName, uint32 nodePort,
-								  StringInfo tableName);
+								  const char *tableName);
 static bool check_log_statement(List *stmt_list);
+static void AlterSequenceMinMax(Oid sequenceId, char *schemaName, char *sequenceName);
+static void SetDefElemArg(AlterSeqStmt *statement, const char *name, Node *arg);
 
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(worker_fetch_partition_file);
 PG_FUNCTION_INFO_V1(worker_fetch_query_results_file);
 PG_FUNCTION_INFO_V1(worker_apply_shard_ddl_command);
+PG_FUNCTION_INFO_V1(worker_apply_inter_shard_ddl_command);
+PG_FUNCTION_INFO_V1(worker_apply_sequence_command);
 PG_FUNCTION_INFO_V1(worker_fetch_regular_table);
 PG_FUNCTION_INFO_V1(worker_fetch_foreign_file);
 PG_FUNCTION_INFO_V1(worker_append_table_to_shard);
@@ -400,15 +408,92 @@ Datum
 worker_apply_shard_ddl_command(PG_FUNCTION_ARGS)
 {
 	uint64 shardId = PG_GETARG_INT64(0);
-	text *ddlCommandText = PG_GETARG_TEXT_P(1);
+	text *schemaNameText = PG_GETARG_TEXT_P(1);
+	text *ddlCommandText = PG_GETARG_TEXT_P(2);
 
+	char *schemaName = text_to_cstring(schemaNameText);
 	const char *ddlCommand = text_to_cstring(ddlCommandText);
 	Node *ddlCommandNode = ParseTreeNode(ddlCommand);
 
 	/* extend names in ddl command and apply extended command */
-	RelayEventExtendNames(ddlCommandNode, shardId);
+	RelayEventExtendNames(ddlCommandNode, schemaName, shardId);
 	ProcessUtility(ddlCommandNode, ddlCommand, PROCESS_UTILITY_TOPLEVEL,
 				   NULL, None_Receiver, NULL);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * worker_apply_inter_shard_ddl_command extends table, index, or constraint names in
+ * the given DDL command. The function then applies this extended DDL command
+ * against the database.
+ */
+Datum
+worker_apply_inter_shard_ddl_command(PG_FUNCTION_ARGS)
+{
+	uint64 leftShardId = PG_GETARG_INT64(0);
+	text *leftShardSchemaNameText = PG_GETARG_TEXT_P(1);
+	uint64 rightShardId = PG_GETARG_INT64(2);
+	text *rightShardSchemaNameText = PG_GETARG_TEXT_P(3);
+	text *ddlCommandText = PG_GETARG_TEXT_P(4);
+
+	char *leftShardSchemaName = text_to_cstring(leftShardSchemaNameText);
+	char *rightShardSchemaName = text_to_cstring(rightShardSchemaNameText);
+	const char *ddlCommand = text_to_cstring(ddlCommandText);
+	Node *ddlCommandNode = ParseTreeNode(ddlCommand);
+
+	/* extend names in ddl command and apply extended command */
+	RelayEventExtendNamesForInterShardCommands(ddlCommandNode, leftShardId,
+											   leftShardSchemaName, rightShardId,
+											   rightShardSchemaName);
+	ProcessUtility(ddlCommandNode, ddlCommand, PROCESS_UTILITY_TOPLEVEL, NULL,
+				   None_Receiver, NULL);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * worker_apply_sequence_command takes a CREATE SEQUENCE command string, runs the
+ * CREATE SEQUENCE command then creates and runs an ALTER SEQUENCE statement
+ * which adjusts the minvalue and maxvalue of the sequence such that the sequence
+ * creates globally unique values.
+ */
+Datum
+worker_apply_sequence_command(PG_FUNCTION_ARGS)
+{
+	text *commandText = PG_GETARG_TEXT_P(0);
+	const char *commandString = text_to_cstring(commandText);
+	Node *commandNode = ParseTreeNode(commandString);
+	CreateSeqStmt *createSequenceStatement = NULL;
+	char *sequenceName = NULL;
+	char *sequenceSchema = NULL;
+	Oid sequenceRelationId = InvalidOid;
+
+	NodeTag nodeType = nodeTag(commandNode);
+	if (nodeType != T_CreateSeqStmt)
+	{
+		ereport(ERROR,
+				(errmsg("must call worker_apply_sequence_command with a CREATE"
+						" SEQUENCE command string")));
+	}
+
+	/* run the CREATE SEQUENCE command */
+	ProcessUtility(commandNode, commandString, PROCESS_UTILITY_TOPLEVEL,
+				   NULL, None_Receiver, NULL);
+
+	createSequenceStatement = (CreateSeqStmt *) commandNode;
+
+	sequenceName = createSequenceStatement->sequence->relname;
+	sequenceSchema = createSequenceStatement->sequence->schemaname;
+	createSequenceStatement = (CreateSeqStmt *) commandNode;
+
+	sequenceRelationId = RangeVarGetRelid(createSequenceStatement->sequence,
+										  AccessShareLock, false);
+	Assert(sequenceRelationId != InvalidOid);
+
+	AlterSequenceMinMax(sequenceRelationId, sequenceSchema, sequenceName);
 
 	PG_RETURN_VOID();
 }
@@ -431,8 +516,8 @@ worker_fetch_regular_table(PG_FUNCTION_ARGS)
 	 * Run common logic to fetch the remote table, and use the provided function
 	 * pointer to perform the actual table fetching.
 	 */
-	FetchTableCommon(regularTableName, generationStamp,
-					 nodeNameObject, nodePortObject, &FetchRegularTable);
+	FetchTableCommon(regularTableName, generationStamp, nodeNameObject, nodePortObject,
+					 &FetchRegularTable);
 
 	PG_RETURN_VOID();
 }
@@ -455,8 +540,8 @@ worker_fetch_foreign_file(PG_FUNCTION_ARGS)
 	 * Run common logic to fetch the remote table, and use the provided function
 	 * pointer to perform the actual table fetching.
 	 */
-	FetchTableCommon(foreignTableName, foreignFileSize,
-					 nodeNameObject, nodePortObject, &FetchForeignTable);
+	FetchTableCommon(foreignTableName, foreignFileSize, nodeNameObject, nodePortObject,
+					 &FetchForeignTable);
 
 	PG_RETURN_VOID();
 }
@@ -471,14 +556,15 @@ worker_fetch_foreign_file(PG_FUNCTION_ARGS)
 static void
 FetchTableCommon(text *tableNameText, uint64 remoteTableSize,
 				 ArrayType *nodeNameObject, ArrayType *nodePortObject,
-				 bool (*FetchTableFunction)(const char *, uint32, StringInfo))
+				 bool (*FetchTableFunction)(const char *, uint32, const char *))
 {
-	StringInfo tableName = NULL;
-	char *tableNameCString = NULL;
 	uint64 shardId = INVALID_SHARD_ID;
 	Oid relationId = InvalidOid;
+	List *relationNameList = NIL;
+	RangeVar *relation = NULL;
 	uint32 nodeIndex = 0;
 	bool tableFetched = false;
+	char *tableName = text_to_cstring(tableNameText);
 
 	Datum *nodeNameArray = DeconstructArrayObject(nodeNameObject);
 	Datum *nodePortArray = DeconstructArrayObject(nodePortObject);
@@ -492,10 +578,6 @@ FetchTableCommon(text *tableNameText, uint64 remoteTableSize,
 							   " do not match", nodeNameCount, nodePortCount)));
 	}
 
-	tableName = makeStringInfo();
-	tableNameCString = text_to_cstring(tableNameText);
-	appendStringInfoString(tableName, tableNameCString);
-
 	/*
 	 * We lock on the shardId, but do not unlock. When the function returns, and
 	 * the transaction for this function commits, this lock will automatically
@@ -505,8 +587,11 @@ FetchTableCommon(text *tableNameText, uint64 remoteTableSize,
 	shardId = ExtractShardId(tableName);
 	LockShardResource(shardId, AccessExclusiveLock);
 
+	relationNameList = textToQualifiedNameList(tableNameText);
+	relation = makeRangeVarFromNameList(relationNameList);
+	relationId = RangeVarGetRelid(relation, NoLock, true);
+
 	/* check if we already fetched the table */
-	relationId = RelnameGetRelid(tableName->data);
 	if (relationId != InvalidOid)
 	{
 		uint64 localTableSize = 0;
@@ -565,7 +650,7 @@ FetchTableCommon(text *tableNameText, uint64 remoteTableSize,
 	/* error out if we tried all nodes and could not fetch the table */
 	if (!tableFetched)
 	{
-		ereport(ERROR, (errmsg("could not fetch relation: \"%s\"", tableName->data)));
+		ereport(ERROR, (errmsg("could not fetch relation: \"%s\"", tableName)));
 	}
 }
 
@@ -590,8 +675,15 @@ LocalTableSize(Oid relationId)
 		bool cstoreTable = CStoreTable(relationId);
 		if (cstoreTable)
 		{
+			/* extract schema name of cstore */
+			Oid cstoreId = get_extension_oid(CSTORE_FDW_NAME, false);
+			Oid cstoreSchemaOid = get_extension_schema(cstoreId);
+			const char *cstoreSchemaName = get_namespace_name(cstoreSchemaOid);
+
 			const int tableSizeArgumentCount = 1;
-			Oid tableSizeFunctionOid = FunctionOid(CSTORE_TABLE_SIZE_FUNCTION_NAME,
+
+			Oid tableSizeFunctionOid = FunctionOid(cstoreSchemaName,
+												   CSTORE_TABLE_SIZE_FUNCTION_NAME,
 												   tableSizeArgumentCount);
 			Datum tableSizeDatum = OidFunctionCall1(tableSizeFunctionOid,
 													relationIdDatum);
@@ -635,18 +727,18 @@ LocalTableSize(Oid relationId)
 
 /* Extracts shard id from the given table name, and returns it. */
 static uint64
-ExtractShardId(StringInfo tableName)
+ExtractShardId(const char *tableName)
 {
 	uint64 shardId = 0;
 	char *shardIdString = NULL;
 	char *shardIdStringEnd = NULL;
 
 	/* find the last underscore and increment for shardId string */
-	shardIdString = strrchr(tableName->data, SHARD_NAME_SEPARATOR);
+	shardIdString = strrchr(tableName, SHARD_NAME_SEPARATOR);
 	if (shardIdString == NULL)
 	{
 		ereport(ERROR, (errmsg("could not extract shardId from table name \"%s\"",
-							   tableName->data)));
+							   tableName)));
 	}
 	shardIdString++;
 
@@ -657,7 +749,7 @@ ExtractShardId(StringInfo tableName)
 	if (errno != 0 || (*shardIdStringEnd != '\0'))
 	{
 		ereport(ERROR, (errmsg("could not extract shardId from table name \"%s\"",
-							   tableName->data)));
+							   tableName)));
 	}
 #else
 	ereport(ERROR, (errmsg("could not extract shardId from table name"),
@@ -677,7 +769,7 @@ ExtractShardId(StringInfo tableName)
  * false. On other types of failures, the function errors out.
  */
 static bool
-FetchRegularTable(const char *nodeName, uint32 nodePort, StringInfo tableName)
+FetchRegularTable(const char *nodeName, uint32 nodePort, const char *tableName)
 {
 	StringInfo localFilePath = NULL;
 	StringInfo remoteCopyCommand = NULL;
@@ -687,13 +779,12 @@ FetchRegularTable(const char *nodeName, uint32 nodePort, StringInfo tableName)
 	RangeVar *localTable = NULL;
 	uint64 shardId = 0;
 	bool received = false;
-	char *quotedTableName = NULL;
 	StringInfo queryString = NULL;
-	const char *schemaName = NULL;
 	const char *tableOwner = NULL;
 	Oid tableOwnerId = InvalidOid;
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
+	List *tableNameList = NIL;
 
 	/* copy remote table's data to this node in an idempotent manner */
 	shardId = ExtractShardId(tableName);
@@ -701,9 +792,8 @@ FetchRegularTable(const char *nodeName, uint32 nodePort, StringInfo tableName)
 	appendStringInfo(localFilePath, "base/%s/%s" UINT64_FORMAT,
 					 PG_JOB_CACHE_DIR, TABLE_FILE_PREFIX, shardId);
 
-	quotedTableName = quote_qualified_identifier(schemaName, tableName->data);
 	remoteCopyCommand = makeStringInfo();
-	appendStringInfo(remoteCopyCommand, COPY_OUT_COMMAND, quotedTableName);
+	appendStringInfo(remoteCopyCommand, COPY_OUT_COMMAND, tableName);
 
 	received = ReceiveRegularFile(nodeName, nodePort, remoteCopyCommand, localFilePath);
 	if (!received)
@@ -752,11 +842,12 @@ FetchRegularTable(const char *nodeName, uint32 nodePort, StringInfo tableName)
 	 * directly calling DoCopy() because some extensions (e.g. cstore_fdw) hook
 	 * into process utility to provide their custom COPY behavior.
 	 */
-	localTable = makeRangeVar((char *) schemaName, tableName->data, -1);
+	tableNameList = stringToQualifiedNameList(tableName);
+	localTable = makeRangeVarFromNameList(tableNameList);
 	localCopyCommand = CopyStatement(localTable, localFilePath->data);
 
 	queryString = makeStringInfo();
-	appendStringInfo(queryString, COPY_IN_COMMAND, quotedTableName, localFilePath->data);
+	appendStringInfo(queryString, COPY_IN_COMMAND, tableName, localFilePath->data);
 
 	ProcessUtility((Node *) localCopyCommand, queryString->data,
 				   PROCESS_UTILITY_TOPLEVEL, NULL, None_Receiver, NULL);
@@ -777,7 +868,7 @@ FetchRegularTable(const char *nodeName, uint32 nodePort, StringInfo tableName)
  * commands against the local database, the function errors out.
  */
 static bool
-FetchForeignTable(const char *nodeName, uint32 nodePort, StringInfo tableName)
+FetchForeignTable(const char *nodeName, uint32 nodePort, const char *tableName)
 {
 	StringInfo localFilePath = NULL;
 	StringInfo remoteFilePath = NULL;
@@ -787,9 +878,14 @@ FetchForeignTable(const char *nodeName, uint32 nodePort, StringInfo tableName)
 	List *ddlCommandList = NIL;
 	ListCell *ddlCommandCell = NULL;
 
-	/* fetch foreign file to this node in an idempotent manner */
+	/*
+	 * Fetch a foreign file to this node in an idempotent manner. It's OK that
+	 * this file name lacks the schema, as the table name will have a shard id
+	 * attached to it, which is unique (so conflicts are avoided even if two
+	 * tables in different schemas have the same name).
+	 */
 	localFilePath = makeStringInfo();
-	appendStringInfo(localFilePath, FOREIGN_CACHED_FILE_PATH, tableName->data);
+	appendStringInfo(localFilePath, FOREIGN_CACHED_FILE_PATH, tableName);
 
 	remoteFilePath = ForeignFilePath(nodeName, nodePort, tableName);
 	if (remoteFilePath == NULL)
@@ -814,8 +910,8 @@ FetchForeignTable(const char *nodeName, uint32 nodePort, StringInfo tableName)
 	}
 
 	alterTableCommand = makeStringInfo();
-	appendStringInfo(alterTableCommand, SET_FOREIGN_TABLE_FILENAME,
-					 tableName->data, localFilePath->data);
+	appendStringInfo(alterTableCommand, SET_FOREIGN_TABLE_FILENAME, tableName,
+					 localFilePath->data);
 
 	ddlCommandList = lappend(ddlCommandList, alterTableCommand);
 
@@ -842,15 +938,14 @@ FetchForeignTable(const char *nodeName, uint32 nodePort, StringInfo tableName)
  * the table. If an error occurs during fetching, return NULL.
  */
 static const char *
-RemoteTableOwner(const char *nodeName, uint32 nodePort, StringInfo tableName)
+RemoteTableOwner(const char *nodeName, uint32 nodePort, const char *tableName)
 {
 	List *ownerList = NIL;
 	StringInfo queryString = NULL;
-	const char *escapedTableName = quote_literal_cstr(tableName->data);
 	StringInfo relationOwner;
 
 	queryString = makeStringInfo();
-	appendStringInfo(queryString, GET_TABLE_OWNER, escapedTableName);
+	appendStringInfo(queryString, GET_TABLE_OWNER, tableName);
 
 	ownerList = ExecuteRemoteQuery(nodeName, nodePort, NULL, queryString);
 	if (list_length(ownerList) != 1)
@@ -870,13 +965,13 @@ RemoteTableOwner(const char *nodeName, uint32 nodePort, StringInfo tableName)
  * the function returns an empty list.
  */
 List *
-TableDDLCommandList(const char *nodeName, uint32 nodePort, StringInfo tableName)
+TableDDLCommandList(const char *nodeName, uint32 nodePort, const char *tableName)
 {
 	List *ddlCommandList = NIL;
 	StringInfo queryString = NULL;
 
 	queryString = makeStringInfo();
-	appendStringInfo(queryString, GET_TABLE_DDL_EVENTS, tableName->data);
+	appendStringInfo(queryString, GET_TABLE_DDL_EVENTS, tableName);
 
 	ddlCommandList = ExecuteRemoteQuery(nodeName, nodePort, NULL, queryString);
 	return ddlCommandList;
@@ -889,14 +984,14 @@ TableDDLCommandList(const char *nodeName, uint32 nodePort, StringInfo tableName)
  * null.
  */
 static StringInfo
-ForeignFilePath(const char *nodeName, uint32 nodePort, StringInfo tableName)
+ForeignFilePath(const char *nodeName, uint32 nodePort, const char *tableName)
 {
 	List *foreignPathList = NIL;
 	StringInfo foreignPathCommand = NULL;
 	StringInfo foreignPath = NULL;
 
 	foreignPathCommand = makeStringInfo();
-	appendStringInfo(foreignPathCommand, FOREIGN_FILE_PATH_COMMAND, tableName->data);
+	appendStringInfo(foreignPathCommand, FOREIGN_FILE_PATH_COMMAND, tableName);
 
 	foreignPathList = ExecuteRemoteQuery(nodeName, nodePort, NULL, foreignPathCommand);
 	if (foreignPathList != NIL)
@@ -989,6 +1084,65 @@ ExecuteRemoteQuery(const char *nodeName, uint32 nodePort, char *runAsUser,
 
 
 /*
+ * ExecuteRemoteCommand executes the given SQL command. This command could be an
+ * Insert, Update, or Delete statement, or a utility command that returns
+ * nothing. If query is successfuly executed, the function returns true.
+ * Otherwise, it returns false.
+ */
+bool
+ExecuteRemoteCommand(const char *nodeName, uint32 nodePort, StringInfo queryString)
+{
+	char *nodeDatabase = get_database_name(MyDatabaseId);
+	int32 connectionId = -1;
+	QueryStatus queryStatus = CLIENT_INVALID_QUERY;
+	bool querySent = false;
+	bool queryReady = false;
+	bool queryDone = false;
+
+	connectionId = MultiClientConnect(nodeName, nodePort, nodeDatabase, NULL);
+	if (connectionId == INVALID_CONNECTION_ID)
+	{
+		return false;
+	}
+
+	querySent = MultiClientSendQuery(connectionId, queryString->data);
+	if (!querySent)
+	{
+		MultiClientDisconnect(connectionId);
+		return false;
+	}
+
+	while (!queryReady)
+	{
+		ResultStatus resultStatus = MultiClientResultStatus(connectionId);
+		if (resultStatus == CLIENT_RESULT_READY)
+		{
+			queryReady = true;
+		}
+		else if (resultStatus == CLIENT_RESULT_BUSY)
+		{
+			long sleepIntervalPerCycle = RemoteTaskCheckInterval * 1000L;
+			pg_usleep(sleepIntervalPerCycle);
+		}
+		else
+		{
+			MultiClientDisconnect(connectionId);
+			return false;
+		}
+	}
+
+	queryStatus = MultiClientQueryStatus(connectionId);
+	if (queryStatus == CLIENT_QUERY_DONE)
+	{
+		queryDone = true;
+	}
+
+	MultiClientDisconnect(connectionId);
+	return queryDone;
+}
+
+
+/*
  * Parses the given DDL command, and returns the tree node for parsed command.
  */
 Node *
@@ -1048,7 +1202,6 @@ worker_append_table_to_shard(PG_FUNCTION_ARGS)
 	char *sourceTableName = NULL;
 	char *sourceQualifiedName = NULL;
 
-	StringInfo shardNameString = NULL;
 	StringInfo localFilePath = NULL;
 	StringInfo sourceCopyCommand = NULL;
 	CopyStmt *localCopyCommand = NULL;
@@ -1068,10 +1221,7 @@ worker_append_table_to_shard(PG_FUNCTION_ARGS)
 	 * the transaction for this function commits, this lock will automatically
 	 * be released. This ensures appends to a shard happen in a serial manner.
 	 */
-	shardNameString = makeStringInfo();
-	appendStringInfoString(shardNameString, shardTableName);
-
-	shardId = ExtractShardId(shardNameString);
+	shardId = ExtractShardId(shardTableName);
 	LockShardResource(shardId, AccessExclusiveLock);
 
 	/* copy remote table's data to this node */
@@ -1143,4 +1293,96 @@ check_log_statement(List *statementList)
 	}
 
 	return false;
+}
+
+
+/*
+ * AlterSequenceMinMax arranges the min and max value of the given sequence. The function
+ * creates ALTER SEQUENCE statemenet which sets the start, minvalue and maxvalue of
+ * the given sequence.
+ *
+ * The function provides the uniqueness by shifting the start of the sequence by
+ * GetLocalGroupId() << 48 + 1 and sets a maxvalue which stops it from passing out any
+ * values greater than: (GetLocalGroupID() + 1) << 48.
+ *
+ * This is to ensure every group of workers passes out values from a unique range,
+ * and therefore that all values generated for the sequence are globally unique.
+ */
+static void
+AlterSequenceMinMax(Oid sequenceId, char *schemaName, char *sequenceName)
+{
+	Form_pg_sequence sequenceData = pg_get_sequencedef(sequenceId);
+	int64 startValue = 0;
+	int64 maxValue = 0;
+
+	/* calculate min/max values that the sequence can generate in this worker */
+	startValue = (((int64) GetLocalGroupId()) << 48) + 1;
+	maxValue = startValue + ((int64) 1 << 48);
+
+	/*
+	 * We alter the sequence if the previously set min and max values are not equal to
+	 * their correct values. This happens when the sequence has been created
+	 * during shard, before the current worker having the metadata.
+	 */
+	if (sequenceData->min_value != startValue || sequenceData->max_value != maxValue)
+	{
+		StringInfo startNumericString = makeStringInfo();
+		StringInfo maxNumericString = makeStringInfo();
+		Node *startFloatArg = NULL;
+		Node *maxFloatArg = NULL;
+		AlterSeqStmt *alterSequenceStatement = makeNode(AlterSeqStmt);
+		const char *dummyString = "-";
+
+		alterSequenceStatement->sequence = makeRangeVar(schemaName, sequenceName, -1);
+
+		/*
+		 * DefElem->arg can only hold literal ints up to int4, in order to represent
+		 * larger numbers we need to construct a float represented as a string.
+		 */
+		appendStringInfo(startNumericString, "%lu", startValue);
+		startFloatArg = (Node *) makeFloat(startNumericString->data);
+
+		appendStringInfo(maxNumericString, "%lu", maxValue);
+		maxFloatArg = (Node *) makeFloat(maxNumericString->data);
+
+		SetDefElemArg(alterSequenceStatement, "start", startFloatArg);
+		SetDefElemArg(alterSequenceStatement, "minvalue", startFloatArg);
+		SetDefElemArg(alterSequenceStatement, "maxvalue", maxFloatArg);
+
+		SetDefElemArg(alterSequenceStatement, "restart", startFloatArg);
+
+		/* since the command is an AlterSeqStmt, a dummy command string works fine */
+		ProcessUtility((Node *) alterSequenceStatement, dummyString,
+					   PROCESS_UTILITY_TOPLEVEL, NULL, None_Receiver, NULL);
+	}
+}
+
+
+/*
+ * SetDefElemArg scans through all the DefElem's of an AlterSeqStmt and
+ * and sets the arg of the one with a defname of name to arg.
+ *
+ * If a DefElem with the given defname does not exist it is created and
+ * added to the AlterSeqStmt.
+ */
+static void
+SetDefElemArg(AlterSeqStmt *statement, const char *name, Node *arg)
+{
+	DefElem *defElem = NULL;
+	ListCell *optionCell = NULL;
+
+	foreach(optionCell, statement->options)
+	{
+		defElem = (DefElem *) lfirst(optionCell);
+
+		if (strcmp(defElem->defname, name) == 0)
+		{
+			pfree(defElem->arg);
+			defElem->arg = arg;
+			return;
+		}
+	}
+
+	defElem = makeDefElem((char *) name, arg);
+	statement->options = lappend(statement->options, defElem);
 }

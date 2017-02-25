@@ -65,49 +65,69 @@ SELECT master_create_empty_shard('index_test_append');
 --
 -- Verify that we can create different types of indexes
 CREATE INDEX lineitem_orderkey_index ON lineitem (l_orderkey);
+NOTICE:  using one-phase commit for distributed DDL commands
+HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 CREATE INDEX lineitem_partkey_desc_index ON lineitem (l_partkey DESC);
 CREATE INDEX lineitem_partial_index ON lineitem (l_shipdate)
 	WHERE l_shipdate < '1995-01-01';
+CREATE INDEX lineitem_colref_index ON lineitem (record_ne(lineitem.*, NULL));
 SET client_min_messages = ERROR; -- avoid version dependant warning about WAL
 CREATE INDEX lineitem_orderkey_hash_index ON lineitem USING hash (l_partkey);
 CREATE UNIQUE INDEX index_test_range_index_a ON index_test_range(a);
 CREATE UNIQUE INDEX index_test_range_index_a_b ON index_test_range(a,b);
 CREATE UNIQUE INDEX index_test_hash_index_a ON index_test_hash(a);
 CREATE UNIQUE INDEX index_test_hash_index_a_b ON index_test_hash(a,b);
+CREATE UNIQUE INDEX index_test_hash_index_a_b_partial ON index_test_hash(a,b) WHERE c IS NOT NULL;
+CREATE UNIQUE INDEX index_test_range_index_a_b_partial ON index_test_range(a,b) WHERE c IS NOT NULL;
 RESET client_min_messages;
+-- Verify that we handle if not exists statements correctly
+CREATE INDEX lineitem_orderkey_index on lineitem(l_orderkey);
+ERROR:  relation "lineitem_orderkey_index" already exists
+CREATE INDEX IF NOT EXISTS lineitem_orderkey_index on lineitem(l_orderkey);
+NOTICE:  relation "lineitem_orderkey_index" already exists, skipping
+CREATE INDEX IF NOT EXISTS lineitem_orderkey_index_new on lineitem(l_orderkey);
+-- Verify if not exists behavior with an index with same name on a different table
+CREATE INDEX lineitem_orderkey_index on index_test_hash(a);
+ERROR:  relation "lineitem_orderkey_index" already exists
+CREATE INDEX IF NOT EXISTS lineitem_orderkey_index on index_test_hash(a);
+NOTICE:  relation "lineitem_orderkey_index" already exists, skipping
 -- Verify that all indexes got created on the master node and one of the workers
 SELECT * FROM pg_indexes WHERE tablename = 'lineitem' or tablename like 'index_test_%' ORDER BY indexname;
- schemaname |    tablename     |          indexname           | tablespace |                                                     indexdef                                                     
-------------+------------------+------------------------------+------------+------------------------------------------------------------------------------------------------------------------
- public     | index_test_hash  | index_test_hash_index_a      |            | CREATE UNIQUE INDEX index_test_hash_index_a ON index_test_hash USING btree (a)
- public     | index_test_hash  | index_test_hash_index_a_b    |            | CREATE UNIQUE INDEX index_test_hash_index_a_b ON index_test_hash USING btree (a, b)
- public     | index_test_range | index_test_range_index_a     |            | CREATE UNIQUE INDEX index_test_range_index_a ON index_test_range USING btree (a)
- public     | index_test_range | index_test_range_index_a_b   |            | CREATE UNIQUE INDEX index_test_range_index_a_b ON index_test_range USING btree (a, b)
- public     | lineitem         | lineitem_orderkey_hash_index |            | CREATE INDEX lineitem_orderkey_hash_index ON lineitem USING hash (l_partkey)
- public     | lineitem         | lineitem_orderkey_index      |            | CREATE INDEX lineitem_orderkey_index ON lineitem USING btree (l_orderkey)
- public     | lineitem         | lineitem_partial_index       |            | CREATE INDEX lineitem_partial_index ON lineitem USING btree (l_shipdate) WHERE (l_shipdate < '01-01-1995'::date)
- public     | lineitem         | lineitem_partkey_desc_index  |            | CREATE INDEX lineitem_partkey_desc_index ON lineitem USING btree (l_partkey DESC)
- public     | lineitem         | lineitem_pkey                |            | CREATE UNIQUE INDEX lineitem_pkey ON lineitem USING btree (l_orderkey, l_linenumber)
- public     | lineitem         | lineitem_time_index          |            | CREATE INDEX lineitem_time_index ON lineitem USING btree (l_shipdate)
-(10 rows)
+ schemaname |    tablename     |             indexname              | tablespace |                                                      indexdef                                                       
+------------+------------------+------------------------------------+------------+---------------------------------------------------------------------------------------------------------------------
+ public     | index_test_hash  | index_test_hash_index_a            |            | CREATE UNIQUE INDEX index_test_hash_index_a ON index_test_hash USING btree (a)
+ public     | index_test_hash  | index_test_hash_index_a_b          |            | CREATE UNIQUE INDEX index_test_hash_index_a_b ON index_test_hash USING btree (a, b)
+ public     | index_test_hash  | index_test_hash_index_a_b_partial  |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_partial ON index_test_hash USING btree (a, b) WHERE (c IS NOT NULL)
+ public     | index_test_range | index_test_range_index_a           |            | CREATE UNIQUE INDEX index_test_range_index_a ON index_test_range USING btree (a)
+ public     | index_test_range | index_test_range_index_a_b         |            | CREATE UNIQUE INDEX index_test_range_index_a_b ON index_test_range USING btree (a, b)
+ public     | index_test_range | index_test_range_index_a_b_partial |            | CREATE UNIQUE INDEX index_test_range_index_a_b_partial ON index_test_range USING btree (a, b) WHERE (c IS NOT NULL)
+ public     | lineitem         | lineitem_colref_index              |            | CREATE INDEX lineitem_colref_index ON lineitem USING btree (record_ne(lineitem.*, NULL::record))
+ public     | lineitem         | lineitem_orderkey_hash_index       |            | CREATE INDEX lineitem_orderkey_hash_index ON lineitem USING hash (l_partkey)
+ public     | lineitem         | lineitem_orderkey_index            |            | CREATE INDEX lineitem_orderkey_index ON lineitem USING btree (l_orderkey)
+ public     | lineitem         | lineitem_orderkey_index_new        |            | CREATE INDEX lineitem_orderkey_index_new ON lineitem USING btree (l_orderkey)
+ public     | lineitem         | lineitem_partial_index             |            | CREATE INDEX lineitem_partial_index ON lineitem USING btree (l_shipdate) WHERE (l_shipdate < '01-01-1995'::date)
+ public     | lineitem         | lineitem_partkey_desc_index        |            | CREATE INDEX lineitem_partkey_desc_index ON lineitem USING btree (l_partkey DESC)
+ public     | lineitem         | lineitem_pkey                      |            | CREATE UNIQUE INDEX lineitem_pkey ON lineitem USING btree (l_orderkey, l_linenumber)
+ public     | lineitem         | lineitem_time_index                |            | CREATE INDEX lineitem_time_index ON lineitem USING btree (l_shipdate)
+(14 rows)
 
 \c - - - :worker_1_port
 SELECT count(*) FROM pg_indexes WHERE tablename = (SELECT relname FROM pg_class WHERE relname LIKE 'lineitem%' ORDER BY relname LIMIT 1);
  count 
 -------
-     6
+     8
 (1 row)
 
 SELECT count(*) FROM pg_indexes WHERE tablename LIKE 'index_test_hash%';
  count 
 -------
-    16
+    24
 (1 row)
 
 SELECT count(*) FROM pg_indexes WHERE tablename LIKE 'index_test_range%';
  count 
 -------
-     4
+     6
 (1 row)
 
 SELECT count(*) FROM pg_indexes WHERE tablename LIKE 'index_test_append%';
@@ -126,7 +146,11 @@ CREATE INDEX try_index ON lineitem (l_orderkey) TABLESPACE newtablespace;
 ERROR:  specifying tablespaces with CREATE INDEX statements is currently unsupported
 CREATE UNIQUE INDEX try_unique_range_index ON index_test_range(b);
 ERROR:  creating unique indexes on non-partition columns is currently unsupported
+CREATE UNIQUE INDEX try_unique_range_index_partial ON index_test_range(b) WHERE c IS NOT NULL;
+ERROR:  creating unique indexes on non-partition columns is currently unsupported
 CREATE UNIQUE INDEX try_unique_hash_index ON index_test_hash(b);
+ERROR:  creating unique indexes on non-partition columns is currently unsupported
+CREATE UNIQUE INDEX try_unique_hash_index_partial ON index_test_hash(b) WHERE c IS NOT NULL;
 ERROR:  creating unique indexes on non-partition columns is currently unsupported
 CREATE UNIQUE INDEX try_unique_append_index ON index_test_append(b);
 ERROR:  creating unique indexes on append-partitioned tables is currently unsupported
@@ -139,31 +163,35 @@ ERROR:  creating unique indexes on append-partitioned tables is currently unsupp
 CREATE INDEX lineitem_orderkey_index ON lineitem (l_orderkey);
 ERROR:  relation "lineitem_orderkey_index" already exists
 CREATE INDEX try_index ON lineitem USING gist (l_orderkey);
-WARNING:  data type bigint has no default operator class for access method "gist"
+NOTICE:  using one-phase commit for distributed DDL commands
+HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
+ERROR:  data type bigint has no default operator class for access method "gist"
 HINT:  You must specify an operator class for the index or define a default operator class for the data type.
 CONTEXT:  while executing command on localhost:57638
-ERROR:  could not execute DDL command on worker node shards
 CREATE INDEX try_index ON lineitem (non_existent_column);
-WARNING:  column "non_existent_column" does not exist
+ERROR:  column "non_existent_column" does not exist
 CONTEXT:  while executing command on localhost:57638
-ERROR:  could not execute DDL command on worker node shards
 CREATE INDEX ON lineitem (l_orderkey);
 ERROR:  creating index without a name on a distributed table is currently unsupported
 -- Verify that none of failed indexes got created on the master node
 SELECT * FROM pg_indexes WHERE tablename = 'lineitem' or tablename like 'index_test_%' ORDER BY indexname;
- schemaname |    tablename     |          indexname           | tablespace |                                                     indexdef                                                     
-------------+------------------+------------------------------+------------+------------------------------------------------------------------------------------------------------------------
- public     | index_test_hash  | index_test_hash_index_a      |            | CREATE UNIQUE INDEX index_test_hash_index_a ON index_test_hash USING btree (a)
- public     | index_test_hash  | index_test_hash_index_a_b    |            | CREATE UNIQUE INDEX index_test_hash_index_a_b ON index_test_hash USING btree (a, b)
- public     | index_test_range | index_test_range_index_a     |            | CREATE UNIQUE INDEX index_test_range_index_a ON index_test_range USING btree (a)
- public     | index_test_range | index_test_range_index_a_b   |            | CREATE UNIQUE INDEX index_test_range_index_a_b ON index_test_range USING btree (a, b)
- public     | lineitem         | lineitem_orderkey_hash_index |            | CREATE INDEX lineitem_orderkey_hash_index ON lineitem USING hash (l_partkey)
- public     | lineitem         | lineitem_orderkey_index      |            | CREATE INDEX lineitem_orderkey_index ON lineitem USING btree (l_orderkey)
- public     | lineitem         | lineitem_partial_index       |            | CREATE INDEX lineitem_partial_index ON lineitem USING btree (l_shipdate) WHERE (l_shipdate < '01-01-1995'::date)
- public     | lineitem         | lineitem_partkey_desc_index  |            | CREATE INDEX lineitem_partkey_desc_index ON lineitem USING btree (l_partkey DESC)
- public     | lineitem         | lineitem_pkey                |            | CREATE UNIQUE INDEX lineitem_pkey ON lineitem USING btree (l_orderkey, l_linenumber)
- public     | lineitem         | lineitem_time_index          |            | CREATE INDEX lineitem_time_index ON lineitem USING btree (l_shipdate)
-(10 rows)
+ schemaname |    tablename     |             indexname              | tablespace |                                                      indexdef                                                       
+------------+------------------+------------------------------------+------------+---------------------------------------------------------------------------------------------------------------------
+ public     | index_test_hash  | index_test_hash_index_a            |            | CREATE UNIQUE INDEX index_test_hash_index_a ON index_test_hash USING btree (a)
+ public     | index_test_hash  | index_test_hash_index_a_b          |            | CREATE UNIQUE INDEX index_test_hash_index_a_b ON index_test_hash USING btree (a, b)
+ public     | index_test_hash  | index_test_hash_index_a_b_partial  |            | CREATE UNIQUE INDEX index_test_hash_index_a_b_partial ON index_test_hash USING btree (a, b) WHERE (c IS NOT NULL)
+ public     | index_test_range | index_test_range_index_a           |            | CREATE UNIQUE INDEX index_test_range_index_a ON index_test_range USING btree (a)
+ public     | index_test_range | index_test_range_index_a_b         |            | CREATE UNIQUE INDEX index_test_range_index_a_b ON index_test_range USING btree (a, b)
+ public     | index_test_range | index_test_range_index_a_b_partial |            | CREATE UNIQUE INDEX index_test_range_index_a_b_partial ON index_test_range USING btree (a, b) WHERE (c IS NOT NULL)
+ public     | lineitem         | lineitem_colref_index              |            | CREATE INDEX lineitem_colref_index ON lineitem USING btree (record_ne(lineitem.*, NULL::record))
+ public     | lineitem         | lineitem_orderkey_hash_index       |            | CREATE INDEX lineitem_orderkey_hash_index ON lineitem USING hash (l_partkey)
+ public     | lineitem         | lineitem_orderkey_index            |            | CREATE INDEX lineitem_orderkey_index ON lineitem USING btree (l_orderkey)
+ public     | lineitem         | lineitem_orderkey_index_new        |            | CREATE INDEX lineitem_orderkey_index_new ON lineitem USING btree (l_orderkey)
+ public     | lineitem         | lineitem_partial_index             |            | CREATE INDEX lineitem_partial_index ON lineitem USING btree (l_shipdate) WHERE (l_shipdate < '01-01-1995'::date)
+ public     | lineitem         | lineitem_partkey_desc_index        |            | CREATE INDEX lineitem_partkey_desc_index ON lineitem USING btree (l_partkey DESC)
+ public     | lineitem         | lineitem_pkey                      |            | CREATE UNIQUE INDEX lineitem_pkey ON lineitem USING btree (l_orderkey, l_linenumber)
+ public     | lineitem         | lineitem_time_index                |            | CREATE INDEX lineitem_time_index ON lineitem USING btree (l_shipdate)
+(14 rows)
 
 --
 -- DROP INDEX
@@ -177,8 +205,10 @@ DROP INDEX CONCURRENTLY lineitem_orderkey_index;
 ERROR:  dropping indexes concurrently on distributed tables is currently unsupported
 -- Verify that we can succesfully drop indexes
 DROP INDEX lineitem_orderkey_index;
+DROP INDEX lineitem_orderkey_index_new;
 DROP INDEX lineitem_partkey_desc_index;
 DROP INDEX lineitem_partial_index;
+DROP INDEX lineitem_colref_index;
 -- Verify that we handle if exists statements correctly
 DROP INDEX non_existent_index;
 ERROR:  index "non_existent_index" does not exist
@@ -189,8 +219,10 @@ DROP INDEX lineitem_orderkey_hash_index;
 ERROR:  index "lineitem_orderkey_hash_index" does not exist
 DROP INDEX index_test_range_index_a;
 DROP INDEX index_test_range_index_a_b;
+DROP INDEX index_test_range_index_a_b_partial;
 DROP INDEX index_test_hash_index_a;
 DROP INDEX index_test_hash_index_a_b;
+DROP INDEX index_test_hash_index_a_b_partial;
 -- Verify that all the indexes are dropped from the master and one worker node.
 -- As there's a primary key, so exclude those from this check.
 SELECT indrelid::regclass, indexrelid::regclass FROM pg_index WHERE indrelid = (SELECT relname FROM pg_class WHERE relname LIKE 'lineitem%' ORDER BY relname LIMIT 1)::regclass AND NOT indisprimary AND indexrelid::regclass::text NOT LIKE 'lineitem_time_index%';

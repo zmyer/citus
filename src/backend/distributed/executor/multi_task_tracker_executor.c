@@ -22,12 +22,15 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include <math.h>
 
 #include "commands/dbcommands.h"
 #include "distributed/citus_nodes.h"
+#include "distributed/connection_management.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/pg_dist_partition.h"
 #include "distributed/worker_protocol.h"
 #include "storage/fd.h"
 #include "utils/builtins.h"
@@ -519,6 +522,15 @@ TaskHashCreate(uint32 taskHashSize)
 	int hashFlags = 0;
 	HTAB *taskHash = NULL;
 
+	/*
+	 * Can't create a hashtable of size 0. Normally that shouldn't happen, but
+	 * shard pruning currently can lead to this (Job with 0 Tasks). See #833.
+	 */
+	if (taskHashSize == 0)
+	{
+		taskHashSize = 2;
+	}
+
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(TaskMapKey);
 	info.entrysize = sizeof(TaskMapEntry);
@@ -870,13 +882,14 @@ TrackerConnectPoll(TaskTracker *taskTracker)
 			if (pollStatus == CLIENT_CONNECTION_BUSY_READ ||
 				pollStatus == CLIENT_CONNECTION_BUSY_WRITE)
 			{
-				uint32 maxCount = REMOTE_NODE_CONNECT_TIMEOUT / RemoteTaskCheckInterval;
+				uint32 maxCount =
+					ceil(NodeConnectionTimeout * 1.0f / RemoteTaskCheckInterval);
 				uint32 currentCount = taskTracker->connectPollCount;
 				if (currentCount >= maxCount)
 				{
 					ereport(WARNING, (errmsg("could not establish asynchronous "
 											 "connection after %u ms",
-											 REMOTE_NODE_CONNECT_TIMEOUT)));
+											 NodeConnectionTimeout)));
 
 					taskTracker->trackerStatus = TRACKER_CONNECTION_FAILED;
 
@@ -1314,7 +1327,7 @@ ManageTransmitExecution(TaskTracker *transmitTracker,
 			queryStatus = MultiClientQueryStatus(connectionId);
 			if (queryStatus == CLIENT_QUERY_COPY)
 			{
-				StringInfo jobDirectoryName = JobDirectoryName(task->jobId);
+				StringInfo jobDirectoryName = MasterJobDirectoryName(task->jobId);
 				StringInfo taskFilename = TaskFilename(jobDirectoryName, task->taskId);
 
 				char *filename = taskFilename->data;
@@ -2752,6 +2765,7 @@ JobCleanupTask(uint64 jobId)
 	jobCleanupTask = CitusMakeNode(Task);
 	jobCleanupTask->jobId = jobId;
 	jobCleanupTask->taskId = JOB_CLEANUP_TASK_ID;
+	jobCleanupTask->replicationModel = REPLICATION_MODEL_INVALID;
 	jobCleanupTask->queryString = jobCleanupQuery->data;
 
 	return jobCleanupTask;
@@ -2770,7 +2784,6 @@ TrackerHashCleanupJob(HTAB *taskTrackerHash, Task *jobCleanupTask)
 	uint64 jobId = jobCleanupTask->jobId;
 	List *taskTrackerList = NIL;
 	List *remainingTaskTrackerList = NIL;
-	const long timeoutDuration = 4000; /* milliseconds */
 	const long statusCheckInterval = 10000; /* microseconds */
 	bool timedOut = false;
 	TimestampTz startTime = 0;
@@ -2846,7 +2859,8 @@ TrackerHashCleanupJob(HTAB *taskTrackerHash, Task *jobCleanupTask)
 
 		pg_usleep(statusCheckInterval);
 		currentTime = GetCurrentTimestamp();
-		timedOut = TimestampDifferenceExceeds(startTime, currentTime, timeoutDuration);
+		timedOut = TimestampDifferenceExceeds(startTime, currentTime,
+											  NodeConnectionTimeout);
 
 		foreach(activeTaskTrackerCell, activeTackTrackerList)
 		{

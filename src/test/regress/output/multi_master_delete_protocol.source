@@ -3,7 +3,7 @@
 --
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 320000;
 ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 320000;
--- Create a new range partitioned customer_delete_protocol table and stage data into it.
+-- Create a new range partitioned customer_delete_protocol table and load data into it.
 CREATE TABLE customer_delete_protocol (
         c_custkey integer not null,
         c_name varchar(25) not null,
@@ -19,15 +19,20 @@ SELECT master_create_distributed_table('customer_delete_protocol', 'c_custkey', 
  
 (1 row)
 
-\STAGE customer_delete_protocol FROM '@abs_srcdir@/data/customer.1.data' with delimiter '|'
-\STAGE customer_delete_protocol FROM '@abs_srcdir@/data/customer.2.data' with delimiter '|'
-\STAGE customer_delete_protocol FROM '@abs_srcdir@/data/customer.3.data' with delimiter '|'
+\copy customer_delete_protocol FROM '@abs_srcdir@/data/customer.1.data' with delimiter '|'
+\copy customer_delete_protocol FROM '@abs_srcdir@/data/customer.2.data' with delimiter '|'
+\copy customer_delete_protocol FROM '@abs_srcdir@/data/customer.3.data' with delimiter '|'
 -- Testing master_apply_delete_command
 -- Check that we don't support conditions on columns other than partition key.
 SELECT master_apply_delete_command('DELETE FROM customer_delete_protocol
                                            WHERE c_acctbal > 0.0');
 ERROR:  cannot delete from distributed table
 DETAIL:  Where clause includes a column other than partition column
+-- Check that free-form deletes are not supported.
+DELETE FROM customer_delete_protocol WHERE c_custkey > 100;
+ERROR:  distributed modifications must target exactly one shard
+DETAIL:  This command modifies all shards.
+HINT:  Consider using an equality filter on partition column "c_custkey". You can use master_modify_multiple_shards() to perform multi-shard delete or update operations. You can also use master_apply_delete_command() to drop all shards satisfying delete criteria.
 -- Check that we delete a shard if and only if all rows in the shard satisfy the condition.
 SELECT master_apply_delete_command('DELETE FROM customer_delete_protocol 
                                            WHERE c_custkey > 6500');
@@ -66,7 +71,7 @@ SELECT master_apply_delete_command('DELETE FROM customer_delete_protocol');
 SELECT count(*) FROM customer_delete_protocol;
  count 
 -------
-      
+     0
 (1 row)
 
 -- Verify that empty shards are deleted if no condition is provided
@@ -89,8 +94,18 @@ SELECT master_apply_delete_command('DELETE FROM customer_delete_protocol');
                            1
 (1 row)
 
--- Verify that master_apply_delete_command cannot be called in a transaction block
+-- Verify that master_apply_delete_command can be called in a transaction block
+SELECT 1 AS one FROM master_create_empty_shard('customer_delete_protocol');
+ one 
+-----
+   1
+(1 row)
+
 BEGIN;
 SELECT master_apply_delete_command('DELETE FROM customer_delete_protocol');
-ERROR:  master_apply_delete_command cannot run inside a transaction block
-ROLLBACK;
+ master_apply_delete_command 
+-----------------------------
+                           1
+(1 row)
+
+COMMIT;

@@ -11,6 +11,7 @@
 # Tests around schema changes, these are run first, so there's no preexisting objects.
 # ---
 test: multi_extension
+test: multi_cluster_management
 test: multi_table_ddl
 
 # ----------
@@ -18,7 +19,7 @@ test: multi_table_ddl
 # uploading data to it.
 # ----------
 test: multi_create_table
-test: multi_stage_data
+test: multi_load_data
 
 test: multi_basic_queries multi_complex_expressions multi_verify_no_subquery
 test: multi_single_relation_subquery

@@ -12,43 +12,59 @@
  */
 
 #include "postgres.h"
-
+#include "c.h"
+#include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 
+#include <string.h>
+
+#include "access/attnum.h"
+#include "access/genam.h"
+#include "access/heapam.h"
+#include "access/htup.h"
 #include "access/htup_details.h"
-#include "catalog/catalog.h"
+#include "access/skey.h"
+#include "access/stratnum.h"
+#include "access/sysattr.h"
+#include "access/tupdesc.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_constraint.h"
+#if (PG_VERSION_NUM >= 90600)
+#include "catalog/pg_constraint_fn.h"
+#endif
 #include "catalog/pg_index.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_namespace.h"
 #include "commands/sequence.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/listutils.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/multi_physical_planner.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/pg_dist_shard.h"
-#include "distributed/pg_dist_partition.h"
 #include "distributed/worker_manager.h"
 #include "foreign/foreign.h"
-#include "libpq/ip.h"
-#include "libpq/libpq-be.h"
+#include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
+#include "nodes/primnodes.h"
 #include "storage/lock.h"
 #include "utils/builtins.h"
+#include "utils/elog.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
-#if (PG_VERSION_NUM >= 90500)
+#include "utils/palloc.h"
+#include "utils/relcache.h"
 #include "utils/ruleutils.h"
-#endif
-#include "utils/syscache.h"
 #include "utils/tqual.h"
 
 
 /* Shard related configuration */
-int ShardReplicationFactor = 2; /* desired replication factor for shards */
+int ShardCount = 32;
+int ShardReplicationFactor = 1; /* desired replication factor for shards */
 int ShardMaxSize = 1048576;     /* maximum size in KB one shard can grow to */
 int ShardPlacementPolicy = SHARD_PLACEMENT_ROUND_ROBIN;
 
@@ -60,6 +76,7 @@ static Datum WorkerNodeGetDatum(WorkerNode *workerNode, TupleDesc tupleDescripto
 PG_FUNCTION_INFO_V1(master_get_table_metadata);
 PG_FUNCTION_INFO_V1(master_get_table_ddl_events);
 PG_FUNCTION_INFO_V1(master_get_new_shardid);
+PG_FUNCTION_INFO_V1(master_get_new_placementid);
 PG_FUNCTION_INFO_V1(master_get_local_first_candidate_nodes);
 PG_FUNCTION_INFO_V1(master_get_round_robin_candidate_nodes);
 PG_FUNCTION_INFO_V1(master_get_active_worker_nodes);
@@ -78,6 +95,7 @@ master_get_table_metadata(PG_FUNCTION_ARGS)
 	Oid relationId = ResolveRelationId(relationName);
 
 	DistTableCacheEntry *partitionEntry = NULL;
+	char *partitionKeyString = NULL;
 	TypeFuncClass resultTypeClass = 0;
 	Datum partitionKeyExpr = 0;
 	Datum partitionKey = 0;
@@ -85,8 +103,7 @@ master_get_table_metadata(PG_FUNCTION_ARGS)
 	HeapTuple metadataTuple = NULL;
 	TupleDesc metadataDescriptor = NULL;
 	uint64 shardMaxSizeInBytes = 0;
-	char relationType = 0;
-	char storageType = 0;
+	char shardStorageType = 0;
 	Datum values[TABLE_METADATA_FIELDS];
 	bool isNulls[TABLE_METADATA_FIELDS];
 
@@ -100,39 +117,34 @@ master_get_table_metadata(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errmsg("return type must be a row type")));
 	}
 
-	/* get decompiled expression tree for partition key */
-	partitionKeyExpr =
-		PointerGetDatum(cstring_to_text(partitionEntry->partitionKeyString));
-	partitionKey = DirectFunctionCall2(pg_get_expr, partitionKeyExpr,
-									   ObjectIdGetDatum(relationId));
-
 	/* form heap tuple for table metadata */
 	memset(values, 0, sizeof(values));
 	memset(isNulls, false, sizeof(isNulls));
 
+	partitionKeyString = partitionEntry->partitionKeyString;
+
+	/* reference tables do not have partition key */
+	if (partitionKeyString == NULL)
+	{
+		partitionKey = PointerGetDatum(NULL);
+		isNulls[3] = true;
+	}
+	else
+	{
+		/* get decompiled expression tree for partition key */
+		partitionKeyExpr =
+			PointerGetDatum(cstring_to_text(partitionEntry->partitionKeyString));
+		partitionKey = DirectFunctionCall2(pg_get_expr, partitionKeyExpr,
+										   ObjectIdGetDatum(relationId));
+	}
+
 	shardMaxSizeInBytes = (int64) ShardMaxSize * 1024L;
 
 	/* get storage type */
-	relationType = get_rel_relkind(relationId);
-	if (relationType == RELKIND_RELATION)
-	{
-		storageType = SHARD_STORAGE_TABLE;
-	}
-	else if (relationType == RELKIND_FOREIGN_TABLE)
-	{
-		bool cstoreTable = CStoreTable(relationId);
-		if (cstoreTable)
-		{
-			storageType = SHARD_STORAGE_COLUMNAR;
-		}
-		else
-		{
-			storageType = SHARD_STORAGE_FOREIGN;
-		}
-	}
+	shardStorageType = ShardStorageType(relationId);
 
 	values[0] = ObjectIdGetDatum(relationId);
-	values[1] = storageType;
+	values[1] = shardStorageType;
 	values[2] = partitionEntry->partitionMethod;
 	values[3] = partitionKey;
 	values[4] = Int32GetDatum(ShardReplicationFactor);
@@ -239,13 +251,8 @@ master_get_table_ddl_events(PG_FUNCTION_ARGS)
 
 
 /*
- * master_get_new_shardid allocates and returns a unique shardId for the shard
- * to be created. This allocation occurs both in shared memory and in write
- * ahead logs; writing to logs avoids the risk of having shardId collisions.
- *
- * Please note that the caller is still responsible for finalizing shard data
- * and the shardId with the master node. Further note that this function relies
- * on an internal sequence created in initdb to generate unique identifiers.
+ * master_get_new_shardid is a user facing wrapper function around GetNextShardId()
+ * which allocates and returns a unique shardId for the shard to be created.
  *
  * NB: This can be called by any user; for now we have decided that that's
  * ok. We might want to restrict this to users part of a specific role or such
@@ -254,12 +261,36 @@ master_get_table_ddl_events(PG_FUNCTION_ARGS)
 Datum
 master_get_new_shardid(PG_FUNCTION_ARGS)
 {
+	uint64 shardId = 0;
+	Datum shardIdDatum = 0;
+
+	EnsureCoordinator();
+
+	shardId = GetNextShardId();
+	shardIdDatum = Int64GetDatum(shardId);
+
+	PG_RETURN_DATUM(shardIdDatum);
+}
+
+
+/*
+ * GetNextShardId allocates and returns a unique shardId for the shard to be
+ * created. This allocation occurs both in shared memory and in write ahead
+ * logs; writing to logs avoids the risk of having shardId collisions.
+ *
+ * Please note that the caller is still responsible for finalizing shard data
+ * and the shardId with the master node.
+ */
+uint64
+GetNextShardId()
+{
 	text *sequenceName = cstring_to_text(SHARDID_SEQUENCE_NAME);
 	Oid sequenceId = ResolveRelationId(sequenceName);
 	Datum sequenceIdDatum = ObjectIdGetDatum(sequenceId);
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
 	Datum shardIdDatum = 0;
+	uint64 shardId = 0;
 
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
@@ -269,7 +300,68 @@ master_get_new_shardid(PG_FUNCTION_ARGS)
 
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
-	PG_RETURN_DATUM(shardIdDatum);
+	shardId = DatumGetInt64(shardIdDatum);
+
+	return shardId;
+}
+
+
+/*
+ * master_get_new_placementid is a user facing wrapper function around
+ * GetNextPlacementId() which allocates and returns a unique placement id for the
+ * placement to be created.
+ *
+ * NB: This can be called by any user; for now we have decided that that's
+ * ok. We might want to restrict this to users part of a specific role or such
+ * at some later point.
+ */
+Datum
+master_get_new_placementid(PG_FUNCTION_ARGS)
+{
+	uint64 placementId = 0;
+	Datum placementIdDatum = 0;
+
+	EnsureCoordinator();
+
+	placementId = GetNextPlacementId();
+	placementIdDatum = Int64GetDatum(placementId);
+
+	PG_RETURN_DATUM(placementIdDatum);
+}
+
+
+/*
+ * GetNextPlacementId allocates and returns a unique placementId for
+ * the placement to be created. This allocation occurs both in shared memory
+ * and in write ahead logs; writing to logs avoids the risk of having shardId
+ * collisions.
+ *
+ * NB: This can be called by any user; for now we have decided that that's
+ * ok. We might want to restrict this to users part of a specific role or such
+ * at some later point.
+ */
+uint64
+GetNextPlacementId(void)
+{
+	text *sequenceName = cstring_to_text(PLACEMENTID_SEQUENCE_NAME);
+	Oid sequenceId = ResolveRelationId(sequenceName);
+	Datum sequenceIdDatum = ObjectIdGetDatum(sequenceId);
+	Oid savedUserId = InvalidOid;
+	int savedSecurityContext = 0;
+	Datum placementIdDatum = 0;
+	uint64 placementId = 0;
+
+	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
+	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
+
+	/* generate new and unique placement id from sequence */
+	placementIdDatum = DirectFunctionCall1(nextval_oid, sequenceIdDatum);
+
+	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+
+	placementId = DatumGetInt64(placementIdDatum);
+
+	return placementId;
 }
 
 
@@ -452,7 +544,7 @@ master_get_round_robin_candidate_nodes(PG_FUNCTION_ARGS)
 /*
  * master_get_active_worker_nodes returns a set of active worker host names and
  * port numbers in deterministic order. Currently we assume that all worker
- * nodes in pg_worker_list.conf are active.
+ * nodes in pg_dist_node are active.
  */
 Datum
 master_get_active_worker_nodes(PG_FUNCTION_ARGS)
@@ -539,16 +631,18 @@ ResolveRelationId(text *relationName)
  * GetTableDDLEvents takes in a relationId, and returns the list of DDL commands
  * needed to reconstruct the relation. These DDL commands are all palloced; and
  * include the table's schema definition, optional column storage and statistics
- * definitions, and index and constraint defitions.
+ * definitions, and index and constraint definitions.
  */
 List *
 GetTableDDLEvents(Oid relationId)
 {
 	List *tableDDLEventList = NIL;
 	char tableType = 0;
+	List *sequenceIdlist = getOwnedSequences(relationId);
+	ListCell *sequenceIdCell;
 	char *tableSchemaDef = NULL;
 	char *tableColumnOptionsDef = NULL;
-	char *schemaName = NULL;
+	char *createSchemaCommand = NULL;
 	Oid schemaId = InvalidOid;
 
 	Relation pgIndex = NULL;
@@ -556,6 +650,16 @@ GetTableDDLEvents(Oid relationId)
 	ScanKeyData scanKey[1];
 	int scanKeyCount = 1;
 	HeapTuple heapTuple = NULL;
+
+	/*
+	 * Set search_path to NIL so that all objects outside of pg_catalog will be
+	 * schema-prefixed. pg_catalog will be added automatically when we call
+	 * PushOverrideSearchPath(), since we set addCatalog to true;
+	 */
+	OverrideSearchPath *overridePath = GetOverrideSearchPath(CurrentMemoryContext);
+	overridePath->schemas = NIL;
+	overridePath->addCatalog = true;
+	PushOverrideSearchPath(overridePath);
 
 	/* if foreign table, fetch extension and server definitions */
 	tableType = get_rel_relkind(relationId);
@@ -573,13 +677,19 @@ GetTableDDLEvents(Oid relationId)
 
 	/* create schema if the table is not in the default namespace (public) */
 	schemaId = get_rel_namespace(relationId);
-	schemaName = get_namespace_name(schemaId);
-	if (strncmp(schemaName, "public", NAMEDATALEN) != 0)
+	createSchemaCommand = CreateSchemaDDLCommand(schemaId);
+	if (createSchemaCommand != NULL)
 	{
-		StringInfo schemaNameDef = makeStringInfo();
-		appendStringInfo(schemaNameDef, CREATE_SCHEMA_COMMAND, schemaName);
+		tableDDLEventList = lappend(tableDDLEventList, createSchemaCommand);
+	}
 
-		tableDDLEventList = lappend(tableDDLEventList, schemaNameDef->data);
+	/* create sequences if needed */
+	foreach(sequenceIdCell, sequenceIdlist)
+	{
+		Oid sequenceRelid = lfirst_oid(sequenceIdCell);
+		char *sequenceDef = pg_get_sequencedef_string(sequenceRelid);
+
+		tableDDLEventList = lappend(tableDDLEventList, sequenceDef);
 	}
 
 	/* fetch table schema and column option definitions */
@@ -612,15 +722,15 @@ GetTableDDLEvents(Oid relationId)
 
 		/*
 		 * A primary key index is always created by a constraint statement.
-		 * A unique key index is created by a constraint if and only if the
-		 * index has a corresponding constraint entry in pg_depend. Any other
-		 * index form is never associated with a constraint.
+		 * A unique key index or exclusion index is created by a constraint
+		 * if and only if the index has a corresponding constraint entry in pg_depend.
+		 * Any other index form is never associated with a constraint.
 		 */
 		if (indexForm->indisprimary)
 		{
 			isConstraint = true;
 		}
-		else if (indexForm->indisunique)
+		else if (indexForm->indisunique || indexForm->indisexclusion)
 		{
 			Oid constraintId = get_index_constraint(indexId);
 			isConstraint = OidIsValid(constraintId);
@@ -636,11 +746,7 @@ GetTableDDLEvents(Oid relationId)
 			Oid constraintId = get_index_constraint(indexId);
 			Assert(constraintId != InvalidOid);
 
-#if (PG_VERSION_NUM >= 90500)
 			statementDef = pg_get_constraintdef_command(constraintId);
-#else
-			statementDef = pg_get_constraintdef_string(constraintId);
-#endif
 		}
 		else
 		{
@@ -666,7 +772,117 @@ GetTableDDLEvents(Oid relationId)
 	systable_endscan(scanDescriptor);
 	heap_close(pgIndex, AccessShareLock);
 
+	/* revert back to original search_path */
+	PopOverrideSearchPath();
+
 	return tableDDLEventList;
+}
+
+
+/*
+ * GetTableForeignConstraints takes in a relationId, and returns the list of foreign
+ * constraint commands needed to reconstruct foreign constraints of that table.
+ */
+List *
+GetTableForeignConstraintCommands(Oid relationId)
+{
+	List *tableForeignConstraints = NIL;
+
+	Relation pgConstraint = NULL;
+	SysScanDesc scanDescriptor = NULL;
+	ScanKeyData scanKey[1];
+	int scanKeyCount = 1;
+	HeapTuple heapTuple = NULL;
+
+	/*
+	 * Set search_path to NIL so that all objects outside of pg_catalog will be
+	 * schema-prefixed. pg_catalog will be added automatically when we call
+	 * PushOverrideSearchPath(), since we set addCatalog to true;
+	 */
+	OverrideSearchPath *overridePath = GetOverrideSearchPath(CurrentMemoryContext);
+	overridePath->schemas = NIL;
+	overridePath->addCatalog = true;
+	PushOverrideSearchPath(overridePath);
+
+	/* open system catalog and scan all constraints that belong to this table */
+	pgConstraint = heap_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&scanKey[0], Anum_pg_constraint_conrelid, BTEqualStrategyNumber, F_OIDEQ,
+				relationId);
+	scanDescriptor = systable_beginscan(pgConstraint, ConstraintRelidIndexId, true, NULL,
+										scanKeyCount, scanKey);
+
+	heapTuple = systable_getnext(scanDescriptor);
+	while (HeapTupleIsValid(heapTuple))
+	{
+		Form_pg_constraint constraintForm = (Form_pg_constraint) GETSTRUCT(heapTuple);
+
+		if (constraintForm->contype == CONSTRAINT_FOREIGN)
+		{
+			Oid constraintId = get_relation_constraint_oid(relationId,
+														   constraintForm->conname.data,
+														   true);
+			char *statementDef = pg_get_constraintdef_command(constraintId);
+
+			tableForeignConstraints = lappend(tableForeignConstraints, statementDef);
+		}
+
+		heapTuple = systable_getnext(scanDescriptor);
+	}
+
+	/* clean up scan and close system catalog */
+	systable_endscan(scanDescriptor);
+	heap_close(pgConstraint, AccessShareLock);
+
+	/* revert back to original search_path */
+	PopOverrideSearchPath();
+
+	return tableForeignConstraints;
+}
+
+
+/*
+ * ShardStorageType returns the shard storage type according to relation type.
+ */
+char
+ShardStorageType(Oid relationId)
+{
+	char shardStorageType = 0;
+
+	char relationType = get_rel_relkind(relationId);
+	if (relationType == RELKIND_RELATION)
+	{
+		shardStorageType = SHARD_STORAGE_TABLE;
+	}
+	else if (relationType == RELKIND_FOREIGN_TABLE)
+	{
+		bool cstoreTable = CStoreTable(relationId);
+		if (cstoreTable)
+		{
+			shardStorageType = SHARD_STORAGE_COLUMNAR;
+		}
+		else
+		{
+			shardStorageType = SHARD_STORAGE_FOREIGN;
+		}
+	}
+	else
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("unexpected relation type: %c", relationType)));
+	}
+
+	return shardStorageType;
+}
+
+
+/*
+ * IsCoordinator function returns true if this node is identified as the
+ * schema/coordinator/master node of the cluster.
+ */
+bool
+IsCoordinator(void)
+{
+	return (GetLocalGroupId() == 0);
 }
 
 

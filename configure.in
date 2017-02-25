@@ -10,6 +10,11 @@ AC_COPYRIGHT([Copyright (c) 2012-2016, Citus Data, Inc.])
 
 AC_PROG_SED
 
+# Re-check for flex. That allows to compile citus against a postgres
+# which was built without flex available (possible because generated
+# files are included)
+AC_PATH_PROG([FLEX], [flex])
+
 # Locate pg_config binary
 AC_ARG_VAR([PG_CONFIG], [Location to find pg_config for target PostgreSQL instalation (default PATH)])
 AC_ARG_VAR([PATH], [PATH for target PostgreSQL install pg_config])
@@ -31,7 +36,7 @@ if test -z "$version_num"; then
   AC_MSG_ERROR([Could not detect PostgreSQL version from pg_config.])
 fi
 
-if test "$version_num" != '9.4' -a "$version_num" != '9.5'; then
+if test "$version_num" != '9.5' -a "$version_num" != '9.6'; then
    AC_MSG_ERROR([Citus is not compatible with the detected PostgreSQL version ${version_num}.])
 else
    AC_MSG_NOTICE([building against PostgreSQL $version_num])
@@ -57,6 +62,14 @@ AC_SUBST(vpath_build)
 SAVE_CFLAGS="$CFLAGS"
 AC_PROG_CC([$($PG_CONFIG --cc)])
 CFLAGS="$SAVE_CFLAGS"
+
+
+# Locate source and build directory of the postgres we're building
+# against. Can't rely on either still being present, but e.g. optional
+# test infrastructure can rely on it.
+POSTGRES_SRCDIR=$(grep ^abs_top_srcdir $(dirname $($PG_CONFIG --pgxs))/../Makefile.global|cut -d ' ' -f3-)
+POSTGRES_BUILDDIR=$(grep ^abs_top_builddir $(dirname $($PG_CONFIG --pgxs))/../Makefile.global|cut -d ' ' -f3-)
+
 
 # check for a number of CFLAGS that make development easier
 
@@ -96,7 +109,17 @@ CITUSAC_PROG_CC_CFLAGS_OPT([-Wmissing-format-attribute])
 CITUSAC_PROG_CC_CFLAGS_OPT([-Wmissing-declarations])
 CITUSAC_PROG_CC_CFLAGS_OPT([-Wmissing-prototypes])
 
+#
+# --enable-coverage enables generation of code coverage metrics with gcov
+#
+AC_ARG_ENABLE([coverage], AS_HELP_STRING([--enable-coverage], [build with coverage testing instrumentation]))
+if test "$enable_coverage" = yes; then
+    CITUS_CFLAGS="$CITUS_CFLAGS -fprofile-arcs -ftest-coverage"
+fi
+
 AC_SUBST(CITUS_CFLAGS, "$CITUS_CFLAGS")
+AC_SUBST(POSTGRES_SRCDIR, "$POSTGRES_SRCDIR")
+AC_SUBST(POSTGRES_BUILDDIR, "$POSTGRES_BUILDDIR")
 
 AC_CONFIG_FILES([Makefile.global])
 AC_CONFIG_HEADERS([src/include/citus_config.h])

@@ -124,8 +124,11 @@ BuildAggregatePlan(Query *masterQuery, Plan *subPlan)
 	AttrNumber *groupColumnIdArray = NULL;
 	List *aggregateTargetList = NIL;
 	List *groupColumnList = NIL;
+	List *aggregateColumnList = NIL;
+	List *havingColumnList = NIL;
 	List *columnList = NIL;
 	ListCell *columnCell = NULL;
+	Node *havingQual = NULL;
 	Oid *groupColumnOpArray = NULL;
 	uint32 groupColumnCount = 0;
 	const long rowEstimate = 10;
@@ -134,13 +137,27 @@ BuildAggregatePlan(Query *masterQuery, Plan *subPlan)
 	Assert(masterQuery->hasAggs || masterQuery->groupClause);
 
 	aggregateTargetList = masterQuery->targetList;
+	havingQual = masterQuery->havingQual;
+
+	/* estimate aggregate execution costs */
+	memset(&aggregateCosts, 0, sizeof(AggClauseCosts));
+#if (PG_VERSION_NUM >= 90600)
+	get_agg_clause_costs(NULL, (Node *) aggregateTargetList, AGGSPLIT_SIMPLE,
+						 &aggregateCosts);
+	get_agg_clause_costs(NULL, (Node *) havingQual, AGGSPLIT_SIMPLE, &aggregateCosts);
+#else
 	count_agg_clauses(NULL, (Node *) aggregateTargetList, &aggregateCosts);
+	count_agg_clauses(NULL, (Node *) havingQual, &aggregateCosts);
+#endif
 
 	/*
 	 * For upper level plans above the sequential scan, the planner expects the
 	 * table id (varno) to be set to OUTER_VAR.
 	 */
-	columnList = pull_var_clause_default((Node *) aggregateTargetList);
+	aggregateColumnList = pull_var_clause_default((Node *) aggregateTargetList);
+	havingColumnList = pull_var_clause_default(havingQual);
+
+	columnList = list_concat(aggregateColumnList, havingColumnList);
 	foreach(columnCell, columnList)
 	{
 		Var *column = (Var *) lfirst(columnCell);
@@ -167,15 +184,22 @@ BuildAggregatePlan(Query *masterQuery, Plan *subPlan)
 	}
 
 	/* finally create the plan */
-#if (PG_VERSION_NUM >= 90500)
-	aggregatePlan = make_agg(NULL, aggregateTargetList, NIL, aggregateStrategy,
+#if (PG_VERSION_NUM >= 90600)
+	aggregatePlan = make_agg(aggregateTargetList, (List *) havingQual, aggregateStrategy,
+							 AGGSPLIT_SIMPLE, groupColumnCount, groupColumnIdArray,
+							 groupColumnOpArray, NIL, NIL,
+							 rowEstimate, subPlan);
+#else
+	aggregatePlan = make_agg(NULL, aggregateTargetList, (List *) havingQual,
+							 aggregateStrategy,
 							 &aggregateCosts, groupColumnCount, groupColumnIdArray,
 							 groupColumnOpArray, NIL, rowEstimate, subPlan);
-#else
-	aggregatePlan = make_agg(NULL, aggregateTargetList, NIL, aggregateStrategy,
-							 &aggregateCosts, groupColumnCount, groupColumnIdArray,
-							 groupColumnOpArray, rowEstimate, subPlan);
 #endif
+
+	/* just for reproducible costs between different PostgreSQL versions */
+	aggregatePlan->plan.startup_cost = 0;
+	aggregatePlan->plan.total_cost = 0;
+	aggregatePlan->plan.plan_rows = 0;
 
 	return aggregatePlan;
 }
@@ -241,20 +265,34 @@ BuildSelectStatement(Query *masterQuery, char *masterTableName,
 	if (masterQuery->sortClause)
 	{
 		List *sortClauseList = masterQuery->sortClause;
+#if (PG_VERSION_NUM >= 90600)
+		Sort *sortPlan = make_sort_from_sortclauses(sortClauseList, topLevelPlan);
+#else
 		Sort *sortPlan = make_sort_from_sortclauses(NULL, sortClauseList, topLevelPlan);
+#endif
+
+		/* just for reproducible costs between different PostgreSQL versions */
+		sortPlan->plan.startup_cost = 0;
+		sortPlan->plan.total_cost = 0;
+		sortPlan->plan.plan_rows = 0;
+
 		topLevelPlan = (Plan *) sortPlan;
 	}
 
 	/* (5) add a limit plan if needed */
-	if (masterQuery->limitCount)
+	if (masterQuery->limitCount || masterQuery->limitOffset)
 	{
 		Node *limitCount = masterQuery->limitCount;
 		Node *limitOffset = masterQuery->limitOffset;
+#if (PG_VERSION_NUM >= 90600)
+		Limit *limitPlan = make_limit(topLevelPlan, limitOffset, limitCount);
+#else
 		int64 offsetEstimate = 0;
 		int64 countEstimate = 0;
 
 		Limit *limitPlan = make_limit(topLevelPlan, limitOffset, limitCount,
 									  offsetEstimate, countEstimate);
+#endif
 		topLevelPlan = (Plan *) limitPlan;
 	}
 
@@ -353,7 +391,7 @@ MasterNodeCopyStatementList(MultiPlan *multiPlan)
 	foreach(workerTaskCell, workerTaskList)
 	{
 		Task *workerTask = (Task *) lfirst(workerTaskCell);
-		StringInfo jobDirectoryName = JobDirectoryName(workerTask->jobId);
+		StringInfo jobDirectoryName = MasterJobDirectoryName(workerTask->jobId);
 		StringInfo taskFilename = TaskFilename(jobDirectoryName, workerTask->taskId);
 
 		RangeVar *relation = makeRangeVar(NULL, tableName, -1);

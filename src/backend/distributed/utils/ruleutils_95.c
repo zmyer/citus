@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * citus_ruleutils.c
+ * ruleutils_95.c
  *	  Additional, non core exposed, functions to convert stored
  *    expressions/querytrees back to source text
  *
@@ -9,7 +9,7 @@
  *
  *
  * IDENTIFICATION
- *	  src/backend/distributed/utils/citus_ruleutils.c
+ *	  src/backend/distributed/utils/ruleutils_95.c
  *
  * This needs to be closely in sync with the core code.
  *-------------------------------------------------------------------------
@@ -1838,6 +1838,8 @@ get_query_def_extended(Query *query, StringInfo buf, List *parentnamespace,
 	deparse_context context;
 	deparse_namespace dpns;
 
+	OverrideSearchPath *overridePath = NULL;
+
 	/* Guard against excessively long or deeply-nested queries */
 	CHECK_FOR_INTERRUPTS();
 	check_stack_depth();
@@ -1852,6 +1854,16 @@ get_query_def_extended(Query *query, StringInfo buf, List *parentnamespace,
 	 * only need AccessShareLock on the relations it mentions.
 	 */
 	AcquireRewriteLocks(query, false, false);
+
+	/*
+	 * Set search_path to NIL so that all objects outside of pg_catalog will be
+	 * schema-prefixed. pg_catalog will be added automatically when we call
+	 * PushOverrideSearchPath(), since we set addCatalog to true;
+	 */
+	overridePath = GetOverrideSearchPath(CurrentMemoryContext);
+	overridePath->schemas = NIL;
+	overridePath->addCatalog = true;
+	PushOverrideSearchPath(overridePath);
 
 	context.buf = buf;
 	context.namespaces = lcons(&dpns, list_copy(parentnamespace));
@@ -1899,6 +1911,9 @@ get_query_def_extended(Query *query, StringInfo buf, List *parentnamespace,
 				 query->commandType);
 			break;
 	}
+
+	/* revert back to original search_path */
+	PopOverrideSearchPath();
 }
 
 /* ----------
@@ -3047,25 +3062,24 @@ get_insert_query_def(Query *query, deparse_context *context)
 			/* Add a WHERE clause (for partial indexes) if given */
 			if (confl->arbiterWhere != NULL)
 			{
-				bool varprefixInitialValue = context->varprefix;
+				bool		save_varprefix;
+
+				/*
+				 * Force non-prefixing of Vars, since parser assumes that they
+				 * belong to target relation.  WHERE clause does not use
+				 * InferenceElem, so this is separately required.
+				 */
+				save_varprefix = context->varprefix;
+				context->varprefix = false;
 
 				appendContextKeyword(context, " WHERE ",
 									 -PRETTYINDENT_STD, PRETTYINDENT_STD, 1);
-
-				/*
-				 * Postgres deparses arbiter WHERE clauses incorrectly. It adds
-				 * varprefix to the arbiter WHERE clause, for which Postgres parser
-				 * errors out. Thus, we temporarily set varprefix to false.
-				 */
-				context->varprefix = false;
-
 				get_rule_expr(confl->arbiterWhere, context, false);
 
-				/* now set the varprefix back to its initial value */
-				context->varprefix = varprefixInitialValue;
+				context->varprefix = save_varprefix;
 			}
 		}
-		else if (confl->constraint != InvalidOid)
+		else if (OidIsValid(confl->constraint))
 		{
 			char	   *constraint = get_constraint_name(confl->constraint);
 			int64 shardId = context->shardid;
@@ -3075,8 +3089,11 @@ get_insert_query_def(Query *query, deparse_context *context)
 				AppendShardIdToName(&constraint, shardId);
 			}
 
+			if (!constraint)
+				elog(ERROR, "cache lookup failed for constraint %u",
+					 confl->constraint);
 			appendStringInfo(buf, " ON CONSTRAINT %s",
-							 quote_qualified_identifier(NULL, constraint));
+							 quote_identifier(constraint));
 		}
 
 		if (confl->action == ONCONFLICT_NOTHING)
@@ -3383,6 +3400,42 @@ get_utility_query_def(Query *query, deparse_context *context)
 			simple_quote_literal(buf, stmt->payload);
 		}
 	}
+	else if (query->utilityStmt && IsA(query->utilityStmt, TruncateStmt))
+	{
+		TruncateStmt *stmt = (TruncateStmt *) query->utilityStmt;
+		List *relationList = stmt->relations;
+		ListCell *relationCell = NULL;
+
+		appendContextKeyword(context, "",
+							 0, PRETTYINDENT_STD, 1);
+
+		appendStringInfo(buf, "TRUNCATE TABLE");
+
+		foreach(relationCell, relationList)
+		{
+			RangeVar *relationVar = (RangeVar *) lfirst(relationCell);
+			Oid relationId = RangeVarGetRelid(relationVar, NoLock, false);
+			char *relationName = generate_relation_or_shard_name(relationId,
+																 context->distrelid,
+																 context->shardid, NIL);
+			appendStringInfo(buf, " %s", relationName);
+
+			if (lnext(relationCell) != NULL)
+			{
+				appendStringInfo(buf, ",");
+			}
+		}
+
+		if (stmt->restart_seqs)
+		{
+			appendStringInfo(buf, " RESTART IDENTITY");
+		}
+
+		if (stmt->behavior == DROP_CASCADE)
+		{
+			appendStringInfo(buf, " CASCADE");
+		}
+	}
 	else
 	{
 		/* Currently only NOTIFY utility commands can appear in rules */
@@ -3541,7 +3594,8 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 
 		tle = get_tle_by_resno(dpns->inner_tlist, var->varattno);
 		if (!tle)
-			elog(ERROR, "bogus varattno for subquery var: %d", var->varattno);
+			elog(ERROR, "invalid attnum %d for relation \"%s\"",
+				 var->varattno, rte->eref->aliasname);
 
 		Assert(netlevelsup == 0);
 		push_child_plan(dpns, dpns->inner_planstate, &save_dpns);
@@ -3602,9 +3656,18 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 	else if (attnum > 0)
 	{
 		/* Get column name to use from the colinfo struct */
-		Assert(attnum <= colinfo->num_cols);
+		if (attnum > colinfo->num_cols)
+			elog(ERROR, "invalid attnum %d for relation \"%s\"",
+				 attnum, rte->eref->aliasname);
 		attname = colinfo->colnames[attnum - 1];
-		Assert(attname != NULL);
+		if (attname == NULL)	/* dropped column? */
+			elog(ERROR, "invalid attnum %d for relation \"%s\"",
+				 attnum, rte->eref->aliasname);
+	}
+	else if (GetRangeTblKind(rte) == CITUS_RTE_SHARD)
+	{
+		/* System column on a Citus shard */
+		attname = get_relid_attribute_name(rte->relid, attnum);
 	}
 	else
 	{
@@ -4735,6 +4798,24 @@ get_rule_expr(Node *node, deparse_context *context,
 									  get_base_element_type(exprType(arg2))),
 								 expr->useOr ? "ANY" : "ALL");
 				get_rule_expr_paren(arg2, context, true, node);
+
+				/*
+				 * There's inherent ambiguity in "x op ANY/ALL (y)" when y is
+				 * a bare sub-SELECT.  Since we're here, the sub-SELECT must
+				 * be meant as a scalar sub-SELECT yielding an array value to
+				 * be used in ScalarArrayOpExpr; but the grammar will
+				 * preferentially interpret such a construct as an ANY/ALL
+				 * SubLink.  To prevent misparsing the output that way, insert
+				 * a dummy coercion (which will be stripped by parse analysis,
+				 * so no inefficiency is added in dump and reload).  This is
+				 * indeed most likely what the user wrote to get the construct
+				 * accepted in the first place.
+				 */
+				if (IsA(arg2, SubLink) &&
+					((SubLink *) arg2)->subLinkType == EXPR_SUBLINK)
+					appendStringInfo(buf, "::%s",
+									 format_type_with_typemod(exprType(arg2),
+														  exprTypmod(arg2)));
 				appendStringInfoChar(buf, ')');
 				if (!PRETTY_PAREN(context))
 					appendStringInfoChar(buf, ')');
@@ -5396,17 +5477,43 @@ get_rule_expr(Node *node, deparse_context *context,
 				if (!PRETTY_PAREN(context))
 					appendStringInfoChar(buf, '(');
 				get_rule_expr_paren((Node *) ntest->arg, context, true, node);
-				switch (ntest->nulltesttype)
+
+				/*
+				 * For scalar inputs, we prefer to print as IS [NOT] NULL,
+				 * which is shorter and traditional.  If it's a rowtype input
+				 * but we're applying a scalar test, must print IS [NOT]
+				 * DISTINCT FROM NULL to be semantically correct.
+				 */
+				if (ntest->argisrow ||
+					!type_is_rowtype(exprType((Node *) ntest->arg)))
 				{
-					case IS_NULL:
-						appendStringInfoString(buf, " IS NULL");
-						break;
-					case IS_NOT_NULL:
-						appendStringInfoString(buf, " IS NOT NULL");
-						break;
-					default:
-						elog(ERROR, "unrecognized nulltesttype: %d",
-							 (int) ntest->nulltesttype);
+					switch (ntest->nulltesttype)
+					{
+						case IS_NULL:
+							appendStringInfoString(buf, " IS NULL");
+							break;
+						case IS_NOT_NULL:
+							appendStringInfoString(buf, " IS NOT NULL");
+							break;
+						default:
+							elog(ERROR, "unrecognized nulltesttype: %d",
+								 (int) ntest->nulltesttype);
+					}
+				}
+				else
+				{
+					switch (ntest->nulltesttype)
+					{
+						case IS_NULL:
+							appendStringInfoString(buf, " IS NOT DISTINCT FROM NULL");
+							break;
+						case IS_NOT_NULL:
+							appendStringInfoString(buf, " IS DISTINCT FROM NULL");
+							break;
+						default:
+							elog(ERROR, "unrecognized nulltesttype: %d",
+								 (int) ntest->nulltesttype);
+					}
 				}
 				if (!PRETTY_PAREN(context))
 					appendStringInfoChar(buf, ')');
@@ -5494,13 +5601,14 @@ get_rule_expr(Node *node, deparse_context *context,
 		case T_InferenceElem:
 			{
 				InferenceElem *iexpr = (InferenceElem *) node;
-				bool		varprefix = context->varprefix;
+				bool		save_varprefix;
 				bool		need_parens;
 
 				/*
 				 * InferenceElem can only refer to target relation, so a
-				 * prefix is never useful.
+				 * prefix is not useful, and indeed would cause parse errors.
 				 */
+				save_varprefix = context->varprefix;
 				context->varprefix = false;
 
 				/*
@@ -5520,7 +5628,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				if (need_parens)
 					appendStringInfoChar(buf, ')');
 
-				context->varprefix = varprefix;
+				context->varprefix = save_varprefix;
 
 				if (iexpr->infercollid)
 					appendStringInfo(buf, " COLLATE %s",
@@ -6556,6 +6664,11 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 			if (strcmp(refname, rte->ctename) != 0)
 				printalias = true;
 		}
+		else if (rte->rtekind == RTE_SUBQUERY)
+		{
+			/* subquery requires alias too */
+			printalias = true;
+		}
 		if (printalias)
 			appendStringInfo(buf, " %s", quote_identifier(refname));
 
@@ -6975,14 +7088,16 @@ generate_relation_or_shard_name(Oid relid, Oid distrelid, int64 shardid,
 
 	if (relid == distrelid)
 	{
-		/* XXX: this is where we would--but don't yet--handle schema-prefixing */
 		relname = get_relation_name(relid);
 
 		if (shardid > 0)
 		{
+			Oid schemaOid = get_rel_namespace(relid);
+			char *schemaName = get_namespace_name(schemaOid);
+
 			AppendShardIdToName(&relname, shardid);
 
-			relname = (char *) quote_identifier(relname);
+			relname = quote_qualified_identifier(schemaName, relname);
 		}
 	}
 	else
@@ -7273,4 +7388,4 @@ generate_operator_name(Oid operid, Oid arg1, Oid arg2)
 	return buf.data;
 }
 
-#endif
+#endif /* (PG_VERSION_NUM >= 90500 && PG_VERSION_NUM < 90600) */

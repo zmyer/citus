@@ -14,8 +14,12 @@
 #ifndef MULTI_PHYSICAL_PLANNER_H
 #define MULTI_PHYSICAL_PLANNER_H
 
+#include "postgres.h"
+#include "c.h"
+
 #include "datatype/timestamp.h"
 #include "distributed/citus_nodes.h"
+#include "distributed/errormessage.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/multi_logical_planner.h"
 #include "lib/stringinfo.h"
@@ -36,9 +40,9 @@
 #define MAP_OUTPUT_FETCH_COMMAND "SELECT worker_fetch_partition_file \
  (" UINT64_FORMAT ", %u, %u, %u, '%s', %u)"
 #define RANGE_PARTITION_COMMAND "SELECT worker_range_partition_table \
- (" UINT64_FORMAT ", %d, %s, '%s', %d, %s)"
+ (" UINT64_FORMAT ", %d, %s, '%s', '%s'::regtype, %s)"
 #define HASH_PARTITION_COMMAND "SELECT worker_hash_partition_table \
- (" UINT64_FORMAT ", %d, %s, '%s', %d, %d)"
+ (" UINT64_FORMAT ", %d, %s, '%s', '%s'::regtype, %d)"
 #define MERGE_FILES_INTO_TABLE_COMMAND "SELECT worker_merge_files_into_table \
  (" UINT64_FORMAT ", %d, '%s', '%s')"
 #define MERGE_FILES_AND_RUN_QUERY_COMMAND \
@@ -78,7 +82,8 @@ typedef enum
 	MAP_OUTPUT_FETCH_TASK = 5,
 	MERGE_FETCH_TASK = 6,
 	MODIFY_TASK = 7,
-	ROUTER_TASK = 8
+	ROUTER_TASK = 8,
+	DDL_TASK = 9
 } TaskType;
 
 
@@ -111,12 +116,13 @@ typedef enum
  */
 typedef struct Job
 {
-	CitusNodeTag type;
+	CitusNode type;
 	uint64 jobId;
 	Query *jobQuery;
 	List *taskList;
 	List *dependedJobList;
 	bool subqueryPushdown;
+	bool requiresMasterEvaluation; /* only applies to modify jobs */
 } Job;
 
 
@@ -141,12 +147,20 @@ typedef struct MapMergeJob
  * as compute tasks; and shard fetch, map fetch, and merge fetch tasks are data
  * fetch tasks. We also forward declare the task execution struct here to avoid
  * including the executor header files.
+ *
+ * We currently do not take replication model into account for tasks other
+ * than modifications. When it is set to REPLICATION_MODEL_2PC, the execution
+ * of the modification task is done with two-phase commit. Set it to
+ * REPLICATION_MODEL_INVALID if it is not relevant for the task.
+ *
+ * NB: Changing this requires also changing _outTask in citus_outfuncs and _readTask
+ * in citus_readfuncs to correctly (de)serialize this struct.
  */
 typedef struct TaskExecution TaskExecution;
 
 typedef struct Task
 {
-	CitusNodeTag type;
+	CitusNode type;
 	TaskType taskType;
 	uint64 jobId;
 	uint32 taskId;
@@ -156,12 +170,16 @@ typedef struct Task
 	List *dependedTaskList;     /* only applies to compute tasks */
 
 	uint32 partitionId;
-	uint32 upstreamTaskId;        /* only applies to data fetch tasks */
-	ShardInterval *shardInterval; /* only applies to merge tasks */
-	bool assignmentConstrained;   /* only applies to merge tasks */
-	uint64 shardId;               /* only applies to shard fetch tasks */
-	TaskExecution *taskExecution; /* used by task tracker executor */
-	bool upsertQuery;             /* only applies to modify tasks */
+	uint32 upstreamTaskId;         /* only applies to data fetch tasks */
+	ShardInterval *shardInterval;  /* only applies to merge tasks */
+	bool assignmentConstrained;    /* only applies to merge tasks */
+	uint64 shardId;                /* only applies to shard fetch tasks */
+	TaskExecution *taskExecution;  /* used by task tracker executor */
+	bool upsertQuery;              /* only applies to modify tasks */
+	char replicationModel;         /* only applies to modify tasks */
+
+	bool insertSelectQuery;
+	List *relationShardList;       /* only applies INSERT/SELECT tasks */
 } Task;
 
 
@@ -194,10 +212,18 @@ typedef struct JoinSequenceNode
  */
 typedef struct MultiPlan
 {
-	CitusNodeTag type;
+	CitusNode type;
 	Job *workerJob;
 	Query *masterQuery;
 	char *masterTableName;
+	bool routerExecutable;
+
+	/*
+	 * NULL if this a valid plan, an error description otherwise. This will
+	 * e.g. be set if SQL features are present that a planner doesn't support,
+	 * or if prepared statement parameters prevented successful planning.
+	 */
+	DeferredErrorMessage *planningError;
 } MultiPlan;
 
 
@@ -220,10 +246,13 @@ extern int TaskAssignmentPolicy;
 /* Function declarations for building physical plans and constructing queries */
 extern MultiPlan * MultiPhysicalPlanCreate(MultiTreeRoot *multiTree);
 extern StringInfo ShardFetchQueryString(uint64 shardId);
+extern Task * CreateBasicTask(uint64 jobId, uint32 taskId, TaskType taskType,
+							  char *queryString);
 
 /* Function declarations for shard pruning */
 extern List * PruneShardList(Oid relationId, Index tableId, List *whereClauseList,
 							 List *shardList);
+extern bool ContainsFalseClause(List *whereClauseList);
 extern OpExpr * MakeOpExpression(Var *variable, int16 strategyNumber);
 
 /*
@@ -235,9 +264,10 @@ extern void UpdateConstraint(Node *baseConstraint, ShardInterval *shardInterval)
 extern bool SimpleOpExpression(Expr *clause);
 extern bool OpExpressionContainsColumn(OpExpr *operatorExpression, Var *partitionColumn);
 
+/* helper functions */
+extern Var * MakeInt4Column(void);
+extern Const * MakeInt4Constant(Datum constantValue);
 extern int CompareShardPlacements(const void *leftElement, const void *rightElement);
-
-/* Function declarations for sorting shards. */
 extern bool ShardIntervalsOverlap(ShardInterval *firstInterval,
 								  ShardInterval *secondInterval);
 

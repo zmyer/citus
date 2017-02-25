@@ -18,6 +18,7 @@
 #include "commands/dbcommands.h"
 #include "commands/explain.h"
 #include "commands/tablecmds.h"
+#include "optimizer/cost.h"
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_executor.h"
@@ -43,12 +44,6 @@
 #include "utils/snapmgr.h"
 
 
-#if (PG_VERSION_NUM >= 90400 && PG_VERSION_NUM < 90500)
-
-/* Crude hack to avoid changing sizeof(ExplainState) in released branches (explain.c) */
-#define grouping_stack extra->groupingstack
-#endif
-
 /* OR-able flags for ExplainXMLTag() (explain.c) */
 #define X_OPENING 0
 #define X_CLOSING 1
@@ -57,8 +52,6 @@
 
 
 /* Config variables that enable printing distributed query plans */
-bool ExplainMultiLogicalPlan = false;
-bool ExplainMultiPhysicalPlan = false;
 bool ExplainDistributedQueries = true;
 bool ExplainAllTasks = false;
 
@@ -84,6 +77,9 @@ static void ExplainTask(Task *task, int placementIndex, List *explainOutputList,
 static void ExplainTaskPlacement(ShardPlacement *taskPlacement, List *explainOutputList,
 								 ExplainState *es);
 static StringInfo BuildRemoteExplainQuery(char *queryString, ExplainState *es);
+static void MultiExplainOnePlan(PlannedStmt *plan, IntoClause *into,
+								ExplainState *es, const char *queryString,
+								ParamListInfo params, const instr_time *planDuration);
 
 /* Static Explain functions copied from explain.c */
 static void ExplainOpenGroup(const char *objtype, const char *labelname,
@@ -105,41 +101,59 @@ void
 MultiExplainOneQuery(Query *query, IntoClause *into, ExplainState *es,
 					 const char *queryString, ParamListInfo params)
 {
-	MultiPlan *multiPlan = NULL;
-	CmdType commandType = CMD_UNKNOWN;
-	PlannedStmt *initialPlan = NULL;
-	Job *workerJob = NULL;
-	bool routerExecutablePlan = false;
 	instr_time planStart;
 	instr_time planDuration;
+	int cursorOptions = 0;
+	PlannedStmt *plan = NULL;
 
-	/* if local query, run the standard explain and return */
-	bool localQuery = !NeedsDistributedPlanning(query);
-	if (localQuery)
+#if PG_VERSION_NUM >= 90600
+
+	/*
+	 * Allow parallel plans in 9.6+ unless selecting into a table.
+	 * Without this, we're breaking explain for non-Citus plans.
+	 */
+	if (!into)
 	{
-		PlannedStmt *plan = NULL;
-
-		INSTR_TIME_SET_CURRENT(planStart);
-
-		/* plan the query */
-		plan = pg_plan_query(query, 0, params);
-
-		INSTR_TIME_SET_CURRENT(planDuration);
-		INSTR_TIME_SUBTRACT(planDuration, planStart);
-
-		/* run it (if needed) and produce output */
-		ExplainOnePlan(plan, into, es, queryString, params, &planDuration);
-
-		return;
+		cursorOptions |= CURSOR_OPT_PARALLEL_OK;
 	}
+#endif
 
-	/* measure the full planning time to display in EXPLAIN ANALYZE */
+	/* plan query, just like ExplainOneQuery does */
 	INSTR_TIME_SET_CURRENT(planStart);
 
-	/* call standard planner to modify the query structure before multi planning */
-	initialPlan = standard_planner(query, 0, params);
+	/* plan the query */
+	plan = pg_plan_query(query, cursorOptions, params);
 
-	commandType = initialPlan->commandType;
+	INSTR_TIME_SET_CURRENT(planDuration);
+	INSTR_TIME_SUBTRACT(planDuration, planStart);
+
+	/* if not a distributed query, use plain explain infrastructure */
+	if (!HasCitusToplevelNode(plan))
+	{
+		/* run it (if needed) and produce output */
+		ExplainOnePlan(plan, into, es, queryString, params, &planDuration);
+	}
+	else
+	{
+		MultiExplainOnePlan(plan, into, es, queryString, params, &planDuration);
+	}
+}
+
+
+/*
+ * MultiExplainOnePlan explains the plan for an individual distributed query.
+ */
+static void
+MultiExplainOnePlan(PlannedStmt *plan, IntoClause *into,
+					ExplainState *es, const char *queryString,
+					ParamListInfo params, const instr_time *planDuration)
+{
+	MultiPlan *multiPlan = NULL;
+	CmdType commandType = CMD_UNKNOWN;
+	Job *workerJob = NULL;
+	bool routerExecutablePlan = false;
+
+	commandType = plan->commandType;
 	if (commandType == CMD_INSERT || commandType == CMD_UPDATE ||
 		commandType == CMD_DELETE)
 	{
@@ -151,29 +165,10 @@ MultiExplainOneQuery(Query *query, IntoClause *into, ExplainState *es,
 		}
 	}
 
-	multiPlan = CreatePhysicalPlan(query);
+	multiPlan = GetMultiPlan(plan);
 
-	INSTR_TIME_SET_CURRENT(planDuration);
-	INSTR_TIME_SUBTRACT(planDuration, planStart);
-
-	if (ExplainMultiLogicalPlan)
-	{
-		MultiTreeRoot *multiTree = MultiLogicalPlanCreate(query);
-		char *logicalPlanString = CitusNodeToString(multiTree);
-		char *formattedPlanString = pretty_format_node_dump(logicalPlanString);
-
-		appendStringInfo(es->str, "logical plan:\n");
-		appendStringInfo(es->str, "%s\n", formattedPlanString);
-	}
-
-	if (ExplainMultiPhysicalPlan)
-	{
-		char *physicalPlanString = CitusNodeToString(multiPlan);
-		char *formattedPlanString = pretty_format_node_dump(physicalPlanString);
-
-		appendStringInfo(es->str, "physical plan:\n");
-		appendStringInfo(es->str, "%s\n", formattedPlanString);
-	}
+	/* ensure plan is executable */
+	VerifyMultiPlanValidity(multiPlan);
 
 	if (!ExplainDistributedQueries)
 	{
@@ -199,7 +194,7 @@ MultiExplainOneQuery(Query *query, IntoClause *into, ExplainState *es,
 		es->indent += 1;
 	}
 
-	routerExecutablePlan = RouterExecutablePlan(multiPlan, TaskExecutorType);
+	routerExecutablePlan = multiPlan->routerExecutable;
 
 	if (routerExecutablePlan)
 	{
@@ -239,8 +234,6 @@ MultiExplainOneQuery(Query *query, IntoClause *into, ExplainState *es,
 
 	if (!routerExecutablePlan)
 	{
-		PlannedStmt *masterPlan = MultiQueryContainerNode(initialPlan, multiPlan);
-
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
 			appendStringInfoSpaces(es->str, es->indent * 2);
@@ -250,7 +243,7 @@ MultiExplainOneQuery(Query *query, IntoClause *into, ExplainState *es,
 
 		ExplainOpenGroup("Master Query", "Master Query", false, es);
 
-		ExplainMasterPlan(masterPlan, into, es, queryString, params, &planDuration);
+		ExplainMasterPlan(plan, into, es, queryString, params, planDuration);
 
 		ExplainCloseGroup("Master Query", "Master Query", false, es);
 

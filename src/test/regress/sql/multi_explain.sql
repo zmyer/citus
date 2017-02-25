@@ -2,10 +2,11 @@
 -- MULTI_EXPLAIN
 --
 
-
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 570000;
 ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 570000;
 
+-- print major version to make version-specific tests clear
+SELECT substring(version(), '\d+\.\d+') AS major_version;
 
 \a\t
 
@@ -111,6 +112,17 @@ EXPLAIN (COSTS FALSE)
 	CREATE TABLE explain_result AS
 	SELECT * FROM lineitem;
 
+-- Test having
+EXPLAIN (COSTS FALSE, VERBOSE TRUE)
+	SELECT sum(l_quantity) / avg(l_quantity) FROM lineitem
+	HAVING sum(l_quantity) > 100;
+
+-- Test having without aggregate
+EXPLAIN (COSTS FALSE, VERBOSE TRUE)
+	SELECT l_quantity FROM lineitem
+	GROUP BY l_quantity
+	HAVING l_quantity > (100 * random());
+
 -- Test all tasks output
 SET citus.explain_all_tasks TO on;
 
@@ -135,28 +147,28 @@ SET citus.large_table_shard_count TO 1;
 
 EXPLAIN (COSTS FALSE)
 	SELECT count(*)
-	FROM lineitem, orders, customer, supplier
+	FROM lineitem, orders, customer, supplier_single_shard
 	WHERE l_orderkey = o_orderkey
 	AND o_custkey = c_custkey
 	AND l_suppkey = s_suppkey;
 
 EXPLAIN (COSTS FALSE, FORMAT JSON)
 	SELECT count(*)
-	FROM lineitem, orders, customer, supplier
+	FROM lineitem, orders, customer, supplier_single_shard
 	WHERE l_orderkey = o_orderkey
 	AND o_custkey = c_custkey
 	AND l_suppkey = s_suppkey;
 
 SELECT true AS valid FROM explain_json($$
 	SELECT count(*)
-	FROM lineitem, orders, customer, supplier
+	FROM lineitem, orders, customer, supplier_single_shard
 	WHERE l_orderkey = o_orderkey
 	AND o_custkey = c_custkey
 	AND l_suppkey = s_suppkey$$);
 
 EXPLAIN (COSTS FALSE, FORMAT XML)
 	SELECT count(*)
-	FROM lineitem, orders, customer, supplier
+	FROM lineitem, orders, customer, supplier_single_shard
 	WHERE l_orderkey = o_orderkey
 	AND o_custkey = c_custkey
 	AND l_suppkey = s_suppkey;
@@ -168,9 +180,55 @@ SELECT true AS valid FROM explain_xml($$
 	AND o_custkey = c_custkey
 	AND l_suppkey = s_suppkey$$);
 
+-- make sure that EXPLAIN works without 
+-- problems for queries that inlvolves only 
+-- reference tables
+SELECT true AS valid FROM explain_xml($$
+	SELECT count(*)
+	FROM nation
+	WHERE n_name = 'CHINA'$$);
+
+SELECT true AS valid FROM explain_xml($$
+	SELECT count(*)
+	FROM nation, supplier
+	WHERE nation.n_nationkey = supplier.s_nationkey$$);
+
+
 EXPLAIN (COSTS FALSE, FORMAT YAML)
 	SELECT count(*)
-	FROM lineitem, orders, customer, supplier
+	FROM lineitem, orders, customer, supplier_single_shard
 	WHERE l_orderkey = o_orderkey
 	AND o_custkey = c_custkey
 	AND l_suppkey = s_suppkey;
+
+-- test parallel aggregates
+SET parallel_setup_cost=0;
+SET parallel_tuple_cost=0;
+SET min_parallel_relation_size=0;
+SET max_parallel_workers_per_gather=4;
+
+-- ensure local plans display correctly
+CREATE TABLE lineitem_clone (LIKE lineitem);
+EXPLAIN (COSTS FALSE) SELECT avg(l_linenumber) FROM lineitem_clone;
+
+-- ensure distributed plans don't break
+EXPLAIN (COSTS FALSE) SELECT avg(l_linenumber) FROM lineitem;
+
+-- ensure EXPLAIN EXECUTE doesn't crash
+PREPARE task_tracker_query AS
+	SELECT avg(l_linenumber) FROM lineitem WHERE l_orderkey > 9030;
+EXPLAIN (COSTS FALSE) EXECUTE task_tracker_query;
+
+SET citus.task_executor_type TO 'real-time';
+
+PREPARE router_executor_query AS SELECT l_quantity FROM lineitem WHERE l_orderkey = 5;
+EXPLAIN EXECUTE router_executor_query;
+
+PREPARE real_time_executor_query AS
+	SELECT avg(l_linenumber) FROM lineitem WHERE l_orderkey > 9030;
+EXPLAIN (COSTS FALSE) EXECUTE real_time_executor_query;
+
+-- EXPLAIN EXECUTE of parametrized prepared statements is broken, but
+-- at least make sure to fail without crashing
+PREPARE router_executor_query_param(int) AS SELECT l_quantity FROM lineitem WHERE l_orderkey = $1;
+EXPLAIN EXECUTE router_executor_query_param(5);

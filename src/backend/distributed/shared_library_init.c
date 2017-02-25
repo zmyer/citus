@@ -18,6 +18,10 @@
 
 #include "commands/explain.h"
 #include "executor/executor.h"
+#include "distributed/citus_nodefuncs.h"
+#include "distributed/connection_management.h"
+#include "distributed/connection_management.h"
+#include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/multi_copy.h"
 #include "distributed/multi_executor.h"
@@ -28,13 +32,17 @@
 #include "distributed/multi_router_executor.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_server_executor.h"
-#include "distributed/multi_transaction.h"
 #include "distributed/multi_utility.h"
+#include "distributed/pg_dist_partition.h"
+#include "distributed/placement_connection.h"
+#include "distributed/remote_commands.h"
 #include "distributed/task_tracker.h"
+#include "distributed/transaction_management.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
 #include "postmaster/postmaster.h"
 #include "optimizer/planner.h"
+#include "optimizer/paths.h"
 #include "utils/guc.h"
 #include "utils/guc_tables.h"
 
@@ -48,11 +56,18 @@ static void RegisterCitusConfigVariables(void);
 static void NormalizeWorkerListPath(void);
 
 
+/* *INDENT-OFF* */
 /* GUC enum definitions */
 static const struct config_enum_entry task_assignment_policy_options[] = {
 	{ "greedy", TASK_ASSIGNMENT_GREEDY, false },
 	{ "first-replica", TASK_ASSIGNMENT_FIRST_REPLICA, false },
 	{ "round-robin", TASK_ASSIGNMENT_ROUND_ROBIN, false },
+	{ NULL, 0, false }
+};
+
+static const struct config_enum_entry replication_model_options[] = {
+	{ "statement", REPLICATION_MODEL_COORDINATOR, false },
+	{ "streaming", REPLICATION_MODEL_STREAMING, false },
 	{ NULL, 0, false }
 };
 
@@ -74,6 +89,8 @@ static const struct config_enum_entry multi_shard_commit_protocol_options[] = {
 	{ "2pc", COMMIT_PROTOCOL_2PC, false },
 	{ NULL, 0, false }
 };
+
+/* *INDENT-ON* */
 
 
 /* shared library initialization function */
@@ -124,6 +141,9 @@ _PG_init(void)
 	 */
 	RegisterCitusConfigVariables();
 
+	/* make our additional node types known */
+	RegisterNodes();
+
 	/* intercept planner */
 	planner_hook = multi_planner;
 
@@ -139,11 +159,23 @@ _PG_init(void)
 	/* register utility hook */
 	ProcessUtility_hook = multi_ProcessUtility;
 
+	/* register for planner hook */
+	set_rel_pathlist_hook = multi_relation_restriction_hook;
+
 	/* organize that task tracker is started once server is up */
 	TaskTrackerRegister();
 
-	/* initialize worker node manager */
-	WorkerNodeRegister();
+	/* initialize coordinated transaction management */
+	InitializeTransactionManagement();
+	InitializeConnectionManagement();
+	InitPlacementConnectionManagement();
+
+	/* enable modification of pg_catalog tables during pg_upgrade */
+	if (IsBinaryUpgrade)
+	{
+		SetConfigOption("allow_system_table_mods", "true", PGC_POSTMASTER,
+						PGC_S_OVERRIDE);
+	}
 }
 
 
@@ -181,6 +213,17 @@ CreateRequiredDirectories(void)
 static void
 RegisterCitusConfigVariables(void)
 {
+	DefineCustomIntVariable(
+		"citus.node_connection_timeout",
+		gettext_noop("Sets the maximum duration to connect to worker nodes."),
+		NULL,
+		&NodeConnectionTimeout,
+		5000, 10, 60 * 60 * 1000,
+		PGC_USERSET,
+		GUC_UNIT_MS,
+		NULL, NULL, NULL);
+
+	/* keeping temporarily for updates from pre-6.0 versions */
 	DefineCustomStringVariable(
 		"citus.worker_list_file",
 		gettext_noop("Sets the server's \"worker_list\" configuration file."),
@@ -188,7 +231,7 @@ RegisterCitusConfigVariables(void)
 		&WorkerListFileName,
 		NULL,
 		PGC_POSTMASTER,
-		GUC_SUPERUSER_ONLY,
+		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 	NormalizeWorkerListPath();
 
@@ -250,27 +293,13 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
-		"citus.explain_multi_logical_plan",
-		gettext_noop("Enables Explain to print out distributed logical plans."),
-		gettext_noop("We use this private configuration entry as a debugging aid. "
-					 "If enabled, the Explain command prints out the optimized "
-					 "logical plan for distributed queries."),
-		&ExplainMultiLogicalPlan,
+		"citus.log_remote_commands",
+		gettext_noop("Log queries sent to other nodes in the server log"),
+		NULL,
+		&LogRemoteCommands,
 		false,
 		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		"citus.explain_multi_physical_plan",
-		gettext_noop("Enables Explain to print out distributed physical plans."),
-		gettext_noop("We use this private configuration entry as a debugging aid. "
-					 "If enabled, the Explain command prints out the physical "
-					 "plan for distributed queries."),
-		&ExplainMultiPhysicalPlan,
-		false,
-		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
+		0,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -309,11 +338,45 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		"citus.enable_deadlock_prevention",
+		gettext_noop("Prevents transactions from expanding to multiple nodes"),
+		gettext_noop("When enabled, consecutive DML statements that write to "
+					 "shards on different nodes are prevented to avoid creating "
+					 "undetectable distributed deadlocks when performed "
+					 "concurrently."),
+		&EnableDeadlockPrevention,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		"citus.enable_ddl_propagation",
 		gettext_noop("Enables propagating DDL statements to worker shards"),
 		NULL,
 		&EnableDDLPropagation,
 		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_router_execution",
+		gettext_noop("Enables router execution"),
+		NULL,
+		&EnableRouterExecution,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.shard_count",
+		gettext_noop("Sets the number of shards for a new hash-partitioned table"
+					 "created with create_distributed_table()."),
+		NULL,
+		&ShardCount,
+		32, 1, 64000,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
@@ -326,7 +389,7 @@ RegisterCitusConfigVariables(void)
 					 "configuration value at sharded table creation time, "
 					 "and later reuse the initially read value."),
 		&ShardReplicationFactor,
-		2, 1, 100,
+		1, 1, 100,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
@@ -368,7 +431,7 @@ RegisterCitusConfigVariables(void)
 					 "progress. This configuration value sets the time "
 					 "interval between two consequent checks."),
 		&RemoteTaskCheckInterval,
-		10, 1, REMOTE_NODE_CONNECT_TIMEOUT,
+		10, 1, INT_MAX,
 		PGC_USERSET,
 		GUC_UNIT_MS,
 		NULL, NULL, NULL);
@@ -382,7 +445,7 @@ RegisterCitusConfigVariables(void)
 					 "before walking over these tasks again. This configuration "
 					 "value determines the length of that sleeping period."),
 		&TaskTrackerDelay,
-		200, 10, 100000,
+		200, 1, 100000,
 		PGC_SIGHUP,
 		GUC_UNIT_MS,
 		NULL, NULL, NULL);
@@ -514,6 +577,20 @@ RegisterCitusConfigVariables(void)
 		task_assignment_policy_options,
 		PGC_USERSET,
 		0,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.replication_model",
+		gettext_noop("Sets the replication model to be used for distributed tables."),
+		gettext_noop("Depending upon the execution environment, statement- or streaming-"
+					 "based replication modes may be employed. Though most Citus deploy-"
+					 "ments will simply use statement replication, hosted and MX-style"
+					 "deployments should set this parameter to 'streaming'."),
+		&ReplicationModel,
+		REPLICATION_MODEL_COORDINATOR,
+		replication_model_options,
+		PGC_SUSET,
+		GUC_SUPERUSER_ONLY,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(

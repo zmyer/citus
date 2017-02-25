@@ -26,6 +26,7 @@
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "distributed/citus_nodes.h"
+#include "distributed/citus_ruleutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_logical_planner.h"
@@ -38,6 +39,7 @@
 #include "optimizer/clauses.h"
 #include "optimizer/tlist.h"
 #include "optimizer/var.h"
+#include "parser/parse_agg.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_oper.h"
 #include "utils/builtins.h"
@@ -125,11 +127,13 @@ static List * WorkerAggregateExpressionList(Aggref *originalAggregate,
 static AggregateType GetAggregateType(Oid aggFunctionId);
 static Oid AggregateArgumentType(Aggref *aggregate);
 static Oid AggregateFunctionOid(const char *functionName, Oid inputType);
+static Oid TypeOid(Oid schemaId, const char *typeName);
 
 /* Local functions forward declarations for count(distinct) approximations */
 static char * CountDistinctHashFunctionName(Oid argumentType);
 static int CountDistinctStorageSize(double approximationErrorRate);
 static Const * MakeIntegerConst(int32 integerValue);
+static Const * MakeIntegerConstInt64(int64 integerValue);
 
 /* Local functions forward declarations for aggregate expression checks */
 static void ErrorIfContainsUnsupportedAggregate(MultiNode *logicalPlanNode);
@@ -148,7 +152,6 @@ static void ErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerQueryHa
 static void ErrorIfUnsupportedTableCombination(Query *queryTree);
 static void ErrorIfUnsupportedUnionQuery(Query *unionQuery);
 static bool TargetListOnPartitionColumn(Query *query, List *targetEntryList);
-static bool IsPartitionColumnRecursive(Expr *columnExpression, Query *query);
 static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
 static bool FullCompositeFieldList(List *compositeFieldList);
 static Query * LateralQuery(Query *query);
@@ -811,7 +814,12 @@ SelectClauseTableIdList(List *selectClauseList)
 		Var *selectColumn = NULL;
 		int selectColumnTableId = 0;
 
-		Assert(list_length(selectColumnList) > 0);
+		if (list_length(selectColumnList) == 0)
+		{
+			/* filter is a constant, e.g. false or 1=0 */
+			continue;
+		}
+
 		selectColumn = (Var *) linitial(selectColumnList);
 		selectColumnTableId = (int) selectColumn->varno;
 
@@ -941,15 +949,23 @@ TableIdListSelectClauses(List *tableIdList, List *selectClauseList)
 	foreach(selectClauseCell, selectClauseList)
 	{
 		Node *selectClause = (Node *) lfirst(selectClauseCell);
+
 		List *selectColumnList = pull_var_clause_default(selectClause);
-
-		Var *selectColumn = (Var *) linitial(selectColumnList);
-		int selectClauseTableId = (int) selectColumn->varno;
-
-		bool tableIdListMember = list_member_int(tableIdList, selectClauseTableId);
-		if (tableIdListMember)
+		if (list_length(selectColumnList) == 0)
 		{
+			/* filter is a constant, e.g. false or 1=0, always include it */
 			tableSelectClauseList = lappend(tableSelectClauseList, selectClause);
+		}
+		else
+		{
+			Var *selectColumn = (Var *) linitial(selectColumnList);
+			int selectClauseTableId = (int) selectColumn->varno;
+
+			bool tableIdListMember = list_member_int(tableIdList, selectClauseTableId);
+			if (tableIdListMember)
+			{
+				tableSelectClauseList = lappend(tableSelectClauseList, selectClause);
+			}
 		}
 	}
 
@@ -1229,6 +1245,8 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
 	List *targetEntryList = originalOpNode->targetList;
 	List *newTargetEntryList = NIL;
 	ListCell *targetEntryCell = NULL;
+	Node *originalHavingQual = originalOpNode->havingQual;
+	Node *newHavingQual = NULL;
 	MultiNode *parentNode = ParentNode((MultiNode *) originalOpNode);
 	MultiNode *childNode = ChildNode((MultiUnaryNode *) originalOpNode);
 	MasterAggregateWalkerContext *walkerContext = palloc0(
@@ -1255,6 +1273,7 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
 		{
 			Node *newNode = MasterAggregateMutator((Node *) originalExpression,
 												   walkerContext);
+
 			newExpression = (Expr *) newNode;
 		}
 		else
@@ -1277,11 +1296,18 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
 		newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
 	}
 
+	if (originalHavingQual != NULL)
+	{
+		newHavingQual = MasterAggregateMutator(originalHavingQual, walkerContext);
+	}
+
 	masterExtendedOpNode = CitusMakeNode(MultiExtendedOp);
 	masterExtendedOpNode->targetList = newTargetEntryList;
 	masterExtendedOpNode->groupClauseList = originalOpNode->groupClauseList;
 	masterExtendedOpNode->sortClauseList = originalOpNode->sortClauseList;
 	masterExtendedOpNode->limitCount = originalOpNode->limitCount;
+	masterExtendedOpNode->limitOffset = originalOpNode->limitOffset;
+	masterExtendedOpNode->havingQual = newHavingQual;
 
 	return masterExtendedOpNode;
 }
@@ -1354,6 +1380,7 @@ MasterAggregateExpression(Aggref *originalAggregate,
 	const uint32 masterTableId = 1;  /* one table on the master node */
 	const Index columnLevelsUp = 0;  /* normal column */
 	const AttrNumber argumentId = 1; /* our aggregates have single arguments */
+	AggClauseCosts aggregateCosts;
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION &&
@@ -1417,11 +1444,18 @@ MasterAggregateExpression(Aggref *originalAggregate,
 		Aggref *unionAggregate = NULL;
 		FuncExpr *cardinalityExpression = NULL;
 
-		Oid unionFunctionId = FunctionOid(HLL_UNION_AGGREGATE_NAME, argCount);
-		Oid cardinalityFunctionId = FunctionOid(HLL_CARDINALITY_FUNC_NAME, argCount);
+		/* extract schema name of hll */
+		Oid hllId = get_extension_oid(HLL_EXTENSION_NAME, false);
+		Oid hllSchemaOid = get_extension_schema(hllId);
+		const char *hllSchemaName = get_namespace_name(hllSchemaOid);
+
+		Oid unionFunctionId = FunctionOid(hllSchemaName, HLL_UNION_AGGREGATE_NAME,
+										  argCount);
+		Oid cardinalityFunctionId = FunctionOid(hllSchemaName, HLL_CARDINALITY_FUNC_NAME,
+												argCount);
 		Oid cardinalityReturnType = get_func_rettype(cardinalityFunctionId);
 
-		Oid hllType = TypenameGetTypid(HLL_TYPE_NAME);
+		Oid hllType = TypeOid(hllSchemaOid, HLL_TYPE_NAME);
 		Oid hllTypeCollationId = get_typcollation(hllType);
 		Var *hllColumn = makeVar(masterTableId, walkerContext->columnId, hllType,
 								 defaultTypeMod,
@@ -1435,6 +1469,12 @@ MasterAggregateExpression(Aggref *originalAggregate,
 		unionAggregate->aggtype = hllType;
 		unionAggregate->args = list_make1(hllTargetEntry);
 		unionAggregate->aggkind = AGGKIND_NORMAL;
+		unionAggregate->aggfilter = NULL;
+#if (PG_VERSION_NUM >= 90600)
+		unionAggregate->aggtranstype = InvalidOid;
+		unionAggregate->aggargtypes = list_make1_oid(unionAggregate->aggtype);
+		unionAggregate->aggsplit = AGGSPLIT_SIMPLE;
+#endif
 
 		cardinalityExpression = makeNode(FuncExpr);
 		cardinalityExpression->funcid = cardinalityFunctionId;
@@ -1475,6 +1515,10 @@ MasterAggregateExpression(Aggref *originalAggregate,
 		 */
 		Var *column = NULL;
 		TargetEntry *columnTargetEntry = NULL;
+		CoerceViaIO *coerceExpr = NULL;
+		Const *zeroConst = NULL;
+		List *coalesceArgs = NULL;
+		CoalesceExpr *coalesceExpr = NULL;
 
 		/* worker aggregate and original aggregate have the same return type */
 		Oid workerReturnType = exprType((Node *) originalAggregate);
@@ -1490,6 +1534,12 @@ MasterAggregateExpression(Aggref *originalAggregate,
 		newMasterAggregate->aggdistinct = NULL;
 		newMasterAggregate->aggfnoid = sumFunctionId;
 		newMasterAggregate->aggtype = masterReturnType;
+		newMasterAggregate->aggfilter = NULL;
+#if (PG_VERSION_NUM >= 90600)
+		newMasterAggregate->aggtranstype = InvalidOid;
+		newMasterAggregate->aggargtypes = list_make1_oid(newMasterAggregate->aggtype);
+		newMasterAggregate->aggsplit = AGGSPLIT_SIMPLE;
+#endif
 
 		column = makeVar(masterTableId, walkerContext->columnId, workerReturnType,
 						 workerReturnTypeMod, workerCollationId, columnLevelsUp);
@@ -1499,7 +1549,25 @@ MasterAggregateExpression(Aggref *originalAggregate,
 		columnTargetEntry = makeTargetEntry((Expr *) column, argumentId, NULL, false);
 		newMasterAggregate->args = list_make1(columnTargetEntry);
 
-		newMasterExpression = (Expr *) newMasterAggregate;
+		/* cast numeric sum result to bigint (count's return type) */
+		coerceExpr = makeNode(CoerceViaIO);
+		coerceExpr->arg = (Expr *) newMasterAggregate;
+		coerceExpr->resulttype = INT8OID;
+		coerceExpr->resultcollid = InvalidOid;
+		coerceExpr->coerceformat = COERCE_IMPLICIT_CAST;
+		coerceExpr->location = -1;
+
+		/* convert NULL to 0 in case of no rows */
+		zeroConst = MakeIntegerConstInt64(0);
+		coalesceArgs = list_make2(coerceExpr, zeroConst);
+
+		coalesceExpr = makeNode(CoalesceExpr);
+		coalesceExpr->coalescetype = INT8OID;
+		coalesceExpr->coalescecollid = InvalidOid;
+		coalesceExpr->args = coalesceArgs;
+		coalesceExpr->location = -1;
+
+		newMasterExpression = (Expr *) coalesceExpr;
 	}
 	else if (aggregateType == AGGREGATE_ARRAY_AGG)
 	{
@@ -1536,6 +1604,12 @@ MasterAggregateExpression(Aggref *originalAggregate,
 		newMasterAggregate = copyObject(originalAggregate);
 		newMasterAggregate->aggfnoid = aggregateFunctionId;
 		newMasterAggregate->args = list_make1(arrayCatAggArgument);
+		newMasterAggregate->aggfilter = NULL;
+#if (PG_VERSION_NUM >= 90600)
+		newMasterAggregate->aggtranstype = InvalidOid;
+		newMasterAggregate->aggargtypes = list_make1_oid(ANYARRAYOID);
+		newMasterAggregate->aggsplit = AGGSPLIT_SIMPLE;
+#endif
 
 		newMasterExpression = (Expr *) newMasterAggregate;
 	}
@@ -1561,6 +1635,7 @@ MasterAggregateExpression(Aggref *originalAggregate,
 		newMasterAggregate->aggdistinct = NULL;
 		newMasterAggregate->aggfnoid = aggregateFunctionId;
 		newMasterAggregate->aggtype = masterReturnType;
+		newMasterAggregate->aggfilter = NULL;
 
 		column = makeVar(masterTableId, walkerContext->columnId, workerReturnType,
 						 workerReturnTypeMod, workerCollationId, columnLevelsUp);
@@ -1585,6 +1660,16 @@ MasterAggregateExpression(Aggref *originalAggregate,
 	{
 		newMasterExpression = typeConvertedExpression;
 	}
+
+	/* Run AggRefs through cost machinery to mark required fields sanely */
+	memset(&aggregateCosts, 0, sizeof(aggregateCosts));
+
+#if PG_VERSION_NUM >= 90600
+	get_agg_clause_costs(NULL, (Node *) newMasterExpression, AGGSPLIT_SIMPLE,
+						 &aggregateCosts);
+#else
+	count_agg_clauses(NULL, (Node *) newMasterExpression, &aggregateCosts);
+#endif
 
 	return newMasterExpression;
 }
@@ -1628,6 +1713,11 @@ MasterAverageExpression(Oid sumAggregateType, Oid countAggregateType,
 	firstSum->aggtype = get_func_rettype(firstSum->aggfnoid);
 	firstSum->args = list_make1(firstTargetEntry);
 	firstSum->aggkind = AGGKIND_NORMAL;
+#if (PG_VERSION_NUM >= 90600)
+	firstSum->aggtranstype = InvalidOid;
+	firstSum->aggargtypes = list_make1_oid(firstSum->aggtype);
+	firstSum->aggsplit = AGGSPLIT_SIMPLE;
+#endif
 
 	/* create the second argument for sum(column2) */
 	secondColumn = makeVar(masterTableId, (*columnId), countAggregateType,
@@ -1640,6 +1730,11 @@ MasterAverageExpression(Oid sumAggregateType, Oid countAggregateType,
 	secondSum->aggtype = get_func_rettype(secondSum->aggfnoid);
 	secondSum->args = list_make1(secondTargetEntry);
 	secondSum->aggkind = AGGKIND_NORMAL;
+#if (PG_VERSION_NUM >= 90600)
+	secondSum->aggtranstype = InvalidOid;
+	secondSum->aggargtypes = list_make1_oid(firstSum->aggtype);
+	secondSum->aggsplit = AGGSPLIT_SIMPLE;
+#endif
 
 	/*
 	 * Build the division operator between these two aggregates. This function
@@ -1702,6 +1797,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 	ListCell *targetEntryCell = NULL;
 	List *newTargetEntryList = NIL;
 	List *groupClauseList = copyObject(originalOpNode->groupClauseList);
+	Node *havingQual = originalOpNode->havingQual;
 	AttrNumber targetProjectionNumber = 1;
 	WorkerAggregateWalkerContext *walkerContext =
 		palloc0(sizeof(WorkerAggregateWalkerContext));
@@ -1743,6 +1839,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 		if (hasAggregates)
 		{
 			WorkerAggregateWalker((Node *) originalExpression, walkerContext);
+
 			newExpressionList = walkerContext->expressionList;
 		}
 		else
@@ -1802,6 +1899,41 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 			newTargetEntry->resno = targetProjectionNumber;
 			targetProjectionNumber++;
 			newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
+		}
+	}
+
+	/* we also need to add having expressions to worker target list */
+	if (havingQual != NULL)
+	{
+		List *newExpressionList = NIL;
+		ListCell *newExpressionCell = NULL;
+
+		/* reset walker context */
+		walkerContext->expressionList = NIL;
+		walkerContext->createGroupByClause = false;
+
+		WorkerAggregateWalker(havingQual, walkerContext);
+		newExpressionList = walkerContext->expressionList;
+
+		/* now create target entries for each new expression */
+		foreach(newExpressionCell, newExpressionList)
+		{
+			TargetEntry *newTargetEntry = makeNode(TargetEntry);
+			StringInfo columnNameString = makeStringInfo();
+
+			Expr *newExpression = (Expr *) lfirst(newExpressionCell);
+			newTargetEntry->expr = newExpression;
+
+			appendStringInfo(columnNameString, WORKER_COLUMN_FORMAT,
+							 targetProjectionNumber);
+			newTargetEntry->resname = columnNameString->data;
+
+			/* force resjunk to false as we may need this on the master */
+			newTargetEntry->resjunk = false;
+			newTargetEntry->resno = targetProjectionNumber;
+
+			newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
+			targetProjectionNumber++;
 		}
 	}
 
@@ -1871,6 +2003,7 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 {
 	AggregateType aggregateType = GetAggregateType(originalAggregate->aggfnoid);
 	List *workerAggregateList = NIL;
+	AggClauseCosts aggregateCosts;
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION &&
@@ -1909,13 +2042,20 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 		TargetEntry *argument = (TargetEntry *) linitial(originalAggregate->args);
 		Expr *argumentExpression = copyObject(argument->expr);
 
+		/* extract schema name of hll */
+		Oid hllId = get_extension_oid(HLL_EXTENSION_NAME, false);
+		Oid hllSchemaOid = get_extension_schema(hllId);
+		const char *hllSchemaName = get_namespace_name(hllSchemaOid);
+
 		char *hashFunctionName = CountDistinctHashFunctionName(argumentType);
-		Oid hashFunctionId = FunctionOid(hashFunctionName, hashArgumentCount);
+		Oid hashFunctionId = FunctionOid(hllSchemaName, hashFunctionName,
+										 hashArgumentCount);
 		Oid hashFunctionReturnType = get_func_rettype(hashFunctionId);
 
 		/* init hll_add_agg() related variables */
-		Oid addFunctionId = FunctionOid(HLL_ADD_AGGREGATE_NAME, addArgumentCount);
-		Oid hllType = TypenameGetTypid(HLL_TYPE_NAME);
+		Oid addFunctionId = FunctionOid(hllSchemaName, HLL_ADD_AGGREGATE_NAME,
+										addArgumentCount);
+		Oid hllType = TypeOid(hllSchemaOid, HLL_TYPE_NAME);
 		int logOfStorageSize = CountDistinctStorageSize(CountDistinctErrorRate);
 		Const *logOfStorageSizeConst = MakeIntegerConst(logOfStorageSize);
 
@@ -1937,6 +2077,8 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 		addAggregateFunction->aggtype = hllType;
 		addAggregateFunction->args = addAggregateArgumentList;
 		addAggregateFunction->aggkind = AGGKIND_NORMAL;
+		addAggregateFunction->aggfilter = (Expr *) copyObject(
+			originalAggregate->aggfilter);
 
 		workerAggregateList = lappend(workerAggregateList, addAggregateFunction);
 	}
@@ -1963,9 +2105,20 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 		sumAggregate->aggfnoid = AggregateFunctionOid(sumAggregateName, argumentType);
 		sumAggregate->aggtype = get_func_rettype(sumAggregate->aggfnoid);
 
+#if (PG_VERSION_NUM >= 90600)
+		sumAggregate->aggtranstype = InvalidOid;
+		sumAggregate->aggargtypes = list_make1_oid(argumentType);
+		sumAggregate->aggsplit = AGGSPLIT_SIMPLE;
+#endif
+
 		/* count has any input type */
 		countAggregate->aggfnoid = AggregateFunctionOid(countAggregateName, ANYOID);
 		countAggregate->aggtype = get_func_rettype(countAggregate->aggfnoid);
+#if (PG_VERSION_NUM >= 90600)
+		countAggregate->aggtranstype = InvalidOid;
+		countAggregate->aggargtypes = list_make1_oid(argumentType);
+		countAggregate->aggsplit = AGGSPLIT_SIMPLE;
+#endif
 
 		workerAggregateList = lappend(workerAggregateList, sumAggregate);
 		workerAggregateList = lappend(workerAggregateList, countAggregate);
@@ -1979,6 +2132,17 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 		Aggref *workerAggregate = copyObject(originalAggregate);
 		workerAggregateList = lappend(workerAggregateList, workerAggregate);
 	}
+
+
+	/* Run AggRefs through cost machinery to mark required fields sanely */
+	memset(&aggregateCosts, 0, sizeof(aggregateCosts));
+
+#if PG_VERSION_NUM >= 90600
+	get_agg_clause_costs(NULL, (Node *) workerAggregateList, AGGSPLIT_SIMPLE,
+						 &aggregateCosts);
+#else
+	count_agg_clauses(NULL, (Node *) workerAggregateList, &aggregateCosts);
+#endif
 
 	return workerAggregateList;
 }
@@ -2101,18 +2265,19 @@ AggregateFunctionOid(const char *functionName, Oid inputType)
  * of arguments, and returns the corresponding function's oid.
  */
 Oid
-FunctionOid(const char *functionName, int argumentCount)
+FunctionOid(const char *schemaName, const char *functionName, int argumentCount)
 {
 	FuncCandidateList functionList = NULL;
 	Oid functionOid = InvalidOid;
 
-	List *qualifiedFunctionName = stringToQualifiedNameList(functionName);
+	char *qualifiedFunctionName = quote_qualified_identifier(schemaName, functionName);
+	List *qualifiedFunctionNameList = stringToQualifiedNameList(qualifiedFunctionName);
 	List *argumentList = NIL;
 	const bool findVariadics = false;
 	const bool findDefaults = false;
 	const bool missingOK = true;
 
-	functionList = FuncnameGetCandidates(qualifiedFunctionName, argumentCount,
+	functionList = FuncnameGetCandidates(qualifiedFunctionNameList, argumentCount,
 										 argumentList, findVariadics,
 										 findDefaults, missingOK);
 
@@ -2130,6 +2295,22 @@ FunctionOid(const char *functionName, int argumentCount)
 	/* get function oid from function list's head */
 	functionOid = functionList->oid;
 	return functionOid;
+}
+
+
+/*
+ * TypeOid looks for a type that has the given name and schema, and returns the
+ * corresponding type's oid.
+ */
+static Oid
+TypeOid(Oid schemaId, const char *typeName)
+{
+	Oid typeOid;
+
+	typeOid = GetSysCacheOid2(TYPENAMENSP, PointerGetDatum(typeName),
+							  ObjectIdGetDatum(schemaId));
+
+	return typeOid;
 }
 
 
@@ -2220,6 +2401,24 @@ MakeIntegerConst(int32 integerValue)
 }
 
 
+/* Makes a 64-bit integer constant node from the given value, and returns that node. */
+static Const *
+MakeIntegerConstInt64(int64 integerValue)
+{
+	const int typeCollationId = get_typcollation(INT8OID);
+	const int16 typeLength = get_typlen(INT8OID);
+	const int32 typeModifier = -1;
+	const bool typeIsNull = false;
+	const bool typePassByValue = true;
+
+	Datum integer64Datum = Int64GetDatum(integerValue);
+	Const *integer64Const = makeConst(INT8OID, typeModifier, typeCollationId, typeLength,
+									  integer64Datum, typeIsNull, typePassByValue);
+
+	return integer64Const;
+}
+
+
 /*
  * ErrorIfContainsUnsupportedAggregate extracts aggregate expressions from the
  * logical plan, walks over them and uses helper functions to check if we can
@@ -2233,8 +2432,18 @@ ErrorIfContainsUnsupportedAggregate(MultiNode *logicalPlanNode)
 	MultiExtendedOp *extendedOpNode = (MultiExtendedOp *) linitial(opNodeList);
 
 	List *targetList = extendedOpNode->targetList;
+
+#if (PG_VERSION_NUM >= 90600)
+
+	/*
+	 * PVC_REJECT_PLACEHOLDERS is now implicit if PVC_INCLUDE_PLACEHOLDERS
+	 * isn't specified.
+	 */
+	List *expressionList = pull_var_clause((Node *) targetList, PVC_INCLUDE_AGGREGATES);
+#else
 	List *expressionList = pull_var_clause((Node *) targetList, PVC_INCLUDE_AGGREGATES,
 										   PVC_REJECT_PLACEHOLDERS);
+#endif
 
 	ListCell *expressionCell = NULL;
 	foreach(expressionCell, expressionList)
@@ -2707,7 +2916,7 @@ ErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerQueryHasLimit)
 	if (subqueryTree->limitOffset)
 	{
 		preconditionsSatisfied = false;
-		errorDetail = "Limit Offset clause is currently unsupported";
+		errorDetail = "Offset clause is currently unsupported";
 	}
 
 	if (subqueryTree->limitCount && !outerQueryHasLimit)
@@ -3071,7 +3280,7 @@ TargetListOnPartitionColumn(Query *query, List *targetEntryList)
 		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
 		Expr *targetExpression = targetEntry->expr;
 
-		bool isPartitionColumn = IsPartitionColumnRecursive(targetExpression, query);
+		bool isPartitionColumn = IsPartitionColumn(targetExpression, query);
 		if (isPartitionColumn)
 		{
 			FieldSelect *compositeField = CompositeFieldRecursive(targetExpression,
@@ -3103,27 +3312,61 @@ TargetListOnPartitionColumn(Query *query, List *targetEntryList)
 
 
 /*
- * IsPartitionColumnRecursive recursively checks if the given column is a partition
- * column. If a column is referenced from a regular table, we directly check if
- * it is a partition column. If a column is referenced from a subquery, then we
- * recursively check that subquery until we reach the source of that column, and
- * verify this column is a partition column. If a column is referenced from a
- * join range table entry, then we resolve which join column it refers and
- * recursively check this column with the same query.
+ * IsPartitionColumn returns true if the given column is a partition column.
+ * The function uses FindReferencedTableColumn to find the original relation
+ * id and column that the column expression refers to. It then checks whether
+ * that column is a partition column of the relation.
  *
- * Note that if the given expression is a field of a composite type, then this
- * function checks if this composite column is a partition column.
+ * Also, the function returns always false for reference tables given that
+ * reference tables do not have partition column. The function does not
+ * support queries with CTEs, it would return false if columnExpression
+ * refers to a column returned by a CTE.
  */
-static bool
-IsPartitionColumnRecursive(Expr *columnExpression, Query *query)
+bool
+IsPartitionColumn(Expr *columnExpression, Query *query)
 {
 	bool isPartitionColumn = false;
+	Oid relationId = InvalidOid;
+	Var *column = NULL;
+
+	FindReferencedTableColumn(columnExpression, NIL, query, &relationId, &column);
+
+	if (relationId != InvalidOid && column != NULL)
+	{
+		Var *partitionColumn = PartitionKey(relationId);
+
+		/* not all distributed tables have partition column */
+		if (partitionColumn != NULL && column->varattno == partitionColumn->varattno)
+		{
+			isPartitionColumn = true;
+		}
+	}
+
+	return isPartitionColumn;
+}
+
+
+/*
+ * FindReferencedTableColumn recursively traverses query tree to find actual relation
+ * id, and column that columnExpression refers to. If columnExpression is a
+ * non-relational or computed/derived expression, the function returns InvolidOid for
+ * relationId and NULL for column. The caller should provide parent query list from
+ * top of the tree to this particular Query's parent. This argument is used to look
+ * into CTEs that may be present in the query.
+ */
+void
+FindReferencedTableColumn(Expr *columnExpression, List *parentQueryList, Query *query,
+						  Oid *relationId, Var **column)
+{
 	Var *candidateColumn = NULL;
 	List *rangetableList = query->rtable;
 	Index rangeTableEntryIndex = 0;
 	RangeTblEntry *rangeTableEntry = NULL;
 	Expr *strippedColumnExpression = (Expr *) strip_implicit_coercions(
 		(Node *) columnExpression);
+
+	*relationId = InvalidOid;
+	*column = NULL;
 
 	if (IsA(strippedColumnExpression, Var))
 	{
@@ -3138,17 +3381,11 @@ IsPartitionColumnRecursive(Expr *columnExpression, Query *query)
 		{
 			candidateColumn = (Var *) fieldExpression;
 		}
-		else
-		{
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("cannot push down this subquery"),
-							errdetail("Only references to column fields are supported")));
-		}
 	}
 
 	if (candidateColumn == NULL)
 	{
-		return false;
+		return;
 	}
 
 	rangeTableEntryIndex = candidateColumn->varno - 1;
@@ -3156,13 +3393,8 @@ IsPartitionColumnRecursive(Expr *columnExpression, Query *query)
 
 	if (rangeTableEntry->rtekind == RTE_RELATION)
 	{
-		Oid relationId = rangeTableEntry->relid;
-		Var *partitionColumn = PartitionKey(relationId);
-
-		if (candidateColumn->varattno == partitionColumn->varattno)
-		{
-			isPartitionColumn = true;
-		}
+		*relationId = rangeTableEntry->relid;
+		*column = candidateColumn;
 	}
 	else if (rangeTableEntry->rtekind == RTE_SUBQUERY)
 	{
@@ -3170,9 +3402,12 @@ IsPartitionColumnRecursive(Expr *columnExpression, Query *query)
 		List *targetEntryList = subquery->targetList;
 		AttrNumber targetEntryIndex = candidateColumn->varattno - 1;
 		TargetEntry *subqueryTargetEntry = list_nth(targetEntryList, targetEntryIndex);
+		Expr *subColumnExpression = subqueryTargetEntry->expr;
 
-		Expr *subqueryExpression = subqueryTargetEntry->expr;
-		isPartitionColumn = IsPartitionColumnRecursive(subqueryExpression, subquery);
+		/* append current query to parent query list */
+		parentQueryList = lappend(parentQueryList, query);
+		FindReferencedTableColumn(subColumnExpression, parentQueryList,
+								  subquery, relationId, column);
 	}
 	else if (rangeTableEntry->rtekind == RTE_JOIN)
 	{
@@ -3180,10 +3415,52 @@ IsPartitionColumnRecursive(Expr *columnExpression, Query *query)
 		AttrNumber joinColumnIndex = candidateColumn->varattno - 1;
 		Expr *joinColumn = list_nth(joinColumnList, joinColumnIndex);
 
-		isPartitionColumn = IsPartitionColumnRecursive(joinColumn, query);
+		/* parent query list stays the same since still in the same query boundary */
+		FindReferencedTableColumn(joinColumn, parentQueryList, query,
+								  relationId, column);
 	}
+	else if (rangeTableEntry->rtekind == RTE_CTE)
+	{
+		int cteParentListIndex = list_length(parentQueryList) -
+								 rangeTableEntry->ctelevelsup - 1;
+		Query *cteParentQuery = NULL;
+		List *cteList = NIL;
+		ListCell *cteListCell = NULL;
+		CommonTableExpr *cte = NULL;
 
-	return isPartitionColumn;
+		/*
+		 * This should have been an error case, not marking it as error at the
+		 * moment due to usage from IsPartitionColumn. Callers of that function
+		 * do not have access to parent query list.
+		 */
+		if (cteParentListIndex >= 0)
+		{
+			cteParentQuery = list_nth(parentQueryList, cteParentListIndex);
+			cteList = cteParentQuery->cteList;
+		}
+
+		foreach(cteListCell, cteList)
+		{
+			CommonTableExpr *candidateCte = (CommonTableExpr *) lfirst(cteListCell);
+			if (strcmp(candidateCte->ctename, rangeTableEntry->ctename) == 0)
+			{
+				cte = candidateCte;
+				break;
+			}
+		}
+
+		if (cte != NULL)
+		{
+			Query *cteQuery = (Query *) cte->ctequery;
+			List *targetEntryList = cteQuery->targetList;
+			AttrNumber targetEntryIndex = candidateColumn->varattno - 1;
+			TargetEntry *targetEntry = list_nth(targetEntryList, targetEntryIndex);
+
+			parentQueryList = lappend(parentQueryList, query);
+			FindReferencedTableColumn(targetEntry->expr, parentQueryList,
+									  cteQuery, relationId, column);
+		}
+	}
 }
 
 
@@ -3347,10 +3624,10 @@ SupportedLateralQuery(Query *parentQuery, Query *lateralQuery)
 	bool supportedLateralQuery = false;
 	List *outerCompositeFieldList = NIL;
 	List *localCompositeFieldList = NIL;
-	List *whereClauseList = WhereClauseList(lateralQuery->jointree);
+	ListCell *qualifierCell = NULL;
 
-	ListCell *whereClauseCell = NULL;
-	foreach(whereClauseCell, whereClauseList)
+	List *qualifierList = QualifierList(lateralQuery->jointree);
+	foreach(qualifierCell, qualifierList)
 	{
 		OpExpr *operatorExpression = NULL;
 		List *argumentList = NIL;
@@ -3364,13 +3641,13 @@ SupportedLateralQuery(Query *parentQuery, Query *lateralQuery)
 		bool outerColumnIsPartitionColumn = false;
 		bool localColumnIsPartitionColumn = false;
 
-		Node *clause = (Node *) lfirst(whereClauseCell);
-		if (!IsA(clause, OpExpr))
+		Node *qualifier = (Node *) lfirst(qualifierCell);
+		if (!IsA(qualifier, OpExpr))
 		{
 			continue;
 		}
 
-		operatorExpression = (OpExpr *) clause;
+		operatorExpression = (OpExpr *) qualifier;
 		argumentList = operatorExpression->args;
 
 		/*
@@ -3452,10 +3729,10 @@ SupportedLateralQuery(Query *parentQuery, Query *lateralQuery)
 			continue;
 		}
 
-		outerColumnIsPartitionColumn = IsPartitionColumnRecursive(outerQueryExpression,
-																  parentQuery);
-		localColumnIsPartitionColumn = IsPartitionColumnRecursive(localQueryExpression,
-																  lateralQuery);
+		outerColumnIsPartitionColumn = IsPartitionColumn(outerQueryExpression,
+														 parentQuery);
+		localColumnIsPartitionColumn = IsPartitionColumn(localQueryExpression,
+														 lateralQuery);
 
 		if (outerColumnIsPartitionColumn && localColumnIsPartitionColumn)
 		{
@@ -3513,8 +3790,8 @@ JoinOnPartitionColumn(Query *query)
 	bool joinOnPartitionColumn = false;
 	List *leftCompositeFieldList = NIL;
 	List *rightCompositeFieldList = NIL;
-	List *whereClauseList = WhereClauseList(query->jointree);
-	List *joinClauseList = JoinClauseList(whereClauseList);
+	List *qualifierList = QualifierList(query->jointree);
+	List *joinClauseList = JoinClauseList(qualifierList);
 
 	ListCell *joinClauseCell = NULL;
 	foreach(joinClauseCell, joinClauseList)
@@ -3530,8 +3807,8 @@ JoinOnPartitionColumn(Query *query)
 		leftArgument = (Expr *) linitial(joinArgumentList);
 		rightArgument = (Expr *) lsecond(joinArgumentList);
 
-		isLeftColumnPartitionColumn = IsPartitionColumnRecursive(leftArgument, query);
-		isRightColumnPartitionColumn = IsPartitionColumnRecursive(rightArgument, query);
+		isLeftColumnPartitionColumn = IsPartitionColumn(leftArgument, query);
+		isRightColumnPartitionColumn = IsPartitionColumn(rightArgument, query);
 
 		if (isLeftColumnPartitionColumn && isRightColumnPartitionColumn)
 		{
@@ -3659,7 +3936,7 @@ ErrorIfUnsupportedShardDistribution(Query *query)
 /*
  * RelationIdList returns list of unique relation ids in query tree.
  */
-List *
+static List *
 RelationIdList(Query *query)
 {
 	List *rangeTableList = NIL;
@@ -3980,7 +4257,8 @@ PartitionColumnOpExpressionList(Query *query)
 		relationId = rangeTableEntry->relid;
 		partitionColumn = PartitionKey(relationId);
 
-		if (candidatePartitionColumn->varattno == partitionColumn->varattno)
+		if (partitionColumn != NULL &&
+			candidatePartitionColumn->varattno == partitionColumn->varattno)
 		{
 			partitionColumnOpExpressionList = lappend(partitionColumnOpExpressionList,
 													  whereClause);
@@ -4080,16 +4358,35 @@ EqualOpExpressionLists(List *firstOpExpressionList, List *secondOpExpressionList
  * WorkerLimitCount checks if the given extended node contains a limit node, and
  * if that node can be pushed down. For this, the function checks if this limit
  * count or a meaningful approximation of it can be pushed down to worker nodes.
- * If they can, the function returns the limit count. Otherwise, the function
+ * If they can, the function returns the limit count.
+ *
+ * The limit push-down decision tree is as follows:
+ *                                 group by?
+ *                              1/           \0
+ *                          order by?         (exact pd)
+ *                       1/           \0
+ *           has order by agg?          (no pd)
+ *            1/           \0
+ *     can approximate?    (exact pd)
+ *      1/       \0
+ * (approx pd)   (no pd)
+ *
+ * When an offset is present, the offset value is added to limit because for a query
+ * with LIMIT x OFFSET y, (x+y) records should be pulled from the workers.
+ *
+ * If no limit is present or can be pushed down, then WorkerLimitCount
  * returns null.
  */
 static Node *
 WorkerLimitCount(MultiExtendedOp *originalOpNode)
 {
-	Node *workerLimitCount = NULL;
+	Node *workerLimitNode = NULL;
 	List *groupClauseList = originalOpNode->groupClauseList;
 	List *sortClauseList = originalOpNode->sortClauseList;
 	List *targetList = originalOpNode->targetList;
+	bool hasOrderByAggregate = HasOrderByAggregate(sortClauseList, targetList);
+	bool canPushDownLimit = false;
+	bool canApproximate = false;
 
 	/* no limit node to push down */
 	if (originalOpNode->limitCount == NULL)
@@ -4104,38 +4401,61 @@ WorkerLimitCount(MultiExtendedOp *originalOpNode)
 	 */
 	if (groupClauseList == NIL)
 	{
-		workerLimitCount = originalOpNode->limitCount;
+		canPushDownLimit = true;
 	}
-	else if (sortClauseList != NIL)
+	else if (sortClauseList == NIL)
 	{
-		bool orderByNonAggregates = !(HasOrderByAggregate(sortClauseList, targetList));
-		bool canApproximate = CanPushDownLimitApproximate(sortClauseList, targetList);
+		canPushDownLimit = false;
+	}
+	else if (!hasOrderByAggregate)
+	{
+		canPushDownLimit = true;
+	}
+	else
+	{
+		canApproximate = CanPushDownLimitApproximate(sortClauseList, targetList);
+	}
 
-		if (orderByNonAggregates)
-		{
-			workerLimitCount = originalOpNode->limitCount;
-		}
-		else if (canApproximate)
-		{
-			Const *workerLimitConst = (Const *) copyObject(originalOpNode->limitCount);
-			int64 workerLimitCountInt64 = (int64) LimitClauseRowFetchCount;
-			workerLimitConst->constvalue = Int64GetDatum(workerLimitCountInt64);
+	/* create the workerLimitNode according to the decisions above */
+	if (canPushDownLimit)
+	{
+		workerLimitNode = (Node *) copyObject(originalOpNode->limitCount);
+	}
+	else if (canApproximate)
+	{
+		Const *workerLimitConst = (Const *) copyObject(originalOpNode->limitCount);
+		int64 workerLimitCount = (int64) LimitClauseRowFetchCount;
+		workerLimitConst->constvalue = Int64GetDatum(workerLimitCount);
 
-			workerLimitCount = (Node *) workerLimitConst;
-		}
+		workerLimitNode = (Node *) workerLimitConst;
+	}
+
+	/*
+	 * If offset clause is present and limit can be pushed down (whether exactly or
+	 * approximately), add the offset value to limit on workers
+	 */
+	if (workerLimitNode != NULL && originalOpNode->limitOffset != NULL)
+	{
+		Const *workerLimitConst = (Const *) workerLimitNode;
+		Const *workerOffsetConst = (Const *) originalOpNode->limitOffset;
+		int64 workerLimitCount = DatumGetInt64(workerLimitConst->constvalue);
+		int64 workerOffsetCount = DatumGetInt64(workerOffsetConst->constvalue);
+
+		workerLimitCount = workerLimitCount + workerOffsetCount;
+		workerLimitNode = (Node *) MakeIntegerConstInt64(workerLimitCount);
 	}
 
 	/* display debug message on limit push down */
-	if (workerLimitCount != NULL)
+	if (workerLimitNode != NULL)
 	{
-		Const *workerLimitConst = (Const *) workerLimitCount;
-		int64 workerLimitCountInt64 = DatumGetInt64(workerLimitConst->constvalue);
+		Const *workerLimitConst = (Const *) workerLimitNode;
+		int64 workerLimitCount = DatumGetInt64(workerLimitConst->constvalue);
 
 		ereport(DEBUG1, (errmsg("push down of limit count: " INT64_FORMAT,
-								workerLimitCountInt64)));
+								workerLimitCount)));
 	}
 
-	return workerLimitCount;
+	return workerLimitNode;
 }
 
 
@@ -4331,9 +4651,21 @@ static bool
 HasOrderByHllType(List *sortClauseList, List *targetList)
 {
 	bool hasOrderByHllType = false;
-	Oid hllTypeId = TypenameGetTypid(HLL_TYPE_NAME);
-
+	Oid hllId = InvalidOid;
+	Oid hllSchemaOid = InvalidOid;
+	Oid hllTypeId = InvalidOid;
 	ListCell *sortClauseCell = NULL;
+
+	/* check whether HLL is loaded */
+	hllId = get_extension_oid(HLL_EXTENSION_NAME, true);
+	if (!OidIsValid(hllId))
+	{
+		return hasOrderByHllType;
+	}
+
+	hllSchemaOid = get_extension_schema(hllId);
+	hllTypeId = TypeOid(hllSchemaOid, HLL_TYPE_NAME);
+
 	foreach(sortClauseCell, sortClauseList)
 	{
 		SortGroupClause *sortClause = (SortGroupClause *) lfirst(sortClauseCell);

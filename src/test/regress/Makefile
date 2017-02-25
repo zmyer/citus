@@ -14,7 +14,7 @@ endif
 ## Citus regression support
 ##
 MULTI_INSTALLDIR=$(CURDIR)/tmp_check/install
-pg_regress_multi_check = $(PERL) $(citus_abs_srcdir)/pg_regress_multi.pl --pgxsdir="$(pgxsdir)" --bindir="$(bindir)" --libdir="$(libdir)" --majorversion="$(MAJORVERSION)"
+pg_regress_multi_check = $(PERL) $(citus_abs_srcdir)/pg_regress_multi.pl --pgxsdir="$(pgxsdir)" --bindir="$(bindir)" --libdir="$(libdir)" --majorversion="$(MAJORVERSION)" --postgres-builddir="$(postgres_abs_builddir)"  --postgres-srcdir="$(postgres_abs_srcdir)"
 MULTI_REGRESS_OPTS = --inputdir=$(citus_abs_srcdir) $(pg_regress_locale_flags)
 
 # XXX: Can't actually do useful testruns against install - $libdir
@@ -37,7 +37,7 @@ output_files := $(patsubst $(citus_abs_srcdir)/output/%.source,expected/%.out, $
 # intermediate, for muscle memory backward compatibility.
 check: check-full
 # check-full triggers all tests that ought to be run routinely
-check-full: check-multi check-multi-task-tracker-extra check-multi-binary check-worker check-multi-fdw
+check-full: check-multi check-multi-mx check-multi-task-tracker-extra check-multi-binary check-worker
 
 # using pg_regress_multi_check unnecessarily starts up multiple nodes, which isn't needed
 # for check-worker. But that's harmless besides a few cycles.
@@ -49,13 +49,20 @@ check-multi: all tempinstall-main
 	$(pg_regress_multi_check) --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule $(EXTRA_TESTS)
 
-check-multi-fdw: all tempinstall-main
-	$(pg_regress_multi_check) --load-extension=citus --load-extension=file_fdw -- \
-	$(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_fdw_schedule $(EXTRA_TESTS)
+check-multi-vg: all tempinstall-main
+	$(pg_regress_multi_check) --load-extension=citus --valgrind \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule $(EXTRA_TESTS)
 
-check-multi-hll: all tempinstall-main
-	$(pg_regress_multi_check) --load-extension=citus --load-extension=hll -- \
-	$(MULTI_REGRESS_OPTS) $(EXTRA_TESTS) multi_create_table multi_master_protocol multi_stage_data multi_agg_approximate_distinct
+check-isolation: all tempinstall-main
+	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/isolation_schedule $(EXTRA_TESTS)
+
+check-vanilla: all tempinstall-main
+	$(pg_regress_multi_check) --load-extension=citus --vanillatest
+	
+check-multi-mx: all tempinstall-main
+	$(pg_regress_multi_check) --load-extension=citus \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_mx_schedule $(EXTRA_TESTS)
 
 check-multi-task-tracker-extra: all tempinstall-main
 	$(pg_regress_multi_check) --load-extension=citus \

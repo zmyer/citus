@@ -29,7 +29,7 @@ CREATE TABLE lineitem_alter (
 	l_comment varchar(44) not null
 	);
 SELECT master_create_distributed_table('lineitem_alter', 'l_orderkey', 'append');
-\STAGE lineitem_alter FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
+\copy lineitem_alter FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
 
 -- Verify that we can add columns
 
@@ -57,8 +57,8 @@ SELECT int_column1, count(*) FROM lineitem_alter GROUP BY int_column1;
 ALTER TABLE lineitem_alter ALTER COLUMN float_column SET DEFAULT 1;
 ALTER TABLE lineitem_alter ALTER COLUMN int_column1 DROP DEFAULT;
 
--- \stage to verify that default values take effect
-\STAGE lineitem_alter (l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment) FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
+-- \copy to verify that default values take effect
+\copy lineitem_alter (l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment) FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
 
 SELECT float_column, count(*) FROM lineitem_alter GROUP BY float_column;
 SELECT int_column1, count(*) FROM lineitem_alter GROUP BY int_column1;
@@ -71,16 +71,17 @@ ALTER TABLE lineitem_alter ALTER COLUMN int_column2 SET NOT NULL;
 -- Drop default so that NULLs will be inserted for this column
 ALTER TABLE lineitem_alter ALTER COLUMN int_column2 DROP DEFAULT;
 
--- \stage should fail because it will try to insert NULLs for a NOT NULL column
-\STAGE lineitem_alter (l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment) FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
+-- \copy should fail because it will try to insert NULLs for a NOT NULL column
+-- Note, this operation will create a table on the workers but it won't be in the metadata
+\copy lineitem_alter (l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment) FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
 
 -- Verify that DROP NOT NULL works
 
 ALTER TABLE lineitem_alter ALTER COLUMN int_column2 DROP NOT NULL;
 \d lineitem_alter
 
--- \stage should succeed now 
-\STAGE lineitem_alter (l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment) FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
+-- \copy should succeed now 
+\copy lineitem_alter (l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment) FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
 SELECT count(*) from lineitem_alter;
 
 -- Verify that SET DATA TYPE works
@@ -156,6 +157,161 @@ ALTER TABLE IF EXISTS lineitem_alter RENAME l_orderkey TO l_orderkey_renamed;
 -- node
 \d lineitem_alter
 
+-- verify that non-propagated ddl commands are allowed inside a transaction block
+SET citus.enable_ddl_propagation to false;
+BEGIN;
+CREATE INDEX temp_index_1 ON lineitem_alter(l_linenumber);
+COMMIT;
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
+DROP INDEX temp_index_1;
+
+-- verify that single distributed ddl commands are allowed inside a transaction block
+SET citus.enable_ddl_propagation to true;
+BEGIN;
+CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
+COMMIT;
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
+DROP INDEX temp_index_2;
+
+-- and so are multiple ddl statements
+BEGIN;
+CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
+ALTER TABLE lineitem_alter ADD COLUMN first integer;
+COMMIT;
+
+\d lineitem_alter
+
+ALTER TABLE lineitem_alter DROP COLUMN first;
+DROP INDEX temp_index_2;
+
+-- ensure that user-specified rollback causes full rollback
+BEGIN;
+CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
+CREATE INDEX temp_index_3 ON lineitem_alter(l_partkey);
+ROLLBACK;
+
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
+
+-- ensure that errors cause full rollback
+BEGIN;
+CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
+CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
+ROLLBACK;
+
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
+
+-- verify that SAVEPOINT is allowed...
+BEGIN;
+CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
+SAVEPOINT my_savepoint;
+CREATE INDEX temp_index_3 ON lineitem_alter(l_partkey);
+ROLLBACK;
+
+-- but that actually rolling back to it is not
+BEGIN;
+CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
+SAVEPOINT my_savepoint;
+CREATE INDEX temp_index_3 ON lineitem_alter(l_partkey);
+ROLLBACK TO my_savepoint;
+COMMIT;
+
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
+
+-- Add column on only one worker...
+\c - - - :worker_2_port
+ALTER TABLE lineitem_alter_220000 ADD COLUMN first integer;
+\c - - - :master_port
+
+-- and try to add it in a multi-statement block, which fails
+BEGIN;
+CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
+ALTER TABLE lineitem_alter ADD COLUMN first integer;
+COMMIT;
+
+-- Nothing from the block should have committed
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
+
+-- Create single-shard table (to avoid deadlocks in the upcoming test hackery)
+CREATE TABLE single_shard_items (id integer, name text);
+SELECT master_create_distributed_table('single_shard_items', 'id', 'hash');
+SELECT master_create_worker_shards('single_shard_items', 1, 2);
+
+-- Drop the column from the worker...
+\c - - - :worker_2_port
+ALTER TABLE lineitem_alter_220000 DROP COLUMN first;
+
+-- Create table to trigger at-xact-end (deferred) failure
+CREATE TABLE ddl_commands (command text UNIQUE DEFERRABLE INITIALLY DEFERRED);
+
+-- Use an event trigger to log all DDL event tags in it
+CREATE FUNCTION log_ddl_tag() RETURNS event_trigger AS $ldt$
+	BEGIN
+		INSERT INTO ddl_commands VALUES (tg_tag);
+	END;
+$ldt$ LANGUAGE plpgsql;
+
+CREATE EVENT TRIGGER log_ddl_tag ON ddl_command_end EXECUTE PROCEDURE log_ddl_tag();
+
+\c - - - :master_port
+-- The above trigger will cause failure at transaction end on one placement.
+-- We'll test 2PC first, as it should handle this "best" (no divergence)
+SET citus.multi_shard_commit_protocol TO '2pc';
+BEGIN;
+CREATE INDEX single_index_2 ON single_shard_items(id);
+CREATE INDEX single_index_3 ON single_shard_items(name);
+COMMIT;
+
+-- Nothing from the block should have committed
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'single_shard_items' ORDER BY 1;
+
+-- Now try with 2pc off
+RESET citus.multi_shard_commit_protocol;
+BEGIN;
+CREATE INDEX single_index_2 ON single_shard_items(id);
+CREATE INDEX single_index_3 ON single_shard_items(name);
+COMMIT;
+
+-- The block should have committed with a warning
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'single_shard_items' ORDER BY 1;
+
+\c - - - :worker_2_port
+DROP EVENT TRIGGER log_ddl_tag;
+DROP FUNCTION log_ddl_tag();
+DROP TABLE ddl_commands;
+
+\c - - - :master_port
+-- Distributed SELECTs cannot appear after ALTER
+BEGIN;
+CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
+SELECT l_orderkey FROM lineitem_alter LIMIT 0;
+COMMIT;
+
+-- but are allowed before
+BEGIN;
+SELECT l_orderkey FROM lineitem_alter LIMIT 0;
+CREATE INDEX temp_index_2 ON lineitem_alter(l_orderkey);
+COMMIT;
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
+DROP INDEX temp_index_2;
+
+--- verify that distributed ddl commands can be used with 2pc
+SET citus.multi_shard_commit_protocol TO '2pc';
+CREATE INDEX temp_index_3 ON lineitem_alter(l_orderkey);
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
+DROP INDEX temp_index_3;
+SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
+RESET citus.multi_shard_commit_protocol;
+
+-- verify that not any of shard placements are marked as failed when a query failure occurs
+CREATE TABLE test_ab (a int, b int);
+SELECT master_create_distributed_table('test_ab', 'a', 'hash');
+SELECT master_create_worker_shards('test_ab', 8, 2);
+INSERT INTO test_ab VALUES (2, 10);
+INSERT INTO test_ab VALUES (2, 11);
+CREATE UNIQUE INDEX temp_unique_index_1 ON test_ab(a);
+SELECT shardid FROM pg_dist_shard_placement NATURAL JOIN pg_dist_shard 
+WHERE logicalrelid='test_ab'::regclass AND shardstate=3;
+
 -- Check that the schema on the worker still looks reasonable
 \c - - - :worker_1_port
 SELECT attname, atttypid::regtype
@@ -213,11 +369,19 @@ SELECT  indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
 SELECT  indexname, tablename FROM pg_indexes WHERE tablename like 'lineitem_alter_%';
 \c - - - :master_port
 
+-- test ALTER TABLE ALL IN TABLESPACE
+-- we expect that it will warn out
+CREATE TABLESPACE super_fast_ssd LOCATION '@abs_srcdir@/data';
+ALTER TABLE ALL IN TABLESPACE pg_default SET TABLESPACE super_fast_ssd;
+ALTER TABLE ALL IN TABLESPACE super_fast_ssd SET TABLESPACE pg_default;
+DROP TABLESPACE super_fast_ssd;
+
 -- Cleanup the table and its shards
 SET citus.enable_ddl_propagation to true;
 SELECT master_apply_delete_command('DELETE FROM lineitem_alter');
 DROP TABLE lineitem_alter;
--- check that nothing's left over on workers
+-- check that nothing's left over on workers, other than the leftover shard created
+-- during the unsuccessful COPY
 \c - - - :worker_1_port
 SELECT relname FROM pg_class WHERE relname LIKE 'lineitem_alter%';
 \c - - - :master_port

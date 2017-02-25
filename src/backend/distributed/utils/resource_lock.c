@@ -19,17 +19,131 @@
 
 #include "distributed/listutils.h"
 #include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/multi_router_executor.h"
+#include "distributed/multi_planner.h"
 #include "distributed/relay_utility.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
+#include "distributed/worker_protocol.h"
 #include "storage/lmgr.h"
+
+
+/* local function forward declarations */
+static LOCKMODE IntToLockMode(int mode);
+
+
+/* exports for SQL callable functions */
+PG_FUNCTION_INFO_V1(lock_shard_metadata);
+PG_FUNCTION_INFO_V1(lock_shard_resources);
+
+
+/*
+ * lock_shard_metadata allows the shard distribution metadata to be locked
+ * remotely to block concurrent writes from workers in MX tables.
+ *
+ * This function does not sort the array to avoid deadlock, callers
+ * must ensure a consistent order.
+ */
+Datum
+lock_shard_metadata(PG_FUNCTION_ARGS)
+{
+	LOCKMODE lockMode = IntToLockMode(PG_GETARG_INT32(0));
+	ArrayType *shardIdArrayObject = PG_GETARG_ARRAYTYPE_P(1);
+	Datum *shardIdArrayDatum = NULL;
+	int shardIdCount = 0;
+	int shardIdIndex = 0;
+
+	if (ARR_NDIM(shardIdArrayObject) == 0)
+	{
+		ereport(ERROR, (errmsg("no locks specified")));
+	}
+
+	/* we don't want random users to block writes */
+	EnsureSuperUser();
+
+	shardIdCount = ArrayObjectCount(shardIdArrayObject);
+	shardIdArrayDatum = DeconstructArrayObject(shardIdArrayObject);
+
+	for (shardIdIndex = 0; shardIdIndex < shardIdCount; shardIdIndex++)
+	{
+		int64 shardId = DatumGetInt64(shardIdArrayDatum[shardIdIndex]);
+
+		LockShardDistributionMetadata(shardId, lockMode);
+	}
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * lock_shard_resources allows shard resources  to be locked
+ * remotely to serialise non-commutative writes on shards.
+ *
+ * This function does not sort the array to avoid deadlock, callers
+ * must ensure a consistent order.
+ */
+Datum
+lock_shard_resources(PG_FUNCTION_ARGS)
+{
+	LOCKMODE lockMode = IntToLockMode(PG_GETARG_INT32(0));
+	ArrayType *shardIdArrayObject = PG_GETARG_ARRAYTYPE_P(1);
+	Datum *shardIdArrayDatum = NULL;
+	int shardIdCount = 0;
+	int shardIdIndex = 0;
+
+	if (ARR_NDIM(shardIdArrayObject) == 0)
+	{
+		ereport(ERROR, (errmsg("no locks specified")));
+	}
+
+	/* we don't want random users to block writes */
+	EnsureSuperUser();
+
+	shardIdCount = ArrayObjectCount(shardIdArrayObject);
+	shardIdArrayDatum = DeconstructArrayObject(shardIdArrayObject);
+
+	for (shardIdIndex = 0; shardIdIndex < shardIdCount; shardIdIndex++)
+	{
+		int64 shardId = DatumGetInt64(shardIdArrayDatum[shardIdIndex]);
+
+		LockShardResource(shardId, lockMode);
+	}
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * IntToLockMode verifies whether the specified integer is an accepted lock mode
+ * and returns it as a LOCKMODE enum.
+ */
+static LOCKMODE
+IntToLockMode(int mode)
+{
+	if (mode == ExclusiveLock)
+	{
+		return ExclusiveLock;
+	}
+	else if (mode == ShareLock)
+	{
+		return ShareLock;
+	}
+	else if (mode == AccessShareLock)
+	{
+		return AccessShareLock;
+	}
+	else
+	{
+		elog(ERROR, "unsupported lockmode %d", mode);
+	}
+}
 
 
 /*
  * LockShardDistributionMetadata returns after grabbing a lock for distribution
- * metadata related to the specified shard, blocking if required. ExclusiveLock
- * and ShareLock modes are supported. Any locks acquired using this method are
- * released at transaction end.
+ * metadata related to the specified shard, blocking if required. Any locks
+ * acquired using this method are released at transaction end.
  */
 void
 LockShardDistributionMetadata(int64 shardId, LOCKMODE lockMode)
@@ -41,6 +155,28 @@ LockShardDistributionMetadata(int64 shardId, LOCKMODE lockMode)
 	SET_LOCKTAG_SHARD_METADATA_RESOURCE(tag, MyDatabaseId, shardId);
 
 	(void) LockAcquire(&tag, lockMode, sessionLock, dontWait);
+}
+
+
+/*
+ * TryLockShardDistributionMetadata tries to grab a lock for distribution
+ * metadata related to the specified shard, returning false if the lock
+ * is currently taken. Any locks acquired using this method are released
+ * at transaction end.
+ */
+bool
+TryLockShardDistributionMetadata(int64 shardId, LOCKMODE lockMode)
+{
+	LOCKTAG tag;
+	const bool sessionLock = false;
+	const bool dontWait = true;
+	bool lockAcquired = false;
+
+	SET_LOCKTAG_SHARD_METADATA_RESOURCE(tag, MyDatabaseId, shardId);
+
+	lockAcquired = LockAcquire(&tag, lockMode, sessionLock, dontWait);
+
+	return lockAcquired;
 }
 
 
@@ -125,12 +261,11 @@ UnlockJobResource(uint64 jobId, LOCKMODE lockmode)
 
 
 /*
- * LockShards takes shared locks on the metadata and the data of all shards in
- * shardIntervalList. This prevents concurrent placement changes and concurrent
- * DML statements that require an exclusive lock.
+ * LockShardListMetadata takes shared locks on the metadata of all shards in
+ * shardIntervalList to prevents concurrent placement changes.
  */
 void
-LockShards(List *shardIntervalList, LOCKMODE lockMode)
+LockShardListMetadata(List *shardIntervalList, LOCKMODE lockMode)
 {
 	ListCell *shardIntervalCell = NULL;
 
@@ -142,10 +277,68 @@ LockShards(List *shardIntervalList, LOCKMODE lockMode)
 		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 		int64 shardId = shardInterval->shardId;
 
-		/* prevent concurrent changes to number of placements */
 		LockShardDistributionMetadata(shardId, lockMode);
+	}
+}
 
-		/* prevent concurrent update/delete statements */
+
+/*
+ * LockShardListResources takes locks on all shards in shardIntervalList to
+ * prevent concurrent DML statements on those shards.
+ */
+void
+LockShardListResources(List *shardIntervalList, LOCKMODE lockMode)
+{
+	ListCell *shardIntervalCell = NULL;
+
+	/* lock shards in order of shard id to prevent deadlock */
+	shardIntervalList = SortList(shardIntervalList, CompareShardIntervalsById);
+
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		int64 shardId = shardInterval->shardId;
+
 		LockShardResource(shardId, lockMode);
 	}
+}
+
+
+/*
+ * LockRelationShardResources takes locks on all shards in a list of RelationShards
+ * to prevent concurrent DML statements on those shards.
+ */
+void
+LockRelationShardResources(List *relationShardList, LOCKMODE lockMode)
+{
+	ListCell *relationShardCell = NULL;
+
+	/* lock shards in a consistent order to prevent deadlock */
+	relationShardList = SortList(relationShardList, CompareRelationShards);
+
+	foreach(relationShardCell, relationShardList)
+	{
+		RelationShard *relationShard = (RelationShard *) lfirst(relationShardCell);
+		uint64 shardId = relationShard->shardId;
+
+		if (shardId != INVALID_SHARD_ID)
+		{
+			LockShardResource(shardId, lockMode);
+		}
+	}
+}
+
+
+/*
+ * LockMetadataSnapshot acquires a lock needed to serialize changes to pg_dist_node
+ * and all other metadata changes. Operations that modify pg_dist_node should acquire
+ * AccessExclusiveLock. All other metadata changes should acquire AccessShareLock. Any locks
+ * acquired using this method are released at transaction end.
+ */
+void
+LockMetadataSnapshot(LOCKMODE lockMode)
+{
+	Assert(lockMode == AccessExclusiveLock || lockMode == AccessShareLock);
+
+	(void) LockRelationOid(DistNodeRelationId(), lockMode);
 }

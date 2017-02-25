@@ -17,16 +17,13 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 
-#ifdef HAVE_INTTYPES_H
-#include <inttypes.h>
-#endif
-
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_namespace.h"
 #include "commands/copy.h"
 #include "commands/tablecmds.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/worker_protocol.h"
 #include "executor/spi.h"
 #include "nodes/makefuncs.h"
@@ -78,6 +75,8 @@ worker_merge_files_into_table(PG_FUNCTION_ARGS)
 	bool schemaExists = false;
 	List *columnNameList = NIL;
 	List *columnTypeList = NIL;
+	Oid savedUserId = InvalidOid;
+	int savedSecurityContext = 0;
 
 	/* we should have the same number of column names and types */
 	int32 columnNameCount = ArrayObjectCount(columnNameObject);
@@ -105,7 +104,13 @@ worker_merge_files_into_table(PG_FUNCTION_ARGS)
 
 	CreateTaskTable(jobSchemaName, taskTableName, columnNameList, columnTypeList);
 
+	/* need superuser to copy from files */
+	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
+	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
+
 	CopyTaskFilesFromDirectory(jobSchemaName, taskTableName, taskDirectoryName);
+
+	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
 	PG_RETURN_VOID();
 }
@@ -253,19 +258,9 @@ worker_cleanup_job_schema_cache(PG_FUNCTION_ARGS)
 StringInfo
 JobSchemaName(uint64 jobId)
 {
-	/*
-	 * We need to apply padding on our 64-bit job id, and therefore cannot use
-	 * UINT64_FORMAT here.
-	 */
-#ifdef HAVE_INTTYPES_H
 	StringInfo jobSchemaName = makeStringInfo();
-	appendStringInfo(jobSchemaName, "%s%0*" PRIu64, JOB_SCHEMA_PREFIX,
+	appendStringInfo(jobSchemaName, "%s%0*" INT64_MODIFIER "u", JOB_SCHEMA_PREFIX,
 					 MIN_JOB_DIRNAME_WIDTH, jobId);
-#else
-	StringInfo jobSchemaName = makeStringInfo();
-	appendStringInfo(jobSchemaName, "%s%0*llu",
-					 JOB_SCHEMA_PREFIX, MIN_JOB_DIRNAME_WIDTH, jobId);
-#endif
 
 	return jobSchemaName;
 }
@@ -369,9 +364,7 @@ CreateTaskTable(StringInfo schemaName, StringInfo relationName,
 	RangeVar *relation = NULL;
 	List *columnDefinitionList = NIL;
 	Oid relationId PG_USED_FOR_ASSERTS_ONLY = InvalidOid;
-#if (PG_VERSION_NUM >= 90500)
 	ObjectAddress relationObject;
-#endif
 
 	Assert(schemaName != NULL);
 	Assert(relationName != NULL);
@@ -386,12 +379,8 @@ CreateTaskTable(StringInfo schemaName, StringInfo relationName,
 
 	createStatement = CreateStatement(relation, columnDefinitionList);
 
-#if (PG_VERSION_NUM >= 90500)
 	relationObject = DefineRelation(createStatement, RELKIND_RELATION, InvalidOid, NULL);
 	relationId = relationObject.objectId;
-#else
-	relationId = DefineRelation(createStatement, RELKIND_RELATION, InvalidOid);
-#endif
 
 	Assert(relationId != InvalidOid);
 	CommandCounterIncrement();

@@ -7,40 +7,80 @@
  */
 
 #include "postgres.h"
+#include "c.h"
+#include "libpq-fe.h"
 #include "miscadmin.h"
+#include "port.h"
 
+#include <string.h>
+
+#include "access/attnum.h"
+#include "access/heapam.h"
+#include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
+#include "access/tupdesc.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "catalog/dependency.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_attribute.h"
+#include "catalog/pg_class.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
+#include "commands/prepare.h"
 #include "distributed/citus_ruleutils.h"
+#include "distributed/colocation_utils.h"
+#include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/multi_copy.h"
-#include "distributed/multi_utility.h"
 #include "distributed/multi_join_order.h"
+#include "distributed/multi_planner.h"
+#include "distributed/multi_router_executor.h"
+#include "distributed/multi_router_planner.h"
+#include "distributed/multi_shard_transaction.h"
+#include "distributed/multi_utility.h" /* IWYU pragma: keep */
+#include "distributed/pg_dist_partition.h"
+#include "distributed/resource_lock.h"
+#include "distributed/transaction_management.h"
 #include "distributed/transmit.h"
-#include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
-#include "foreign/foreign.h"
+#include "distributed/worker_transaction.h"
 #include "executor/executor.h"
-#include "parser/parser.h"
-#include "parser/parse_utilcmd.h"
+#include "foreign/foreign.h"
+#include "lib/stringinfo.h"
+#include "nodes/bitmapset.h"
+#include "nodes/nodes.h"
+#include "nodes/params.h"
+#include "nodes/parsenodes.h"
+#include "nodes/pg_list.h"
+#include "nodes/primnodes.h"
+#include "nodes/value.h"
+#include "parser/analyze.h"
 #include "storage/lmgr.h"
-#include "tcop/pquery.h"
+#include "storage/lock.h"
+#include "tcop/dest.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/elog.h"
+#include "utils/errcodes.h"
+#include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/palloc.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/syscache.h"
 
 
 bool EnableDDLPropagation = true; /* ddl propagation is enabled */
+
 
 /*
  * This struct defines the state for the callback for drop statements.
@@ -62,29 +102,52 @@ static void VerifyTransmitStmt(CopyStmt *copyStatement);
 static Node * ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag,
 							  bool *commandMustRunAsOwner);
 static Node * ProcessIndexStmt(IndexStmt *createIndexStatement,
-							   const char *createIndexCommand);
+							   const char *createIndexCommand, bool isTopLevel);
 static Node * ProcessDropIndexStmt(DropStmt *dropIndexStatement,
-								   const char *dropIndexCommand);
+								   const char *dropIndexCommand, bool isTopLevel);
 static Node * ProcessAlterTableStmt(AlterTableStmt *alterTableStatement,
-									const char *alterTableCommand);
+									const char *alterTableCommand, bool isTopLevel);
+static Node * WorkerProcessAlterTableStmt(AlterTableStmt *alterTableStatement,
+										  const char *alterTableCommand);
+static Node * ProcessAlterObjectSchemaStmt(AlterObjectSchemaStmt *alterObjectSchemaStmt,
+										   const char *alterObjectSchemaCommand,
+										   bool isTopLevel);
+static void ProcessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand);
+static bool IsSupportedDistributedVacuumStmt(Oid relationId, VacuumStmt *vacuumStmt);
+static List * VacuumTaskList(Oid relationId, VacuumStmt *vacuumStmt);
+static StringInfo DeparseVacuumStmtPrefix(VacuumStmt *vacuumStmt);
+static char * DeparseVacuumColumnNames(List *columnNameList);
+
 
 /* Local functions forward declarations for unsupported command checks */
 static void ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement);
 static void ErrorIfUnsupportedDropIndexStmt(DropStmt *dropIndexStatement);
 static void ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement);
+static void ErrorIfUnsupportedSeqStmt(CreateSeqStmt *createSeqStmt);
+static void ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt);
+static void ErrorIfUnsupportedTruncateStmt(TruncateStmt *truncateStatement);
+static bool OptionsSpecifyOwnedBy(List *optionList, Oid *ownedByTableId);
 static void ErrorIfDistributedRenameStmt(RenameStmt *renameStatement);
 
 /* Local functions forward declarations for helper functions */
 static void CreateLocalTable(RangeVar *relation, char *nodeName, int32 nodePort);
 static bool IsAlterTableRenameStmt(RenameStmt *renameStatement);
-static void ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString);
-static bool ExecuteCommandOnWorkerShards(Oid relationId, const char *commandString,
-										 List **failedPlacementList);
-static bool AllFinalizedPlacementsAccessible(Oid relationId);
+static void ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString,
+										 bool isTopLevel);
+static void ExecuteDistributedForeignKeyCommand(Oid leftRelationId, Oid rightRelationId,
+												const char *ddlCommandString,
+												bool isTopLevel);
+static void ShowNoticeIfNotUsing2PC(void);
+static List * DDLTaskList(Oid relationId, const char *commandString);
+static List * ForeignKeyTaskList(Oid leftRelationId, Oid rightRelationId,
+								 const char *commandString);
 static void RangeVarCallbackForDropIndex(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 										 void *arg);
 static void CheckCopyPermissions(CopyStmt *copyStatement);
 static List * CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist);
+
+
+static bool warnedUserAbout2PC = false;
 
 
 /*
@@ -110,6 +173,32 @@ multi_ProcessUtility(Node *parsetree,
 	bool commandMustRunAsOwner = false;
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
+
+	if (IsA(parsetree, TransactionStmt))
+	{
+		/*
+		 * Transaction statements (e.g. ABORT, COMMIT) can be run in aborted
+		 * transactions in which case a lot of checks cannot be done safely in
+		 * that state. Since we never need to intercept transaction statements,
+		 * skip our checks and immediately fall into standard_ProcessUtility.
+		 */
+		standard_ProcessUtility(parsetree, queryString, context,
+								params, dest, completionTag);
+
+		return;
+	}
+
+	if (!CitusHasBeenLoaded())
+	{
+		/*
+		 * Ensure that utility commands do not behave any differently until CREATE
+		 * EXTENSION is invoked.
+		 */
+		standard_ProcessUtility(parsetree, queryString, context,
+								params, dest, completionTag);
+
+		return;
+	}
 
 	/*
 	 * TRANSMIT used to be separate command, but to avoid patching the grammar
@@ -147,12 +236,33 @@ multi_ProcessUtility(Node *parsetree,
 		}
 	}
 
-	/* ddl commands are propagated to workers only if EnableDDLPropagation is set */
+	if (IsA(parsetree, CreateSeqStmt))
+	{
+		ErrorIfUnsupportedSeqStmt((CreateSeqStmt *) parsetree);
+	}
+
+	if (IsA(parsetree, AlterSeqStmt))
+	{
+		ErrorIfDistributedAlterSeqOwnedBy((AlterSeqStmt *) parsetree);
+	}
+
+	if (IsA(parsetree, TruncateStmt))
+	{
+		ErrorIfUnsupportedTruncateStmt((TruncateStmt *) parsetree);
+	}
+
+	/*
+	 * DDL commands are propagated to workers only if EnableDDLPropagation is
+	 * set to true and the current node is the coordinator
+	 */
 	if (EnableDDLPropagation)
 	{
+		bool isTopLevel = (context == PROCESS_UTILITY_TOPLEVEL);
+
 		if (IsA(parsetree, IndexStmt))
 		{
-			parsetree = ProcessIndexStmt((IndexStmt *) parsetree, queryString);
+			parsetree = ProcessIndexStmt((IndexStmt *) parsetree, queryString,
+										 isTopLevel);
 		}
 
 		if (IsA(parsetree, DropStmt))
@@ -160,7 +270,7 @@ multi_ProcessUtility(Node *parsetree,
 			DropStmt *dropStatement = (DropStmt *) parsetree;
 			if (dropStatement->removeType == OBJECT_INDEX)
 			{
-				parsetree = ProcessDropIndexStmt(dropStatement, queryString);
+				parsetree = ProcessDropIndexStmt(dropStatement, queryString, isTopLevel);
 			}
 		}
 
@@ -169,7 +279,8 @@ multi_ProcessUtility(Node *parsetree,
 			AlterTableStmt *alterTableStmt = (AlterTableStmt *) parsetree;
 			if (alterTableStmt->relkind == OBJECT_TABLE)
 			{
-				parsetree = ProcessAlterTableStmt(alterTableStmt, queryString);
+				parsetree = ProcessAlterTableStmt(alterTableStmt, queryString,
+												  isTopLevel);
 			}
 		}
 
@@ -185,16 +296,63 @@ multi_ProcessUtility(Node *parsetree,
 				ErrorIfDistributedRenameStmt(renameStmt);
 			}
 		}
+
+		/*
+		 * ALTER ... SET SCHEMA statements have their node type as AlterObjectSchemaStmt.
+		 * So, we intercept AlterObjectSchemaStmt to tackle these commands.
+		 */
+		if (IsA(parsetree, AlterObjectSchemaStmt))
+		{
+			AlterObjectSchemaStmt *setSchemaStmt = (AlterObjectSchemaStmt *) parsetree;
+			parsetree = ProcessAlterObjectSchemaStmt(setSchemaStmt, queryString,
+													 isTopLevel);
+		}
+
+		/*
+		 * ALTER TABLE ALL IN TABLESPACE statements have their node type as
+		 * AlterTableMoveAllStmt. At the moment we do not support this functionality in
+		 * the distributed environment. We warn out here.
+		 */
+		if (IsA(parsetree, AlterTableMoveAllStmt))
+		{
+			ereport(WARNING, (errmsg("not propagating ALTER TABLE ALL IN TABLESPACE "
+									 "commands to worker nodes"),
+							  errhint("Connect to worker nodes directly to manually "
+									  "move all tables.")));
+		}
+	}
+	else
+	{
+		/*
+		 * citus.enable_ddl_propagation is disabled, which means that PostgreSQL
+		 * should handle the DDL command on a distributed table directly, without
+		 * Citus intervening. Advanced Citus users use this to implement their own
+		 * DDL propagation. We also use it to avoid re-propagating DDL commands
+		 * when changing MX tables on workers. Below, we also make sure that DDL
+		 * commands don't run queries that might get intercepted by Citus and error
+		 * out, specifically we skip validation in foreign keys.
+		 */
+
+		if (IsA(parsetree, AlterTableStmt))
+		{
+			AlterTableStmt *alterTableStmt = (AlterTableStmt *) parsetree;
+			if (alterTableStmt->relkind == OBJECT_TABLE)
+			{
+				/*
+				 * When issuing an ALTER TABLE ... ADD FOREIGN KEY command, the
+				 * the validation step should be skipped on the distributed table.
+				 * Therefore, we check whether the given ALTER TABLE statement is a
+				 * FOREIGN KEY constraint and if so disable the validation step.
+				 * Note that validation is done on the shard level when DDL
+				 * propagation is enabled.
+				 */
+				parsetree = WorkerProcessAlterTableStmt(alterTableStmt, queryString);
+			}
+		}
 	}
 
-	/*
-	 * Inform the user about potential caveats.
-	 *
-	 * To prevent failures in aborted transactions, CitusHasBeenLoaded() needs
-	 * to be the second condition. See RelationIdGetRelation() which is called
-	 * by CitusHasBeenLoaded().
-	 */
-	if (IsA(parsetree, CreatedbStmt) && CitusHasBeenLoaded())
+	/* inform the user about potential caveats */
+	if (IsA(parsetree, CreatedbStmt))
 	{
 		ereport(NOTICE, (errmsg("Citus partially supports CREATE DATABASE for "
 								"distributed databases"),
@@ -203,19 +361,57 @@ multi_ProcessUtility(Node *parsetree,
 						 errhint("You can manually create a database and its "
 								 "extensions on workers.")));
 	}
-	else if (IsA(parsetree, CreateSchemaStmt) && CitusHasBeenLoaded())
-	{
-		ereport(NOTICE, (errmsg("Citus partially supports CREATE SCHEMA "
-								"for distributed databases"),
-						 errdetail("schema usage in joins and in some UDFs "
-								   "provided by Citus are not supported yet")));
-	}
-	else if (IsA(parsetree, CreateRoleStmt) && CitusHasBeenLoaded())
+	else if (IsA(parsetree, CreateRoleStmt))
 	{
 		ereport(NOTICE, (errmsg("not propagating CREATE ROLE/USER commands to worker"
 								" nodes"),
 						 errhint("Connect to worker nodes directly to manually create all"
 								 " necessary users and roles.")));
+	}
+
+	/* due to an explain-hook limitation we have to special-case EXPLAIN EXECUTE */
+	if (IsA(parsetree, ExplainStmt) && IsA(((ExplainStmt *) parsetree)->query, Query))
+	{
+		ExplainStmt *explainStmt = (ExplainStmt *) parsetree;
+		Query *query = (Query *) explainStmt->query;
+
+		if (query->commandType == CMD_UTILITY &&
+			IsA(query->utilityStmt, ExecuteStmt))
+		{
+			ExecuteStmt *execstmt = (ExecuteStmt *) query->utilityStmt;
+			PreparedStatement *entry = FetchPreparedStatement(execstmt->name, true);
+			CachedPlanSource *plansource = entry->plansource;
+			Node *parseTreeCopy;
+			Query *originalQuery;
+
+			/* copied from ExplainExecuteQuery, will never trigger if you used PREPARE */
+			if (!plansource->fixed_result)
+			{
+				ereport(ERROR, (errmsg("EXPLAIN EXECUTE does not support variable-result"
+									   " cached plans")));
+			}
+
+			parseTreeCopy = copyObject(plansource->raw_parse_tree);
+
+			originalQuery = parse_analyze(parseTreeCopy,
+										  plansource->query_string,
+										  plansource->param_types,
+										  plansource->num_params);
+
+			if (ExtractFirstDistributedTableId(originalQuery) != InvalidOid)
+			{
+				/*
+				 * since pg no longer sees EXECUTE it will use the explain hook we've
+				 * installed
+				 */
+				explainStmt->query = (Node *) originalQuery;
+				standard_ProcessUtility(parsetree, plansource->query_string, context,
+										params, dest, completionTag);
+				return;
+			}
+
+			/* if this is a normal query fall through to the usual executor */
+		}
 	}
 
 	if (commandMustRunAsOwner)
@@ -231,6 +427,14 @@ multi_ProcessUtility(Node *parsetree,
 	if (commandMustRunAsOwner)
 	{
 		SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+	}
+
+	/* we run VacuumStmt after standard hook to benefit from its checks and locking */
+	if (IsA(parsetree, VacuumStmt))
+	{
+		VacuumStmt *vacuumStmt = (VacuumStmt *) parsetree;
+
+		ProcessVacuumStmt(vacuumStmt, queryString);
 	}
 }
 
@@ -457,7 +661,8 @@ ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag, bool *commandMustR
  * master node table.
  */
 static Node *
-ProcessIndexStmt(IndexStmt *createIndexStatement, const char *createIndexCommand)
+ProcessIndexStmt(IndexStmt *createIndexStatement, const char *createIndexCommand,
+				 bool isTopLevel)
 {
 	/*
 	 * We first check whether a distributed relation is affected. For that, we need to
@@ -501,10 +706,26 @@ ProcessIndexStmt(IndexStmt *createIndexStatement, const char *createIndexCommand
 
 		if (isDistributedRelation)
 		{
+			Oid namespaceId = InvalidOid;
+			Oid indexRelationId = InvalidOid;
+			char *indexName = createIndexStatement->idxname;
+
 			ErrorIfUnsupportedIndexStmt(createIndexStatement);
 
-			/* if it is supported, go ahead and execute the command */
-			ExecuteDistributedDDLCommand(relationId, createIndexCommand);
+			namespaceId = get_namespace_oid(namespaceName, false);
+			indexRelationId = get_relname_relid(indexName, namespaceId);
+
+			/* if index does not exist, send the command to workers */
+			if (!OidIsValid(indexRelationId))
+			{
+				ExecuteDistributedDDLCommand(relationId, createIndexCommand, isTopLevel);
+			}
+			else if (!createIndexStatement->if_not_exists)
+			{
+				/* if the index exists and there is no IF NOT EXISTS clause, error */
+				ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE),
+								errmsg("relation \"%s\" already exists", indexName)));
+			}
 		}
 	}
 
@@ -521,7 +742,8 @@ ProcessIndexStmt(IndexStmt *createIndexStatement, const char *createIndexCommand
  * master node table.
  */
 static Node *
-ProcessDropIndexStmt(DropStmt *dropIndexStatement, const char *dropIndexCommand)
+ProcessDropIndexStmt(DropStmt *dropIndexStatement, const char *dropIndexCommand,
+					 bool isTopLevel)
 {
 	ListCell *dropObjectCell = NULL;
 	Oid distributedIndexId = InvalidOid;
@@ -590,7 +812,7 @@ ProcessDropIndexStmt(DropStmt *dropIndexStatement, const char *dropIndexCommand)
 		ErrorIfUnsupportedDropIndexStmt(dropIndexStatement);
 
 		/* if it is supported, go ahead and execute the command */
-		ExecuteDistributedDDLCommand(distributedRelationId, dropIndexCommand);
+		ExecuteDistributedDDLCommand(distributedRelationId, dropIndexCommand, isTopLevel);
 	}
 
 	return (Node *) dropIndexStatement;
@@ -606,27 +828,451 @@ ProcessDropIndexStmt(DropStmt *dropIndexStatement, const char *dropIndexCommand)
  * master node table.
  */
 static Node *
-ProcessAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCommand)
+ProcessAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCommand,
+					  bool isTopLevel)
 {
-	/* first check whether a distributed relation is affected */
-	if (alterTableStatement->relation != NULL)
-	{
-		LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
-		Oid relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
-		if (OidIsValid(relationId))
-		{
-			bool isDistributedRelation = IsDistributedTable(relationId);
-			if (isDistributedRelation)
-			{
-				ErrorIfUnsupportedAlterTableStmt(alterTableStatement);
+	LOCKMODE lockmode = 0;
+	Oid leftRelationId = InvalidOid;
+	Oid rightRelationId = InvalidOid;
+	bool isDistributedRelation = false;
+	List *commandList = NIL;
+	ListCell *commandCell = NULL;
 
-				/* if it is supported, go ahead and execute the command */
-				ExecuteDistributedDDLCommand(relationId, alterTableCommand);
+	/* first check whether a distributed relation is affected */
+	if (alterTableStatement->relation == NULL)
+	{
+		return (Node *) alterTableStatement;
+	}
+
+	lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
+	leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+	if (!OidIsValid(leftRelationId))
+	{
+		return (Node *) alterTableStatement;
+	}
+
+	isDistributedRelation = IsDistributedTable(leftRelationId);
+	if (!isDistributedRelation)
+	{
+		return (Node *) alterTableStatement;
+	}
+
+	ErrorIfUnsupportedAlterTableStmt(alterTableStatement);
+
+	/*
+	 * We check if there is a ADD FOREIGN CONSTRAINT command in sub commands list.
+	 * If there is we assign referenced releation id to rightRelationId and we also
+	 * set skip_validation to true to prevent PostgreSQL to verify validity of the
+	 * foreign constraint in master. Validity will be checked in workers anyway.
+	 */
+	commandList = alterTableStatement->cmds;
+
+	foreach(commandCell, commandList)
+	{
+		AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
+		AlterTableType alterTableType = command->subtype;
+
+		if (alterTableType == AT_AddConstraint)
+		{
+			Constraint *constraint = (Constraint *) command->def;
+			if (constraint->contype == CONSTR_FOREIGN)
+			{
+				/*
+				 * We only support ALTER TABLE ADD CONSTRAINT ... FOREIGN KEY, if it is
+				 * only subcommand of ALTER TABLE. It was already checked in
+				 * ErrorIfUnsupportedAlterTableStmt.
+				 */
+				Assert(commandList->length <= 1);
+
+				rightRelationId = RangeVarGetRelid(constraint->pktable, lockmode,
+												   alterTableStatement->missing_ok);
+
+				/*
+				 * Foreign constraint validations will be done in workers. If we do not
+				 * set this flag, PostgreSQL tries to do additional checking when we drop
+				 * to standard_ProcessUtility. standard_ProcessUtility tries to open new
+				 * connections to workers to verify foreign constraints while original
+				 * transaction is in process, which causes deadlock.
+				 */
+				constraint->skip_validation = true;
+			}
+		}
+	}
+
+	if (rightRelationId)
+	{
+		ExecuteDistributedForeignKeyCommand(leftRelationId, rightRelationId,
+											alterTableCommand, isTopLevel);
+	}
+	else
+	{
+		ExecuteDistributedDDLCommand(leftRelationId, alterTableCommand, isTopLevel);
+	}
+
+	return (Node *) alterTableStatement;
+}
+
+
+/*
+ * WorkerProcessAlterTableStmt checks and processes the alter table statement to be
+ * worked on the distributed table of the worker node. Currently, it only processes
+ * ALTER TABLE ... ADD FOREIGN KEY command to skip the validation step.
+ */
+static Node *
+WorkerProcessAlterTableStmt(AlterTableStmt *alterTableStatement,
+							const char *alterTableCommand)
+{
+	LOCKMODE lockmode = 0;
+	Oid leftRelationId = InvalidOid;
+	bool isDistributedRelation = false;
+	List *commandList = NIL;
+	ListCell *commandCell = NULL;
+
+	/* first check whether a distributed relation is affected */
+	if (alterTableStatement->relation == NULL)
+	{
+		return (Node *) alterTableStatement;
+	}
+
+	lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
+	leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+	if (!OidIsValid(leftRelationId))
+	{
+		return (Node *) alterTableStatement;
+	}
+
+	isDistributedRelation = IsDistributedTable(leftRelationId);
+	if (!isDistributedRelation)
+	{
+		return (Node *) alterTableStatement;
+	}
+
+	/*
+	 * We check if there is a ADD FOREIGN CONSTRAINT command in sub commands list.
+	 * If there is we assign referenced releation id to rightRelationId and we also
+	 * set skip_validation to true to prevent PostgreSQL to verify validity of the
+	 * foreign constraint in master. Validity will be checked in workers anyway.
+	 */
+	commandList = alterTableStatement->cmds;
+
+	foreach(commandCell, commandList)
+	{
+		AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
+		AlterTableType alterTableType = command->subtype;
+
+		if (alterTableType == AT_AddConstraint)
+		{
+			Constraint *constraint = (Constraint *) command->def;
+			if (constraint->contype == CONSTR_FOREIGN)
+			{
+				/* foreign constraint validations will be done in shards. */
+				constraint->skip_validation = true;
 			}
 		}
 	}
 
 	return (Node *) alterTableStatement;
+}
+
+
+/*
+ * ProcessAlterObjectSchemaStmt processes ALTER ... SET SCHEMA statements for distributed
+ * objects. The function first checks if the statement belongs to a distributed objects
+ * or not. If it does, then it checks whether given object is a table. If it is, we warn
+ * out, since we do not support ALTER ... SET SCHEMA
+ */
+static Node *
+ProcessAlterObjectSchemaStmt(AlterObjectSchemaStmt *alterObjectSchemaStmt,
+							 const char *alterObjectSchemaCommand, bool isTopLevel)
+{
+	Oid relationId = InvalidOid;
+	bool noWait = false;
+
+	if (alterObjectSchemaStmt->relation == NULL)
+	{
+		return (Node *) alterObjectSchemaStmt;
+	}
+
+	relationId = RangeVarGetRelidExtended(alterObjectSchemaStmt->relation,
+										  AccessExclusiveLock,
+										  alterObjectSchemaStmt->missing_ok,
+										  noWait, NULL, NULL);
+
+	/* first check whether a distributed relation is affected */
+	if (!OidIsValid(relationId) || !IsDistributedTable(relationId))
+	{
+		return (Node *) alterObjectSchemaStmt;
+	}
+
+	/* warn out if a distributed relation is affected */
+	ereport(WARNING, (errmsg("not propagating ALTER ... SET SCHEMA commands to "
+							 "worker nodes"),
+					  errhint("Connect to worker nodes directly to manually "
+							  "change schemas of affected objects.")));
+
+	return (Node *) alterObjectSchemaStmt;
+}
+
+
+/*
+ * ProcessVacuumStmt processes vacuum statements that may need propagation to
+ * distributed tables. If a VACUUM or ANALYZE command references a distributed
+ * table, it is propagated to all involved nodes; otherwise, this function will
+ * immediately exit after some error checking.
+ *
+ * Unlike most other Process functions within this file, this function does not
+ * return a modified parse node, as it is expected that the local VACUUM or
+ * ANALYZE has already been processed.
+ */
+static void
+ProcessVacuumStmt(VacuumStmt *vacuumStmt, const char *vacuumCommand)
+{
+	Oid relationId = InvalidOid;
+	List *taskList = NIL;
+	bool supportedVacuumStmt = false;
+
+	if (vacuumStmt->relation != NULL)
+	{
+		LOCKMODE lockMode = (vacuumStmt->options & VACOPT_FULL) ?
+							AccessExclusiveLock : ShareUpdateExclusiveLock;
+
+		relationId = RangeVarGetRelid(vacuumStmt->relation, lockMode, false);
+
+		if (relationId == InvalidOid)
+		{
+			return;
+		}
+	}
+
+	supportedVacuumStmt = IsSupportedDistributedVacuumStmt(relationId, vacuumStmt);
+	if (!supportedVacuumStmt)
+	{
+		return;
+	}
+
+	taskList = VacuumTaskList(relationId, vacuumStmt);
+
+	/* save old commit protocol to restore at xact end */
+	Assert(SavedMultiShardCommitProtocol == COMMIT_PROTOCOL_BARE);
+	SavedMultiShardCommitProtocol = MultiShardCommitProtocol;
+	MultiShardCommitProtocol = COMMIT_PROTOCOL_BARE;
+
+	ExecuteModifyTasksWithoutResults(taskList);
+}
+
+
+/*
+ * IsSupportedDistributedVacuumStmt returns whether distributed execution of a
+ * given VacuumStmt is supported. The provided relationId (if valid) represents
+ * the table targeted by the provided statement.
+ *
+ * Returns true if the statement requires distributed execution and returns
+ * false otherwise; however, this function will raise errors if the provided
+ * statement needs distributed execution but contains unsupported options.
+ */
+static bool
+IsSupportedDistributedVacuumStmt(Oid relationId, VacuumStmt *vacuumStmt)
+{
+	const char *stmtName = (vacuumStmt->options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
+
+	if (vacuumStmt->relation == NULL)
+	{
+		/* WARN and exit early for unqualified VACUUM commands */
+		ereport(WARNING, (errmsg("not propagating %s command to worker nodes", stmtName),
+						  errhint("Provide a specific table in order to %s "
+								  "distributed tables.", stmtName)));
+
+		return false;
+	}
+
+	if (!OidIsValid(relationId) || !IsDistributedTable(relationId))
+	{
+		return false;
+	}
+
+	if (!EnableDDLPropagation)
+	{
+		/* WARN and exit early if DDL propagation is not enabled */
+		ereport(WARNING, (errmsg("not propagating %s command to worker nodes", stmtName),
+						  errhint("Set citus.enable_ddl_propagation to true in order to "
+								  "send targeted %s commands to worker nodes.",
+								  stmtName)));
+	}
+
+	if (vacuumStmt->options & VACOPT_VERBOSE)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("the VERBOSE option is currently unsupported in "
+							   "distributed %s commands", stmtName)));
+	}
+
+	return true;
+}
+
+
+/*
+ * VacuumTaskList returns a list of tasks to be executed as part of processing
+ * a VacuumStmt which targets a distributed relation.
+ */
+static List *
+VacuumTaskList(Oid relationId, VacuumStmt *vacuumStmt)
+{
+	List *taskList = NIL;
+	List *shardIntervalList = NIL;
+	ListCell *shardIntervalCell = NULL;
+	uint64 jobId = INVALID_JOB_ID;
+	int taskId = 1;
+	StringInfo vacuumString = DeparseVacuumStmtPrefix(vacuumStmt);
+	const char *columnNames = DeparseVacuumColumnNames(vacuumStmt->va_cols);
+	const int vacuumPrefixLen = vacuumString->len;
+	Oid schemaId = get_rel_namespace(relationId);
+	char *schemaName = get_namespace_name(schemaId);
+	char *tableName = get_rel_name(relationId);
+
+	/* lock relation metadata before getting shard list */
+	LockRelationDistributionMetadata(relationId, ShareLock);
+
+	shardIntervalList = LoadShardIntervalList(relationId);
+
+	/* grab shard lock before getting placement list */
+	LockShardListMetadata(shardIntervalList, ShareLock);
+
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		uint64 shardId = shardInterval->shardId;
+		Task *task = NULL;
+
+		char *shardName = pstrdup(tableName);
+		AppendShardIdToName(&shardName, shardInterval->shardId);
+		shardName = quote_qualified_identifier(schemaName, shardName);
+
+		vacuumString->len = vacuumPrefixLen;
+		appendStringInfoString(vacuumString, shardName);
+		appendStringInfoString(vacuumString, columnNames);
+
+		task = CitusMakeNode(Task);
+		task->jobId = jobId;
+		task->taskId = taskId++;
+		task->taskType = DDL_TASK;
+		task->queryString = pstrdup(vacuumString->data);
+		task->dependedTaskList = NULL;
+		task->replicationModel = REPLICATION_MODEL_INVALID;
+		task->anchorShardId = shardId;
+		task->taskPlacementList = FinalizedShardPlacementList(shardId);
+
+		taskList = lappend(taskList, task);
+	}
+
+	return taskList;
+}
+
+
+/*
+ * DeparseVacuumStmtPrefix returns a StringInfo appropriate for use as a prefix
+ * during distributed execution of a VACUUM or ANALYZE statement. Callers may
+ * reuse this prefix within a loop to generate shard-specific VACUUM or ANALYZE
+ * statements.
+ */
+static StringInfo
+DeparseVacuumStmtPrefix(VacuumStmt *vacuumStmt)
+{
+	StringInfo vacuumPrefix = makeStringInfo();
+	int vacuumFlags = vacuumStmt->options;
+	const int unsupportedFlags PG_USED_FOR_ASSERTS_ONLY = ~(
+		VACOPT_ANALYZE |
+#if (PG_VERSION_NUM >= 90600)
+		VACOPT_DISABLE_PAGE_SKIPPING |
+#endif
+		VACOPT_FREEZE |
+		VACOPT_FULL
+		);
+
+	/* determine actual command and block out its bit */
+	if (vacuumFlags & VACOPT_VACUUM)
+	{
+		appendStringInfoString(vacuumPrefix, "VACUUM ");
+		vacuumFlags &= ~VACOPT_VACUUM;
+	}
+	else
+	{
+		appendStringInfoString(vacuumPrefix, "ANALYZE ");
+		vacuumFlags &= ~VACOPT_ANALYZE;
+	}
+
+	/* unsupported flags should have already been rejected */
+	Assert((vacuumFlags & unsupportedFlags) == 0);
+
+	/* if no flags remain, exit early */
+	if (vacuumFlags == 0)
+	{
+		return vacuumPrefix;
+	}
+
+	/* otherwise, handle options */
+	appendStringInfoChar(vacuumPrefix, '(');
+
+	if (vacuumFlags & VACOPT_ANALYZE)
+	{
+		appendStringInfoString(vacuumPrefix, "ANALYZE,");
+	}
+
+#if (PG_VERSION_NUM >= 90600)
+	if (vacuumFlags & VACOPT_DISABLE_PAGE_SKIPPING)
+	{
+		appendStringInfoString(vacuumPrefix, "DISABLE_PAGE_SKIPPING,");
+	}
+#endif
+
+	if (vacuumFlags & VACOPT_FREEZE)
+	{
+		appendStringInfoString(vacuumPrefix, "FREEZE,");
+	}
+
+	if (vacuumFlags & VACOPT_FULL)
+	{
+		appendStringInfoString(vacuumPrefix, "FULL,");
+	}
+
+	vacuumPrefix->data[vacuumPrefix->len - 1] = ')';
+
+	appendStringInfoChar(vacuumPrefix, ' ');
+
+	return vacuumPrefix;
+}
+
+
+/*
+ * DeparseVacuumColumnNames joins the list of strings using commas as a
+ * delimiter. The whole thing is placed in parenthesis and set off with a
+ * single space in order to facilitate appending it to the end of any VACUUM
+ * or ANALYZE command which uses explicit column names. If the provided list
+ * is empty, this function returns an empty string to keep the calling code
+ * simplest.
+ */
+static char *
+DeparseVacuumColumnNames(List *columnNameList)
+{
+	StringInfo columnNames = makeStringInfo();
+	ListCell *columnNameCell = NULL;
+
+	if (columnNameList == NIL)
+	{
+		return columnNames->data;
+	}
+
+	appendStringInfoString(columnNames, " (");
+
+	foreach(columnNameCell, columnNameList)
+	{
+		char *columnName = strVal(lfirst(columnNameCell));
+
+		appendStringInfo(columnNames, "%s,", columnName);
+	}
+
+	columnNames->data[columnNames->len - 1] = ')';
+
+	return columnNames->data;
 }
 
 
@@ -637,23 +1283,12 @@ ProcessAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTabl
 static void
 ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement)
 {
-	Oid namespaceId;
-	Oid indexRelationId;
 	char *indexRelationName = createIndexStatement->idxname;
-
 	if (indexRelationName == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("creating index without a name on a distributed table is "
 							   "currently unsupported")));
-	}
-
-	namespaceId = get_namespace_oid(createIndexStatement->relation->schemaname, false);
-	indexRelationId = get_relname_relid(indexRelationName, namespaceId);
-	if (indexRelationId != InvalidOid)
-	{
-		ereport(ERROR, (errcode(ERRCODE_DUPLICATE_TABLE),
-						errmsg("relation \"%s\" already exists", indexRelationName)));
 	}
 
 	if (createIndexStatement->tableSpace != NULL)
@@ -683,6 +1318,15 @@ ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement)
 		List *indexParameterList = NIL;
 		ListCell *indexParameterCell = NULL;
 		bool indexContainsPartitionColumn = false;
+
+		/*
+		 * Reference tables do not have partition key, and unique constraints
+		 * are allowed for them. Thus, we added a short-circuit for reference tables.
+		 */
+		if (partitionMethod == DISTRIBUTE_BY_NONE)
+		{
+			return;
+		}
 
 		if (partitionMethod == DISTRIBUTE_BY_APPEND)
 		{
@@ -757,6 +1401,7 @@ ErrorIfUnsupportedDropIndexStmt(DropStmt *dropIndexStatement)
  * ALTER TABLE ALTER COLUMN SET DATA TYPE
  * ALTER TABLE SET|DROP NOT NULL
  * ALTER TABLE SET|DROP DEFAULT
+ * ALTER TABLE ADD|DROP CONSTRAINT FOREIGN
  */
 static void
 ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
@@ -774,6 +1419,33 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 		{
 			case AT_AddColumn:
 			{
+				if (IsA(command->def, ColumnDef))
+				{
+					ColumnDef *column = (ColumnDef *) command->def;
+
+					/*
+					 * Check for SERIAL pseudo-types. The structure of this
+					 * check is copied from transformColumnDefinition.
+					 */
+					if (column->typeName && list_length(column->typeName->names) == 1 &&
+						!column->typeName->pct_type)
+					{
+						char *typeName = strVal(linitial(column->typeName->names));
+
+						if (strcmp(typeName, "smallserial") == 0 ||
+							strcmp(typeName, "serial2") == 0 ||
+							strcmp(typeName, "serial") == 0 ||
+							strcmp(typeName, "serial4") == 0 ||
+							strcmp(typeName, "bigserial") == 0 ||
+							strcmp(typeName, "serial8") == 0)
+						{
+							ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+											errmsg("cannot execute ADD COLUMN commands "
+												   "involving serial pseudotypes")));
+						}
+					}
+				}
+
 				break;
 			}
 
@@ -802,7 +1474,10 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 				if (HeapTupleIsValid(tuple))
 				{
 					Form_pg_attribute targetAttr = (Form_pg_attribute) GETSTRUCT(tuple);
-					if (targetAttr->attnum == partitionColumn->varattno)
+
+					/* reference tables do not have partition column, so allow them */
+					if (partitionColumn != NULL &&
+						targetAttr->attnum == partitionColumn->varattno)
 					{
 						ereport(ERROR, (errmsg("cannot execute ALTER TABLE command "
 											   "involving partition column")));
@@ -814,16 +1489,359 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 				break;
 			}
 
+			case AT_AddConstraint:
+			{
+				Constraint *constraint = (Constraint *) command->def;
+				LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
+				Oid referencingTableId = InvalidOid;
+				Oid referencedTableId = InvalidOid;
+				Var *referencingTablePartitionColumn = NULL;
+				Var *referencedTablePartitionColumn = NULL;
+				ListCell *referencingTableAttr = NULL;
+				ListCell *referencedTableAttr = NULL;
+				bool foreignConstraintOnPartitionColumn = false;
+
+				/* we only allow adding foreign constraints with ALTER TABLE */
+				if (constraint->contype != CONSTR_FOREIGN)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create constraint"),
+									errdetail("Citus cannot execute ADD CONSTRAINT "
+											  "command other than ADD CONSTRAINT FOREIGN "
+											  "KEY.")));
+				}
+
+				/* we only allow foreign constraints if they are only subcommand */
+				if (commandList->length > 1)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint"),
+									errdetail("Citus cannot execute ADD CONSTRAINT "
+											  "FOREIGN KEY command together with other "
+											  "subcommands."),
+									errhint("You can issue each subcommand separately")));
+				}
+
+				referencingTableId = RangeVarGetRelid(alterTableStatement->relation,
+													  lockmode,
+													  alterTableStatement->missing_ok);
+				referencedTableId = RangeVarGetRelid(constraint->pktable, lockmode,
+													 alterTableStatement->missing_ok);
+
+				/* we do not support foreign keys for reference tables */
+				if (PartitionMethod(referencingTableId) == DISTRIBUTE_BY_NONE ||
+					PartitionMethod(referencedTableId) == DISTRIBUTE_BY_NONE)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint"),
+									errdetail(
+										"Foreign key constraints are not allowed from or "
+										"to reference tables.")));
+				}
+
+				/*
+				 * ON DELETE SET NULL and ON DELETE SET DEFAULT is not supported. Because
+				 * we do not want to set partition column to NULL or default value.
+				 */
+				if (constraint->fk_del_action == FKCONSTR_ACTION_SETNULL ||
+					constraint->fk_del_action == FKCONSTR_ACTION_SETDEFAULT)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint"),
+									errdetail("SET NULL or SET DEFAULT is not supported"
+											  " in ON DELETE operation.")));
+				}
+
+				/*
+				 * ON UPDATE SET NULL, ON UPDATE SET DEFAULT and UPDATE CASCADE is not
+				 * supported. Because we do not want to set partition column to NULL or
+				 * default value. Also cascading update operation would require
+				 * re-partitioning. Updating partition column value is not allowed anyway
+				 * even outside of foreign key concept.
+				 */
+				if (constraint->fk_upd_action == FKCONSTR_ACTION_SETNULL ||
+					constraint->fk_upd_action == FKCONSTR_ACTION_SETDEFAULT ||
+					constraint->fk_upd_action == FKCONSTR_ACTION_CASCADE)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint"),
+									errdetail("SET NULL, SET DEFAULT or CASCADE is not"
+											  " supported in ON UPDATE operation.")));
+				}
+
+				/*
+				 * We will use constraint name in each placement by extending it at
+				 * workers. Therefore we require it to be exist.
+				 */
+				if (constraint->conname == NULL)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint"),
+									errdetail("Creating foreign constraint without a "
+											  "name on a distributed table is currently "
+											  "not supported.")));
+				}
+
+				/* to enforce foreign constraints, tables must be co-located */
+				if (!TablesColocated(referencingTableId, referencedTableId))
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint"),
+									errdetail("Foreign key constraint can only be created"
+											  " on co-located tables.")));
+				}
+
+				/*
+				 * The following logic requires the referenced columns to exists in
+				 * the statement. Otherwise, we cannot apply some of the checks.
+				 */
+				if (constraint->pk_attrs == NULL)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint "
+										   "because referenced column list is empty"),
+									errhint("Add column names to \"REFERENCES\" part of "
+											"the statement.")));
+				}
+
+				/*
+				 * Referencing column's list length should be equal to referenced columns
+				 * list length.
+				 */
+				if (constraint->fk_attrs->length != constraint->pk_attrs->length)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint"),
+									errdetail("Referencing column list and referenced "
+											  "column list must be in same size.")));
+				}
+
+				/*
+				 * Partition column must exist in both referencing and referenced side
+				 * of the foreign key constraint. They also must be in same ordinal.
+				 */
+				referencingTablePartitionColumn = PartitionKey(referencingTableId);
+				referencedTablePartitionColumn = PartitionKey(referencedTableId);
+
+				/*
+				 * We iterate over fk_attrs and pk_attrs together because partition
+				 * column must be at the same place in both referencing and referenced
+				 * side of the foreign key constraint
+				 */
+				forboth(referencingTableAttr, constraint->fk_attrs,
+						referencedTableAttr, constraint->pk_attrs)
+				{
+					char *referencingAttrName = strVal(lfirst(referencingTableAttr));
+					char *referencedAttrName = strVal(lfirst(referencedTableAttr));
+					AttrNumber referencingAttrNo = get_attnum(referencingTableId,
+															  referencingAttrName);
+					AttrNumber referencedAttrNo = get_attnum(referencedTableId,
+															 referencedAttrName);
+
+					if (referencingTablePartitionColumn->varattno == referencingAttrNo &&
+						referencedTablePartitionColumn->varattno == referencedAttrNo)
+					{
+						foreignConstraintOnPartitionColumn = true;
+					}
+				}
+
+				if (!foreignConstraintOnPartitionColumn)
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint"),
+									errdetail("Partition column must exist both "
+											  "referencing and referenced side of the "
+											  "foreign constraint statement and it must "
+											  "be in the same ordinal in both sides.")));
+				}
+
+				/*
+				 * We do not allow to create foreign constraints if shard replication
+				 * factor is greater than 1. Because in our current design, multiple
+				 * replicas may cause locking problems and inconsistent shard contents.
+				 */
+				if (!SingleReplicatedTable(referencingTableId) ||
+					!SingleReplicatedTable(referencedTableId))
+				{
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cannot create foreign key constraint"),
+									errdetail("Citus Community Edition currently "
+											  "supports foreign key constraints only for "
+											  "\"citus.shard_replication_factor = 1\"."),
+									errhint("Please change "
+											"\"citus.shard_replication_factor to 1\". To "
+											"learn more about using foreign keys with "
+											"other replication factors, please contact"
+											" us at "
+											"https://citusdata.com/about/contact_us.")));
+				}
+
+				break;
+			}
+
+			case AT_DropConstraint:
+			{
+				/* we will no perform any special check for ALTER TABLE DROP CONSTRAINT */
+				break;
+			}
+
 			default:
 			{
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("alter table command is currently supported"),
+								errmsg("alter table command is currently unsupported"),
 								errdetail("Only ADD|DROP COLUMN, SET|DROP NOT NULL,"
-										  " SET|DROP DEFAULT and TYPE subcommands are"
-										  " supported.")));
+										  " SET|DROP DEFAULT, ADD|DROP CONSTRAINT FOREIGN"
+										  " KEY and TYPE subcommands are supported.")));
 			}
 		}
 	}
+}
+
+
+/*
+ * ErrorIfUnsupportedSeqStmt errors out if the provided create sequence
+ * statement specifies a distributed table in its OWNED BY clause.
+ */
+static void
+ErrorIfUnsupportedSeqStmt(CreateSeqStmt *createSeqStmt)
+{
+	Oid ownedByTableId = InvalidOid;
+
+	/* create is easy: just prohibit any distributed OWNED BY */
+	if (OptionsSpecifyOwnedBy(createSeqStmt->options, &ownedByTableId))
+	{
+		if (IsDistributedTable(ownedByTableId))
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot create sequences that specify a distributed "
+								   "table in their OWNED BY option"),
+							errhint("Use a sequence in a distributed table by specifying "
+									"a serial column type before creating any shards.")));
+		}
+	}
+}
+
+
+/*
+ * ErrorIfDistributedAlterSeqOwnedBy errors out if the provided alter sequence
+ * statement attempts to change the owned by property of a distributed sequence
+ * or attempt to change a local sequence to be owned by a distributed table.
+ */
+static void
+ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt)
+{
+	Oid sequenceId = RangeVarGetRelid(alterSeqStmt->sequence, AccessShareLock,
+									  alterSeqStmt->missing_ok);
+	Oid ownedByTableId = InvalidOid;
+	Oid newOwnedByTableId = InvalidOid;
+	int32 ownedByColumnId = 0;
+	bool hasDistributedOwner = false;
+
+	/* alter statement referenced nonexistent sequence; return */
+	if (sequenceId == InvalidOid)
+	{
+		return;
+	}
+
+	/* see whether the sequences is already owned by a distributed table */
+	if (sequenceIsOwned(sequenceId, &ownedByTableId, &ownedByColumnId))
+	{
+		hasDistributedOwner = IsDistributedTable(ownedByTableId);
+	}
+
+	if (OptionsSpecifyOwnedBy(alterSeqStmt->options, &newOwnedByTableId))
+	{
+		/* if a distributed sequence tries to change owner, error */
+		if (hasDistributedOwner && ownedByTableId != newOwnedByTableId)
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot alter OWNED BY option of a sequence "
+								   "already owned by a distributed table")));
+		}
+		else if (!hasDistributedOwner && IsDistributedTable(newOwnedByTableId))
+		{
+			/* and don't let local sequences get a distributed OWNED BY */
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot associate an existing sequence with a "
+								   "distributed table"),
+							errhint("Use a sequence in a distributed table by specifying "
+									"a serial column type before creating any shards.")));
+		}
+	}
+}
+
+
+/*
+ * ErrorIfUnsupportedTruncateStmt errors out if the command attempts to
+ * truncate a distributed foreign table.
+ */
+static void
+ErrorIfUnsupportedTruncateStmt(TruncateStmt *truncateStatement)
+{
+	List *relationList = truncateStatement->relations;
+	ListCell *relationCell = NULL;
+	foreach(relationCell, relationList)
+	{
+		RangeVar *rangeVar = (RangeVar *) lfirst(relationCell);
+		Oid relationId = RangeVarGetRelid(rangeVar, NoLock, true);
+		char relationKind = get_rel_relkind(relationId);
+		if (IsDistributedTable(relationId) &&
+			relationKind == RELKIND_FOREIGN_TABLE)
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("truncating distributed foreign tables is "
+								   "currently unsupported"),
+							errhint("Use master_drop_all_shards to remove "
+									"foreign table's shards.")));
+		}
+	}
+}
+
+
+/*
+ * OptionsSpecifyOwnedBy processes the options list of either a CREATE or ALTER
+ * SEQUENCE command, extracting the first OWNED BY option it encounters. The
+ * identifier for the specified table is placed in the Oid out parameter before
+ * returning true. Returns false if no such option is found. Still returns true
+ * for OWNED BY NONE, but leaves the out paramter set to InvalidOid.
+ */
+static bool
+OptionsSpecifyOwnedBy(List *optionList, Oid *ownedByTableId)
+{
+	ListCell *optionCell = NULL;
+
+	foreach(optionCell, optionList)
+	{
+		DefElem *defElem = (DefElem *) lfirst(optionCell);
+		if (strcmp(defElem->defname, "owned_by") == 0)
+		{
+			List *ownedByNames = defGetQualifiedName(defElem);
+			int nameCount = list_length(ownedByNames);
+
+			/* if only one name is present, this is OWNED BY NONE */
+			if (nameCount == 1)
+			{
+				*ownedByTableId = InvalidOid;
+				return true;
+			}
+			else
+			{
+				/*
+				 * Otherwise, we have a list of schema, table, column, which we
+				 * need to truncate to simply the schema and table to determine
+				 * the relevant relation identifier.
+				 */
+				List *relNameList = list_truncate(list_copy(ownedByNames), nameCount - 1);
+				RangeVar *rangeVar = makeRangeVarFromNameList(relNameList);
+				bool failOK = true;
+
+				*ownedByTableId = RangeVarGetRelid(rangeVar, NoLock, failOK);
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
 
 
@@ -880,18 +1898,14 @@ CreateLocalTable(RangeVar *relation, char *nodeName, int32 nodePort)
 
 	char *relationName = relation->relname;
 	char *schemaName = relation->schemaname;
-	char *qualifiedName = quote_qualified_identifier(schemaName, relationName);
-
-	/* fetch the ddl commands needed to create the table */
-	StringInfo tableNameStringInfo = makeStringInfo();
-	appendStringInfoString(tableNameStringInfo, qualifiedName);
+	char *qualifiedRelationName = quote_qualified_identifier(schemaName, relationName);
 
 	/*
 	 * The warning message created in TableDDLCommandList() is descriptive
 	 * enough; therefore, we just throw an error which says that we could not
 	 * run the copy operation.
 	 */
-	ddlCommandList = TableDDLCommandList(nodeName, nodePort, tableNameStringInfo);
+	ddlCommandList = TableDDLCommandList(nodeName, nodePort, qualifiedRelationName);
 	if (ddlCommandList == NIL)
 	{
 		ereport(ERROR, (errmsg("could not run copy from the worker node")));
@@ -932,6 +1946,13 @@ CreateLocalTable(RangeVar *relation, char *nodeName, int32 nodePort)
 		{
 			applyDDLCommand = true;
 		}
+		else if ((IsA(ddlCommandNode, CreateSeqStmt)))
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot copy to table with serial column from worker"),
+							errhint("Connect to the master node to COPY to tables which "
+									"use serial column types.")));
+		}
 
 		/* run only a selected set of DDL commands */
 		if (applyDDLCommand)
@@ -965,19 +1986,10 @@ IsAlterTableRenameStmt(RenameStmt *renameStmt)
 	{
 		isAlterTableRenameStmt = true;
 	}
-
-#if (PG_VERSION_NUM >= 90500)
 	else if (renameStmt->renameType == OBJECT_TABCONSTRAINT)
 	{
 		isAlterTableRenameStmt = true;
 	}
-#else
-	else if (renameStmt->renameType == OBJECT_CONSTRAINT &&
-			 renameStmt->relationType == OBJECT_TABLE)
-	{
-		isAlterTableRenameStmt = true;
-	}
-#endif
 
 	return isAlterTableRenameStmt;
 }
@@ -985,206 +1997,221 @@ IsAlterTableRenameStmt(RenameStmt *renameStmt)
 
 /*
  * ExecuteDistributedDDLCommand applies a given DDL command to the given
- * distributed table. If the function is unable to access all the finalized
- * shard placements, then it fails early and errors out. If the command
- * successfully executed on any finalized shard placement, and failed on
- * others, then it marks the placements on which execution failed as invalid.
+ * distributed table in a distributed transaction. If the multi shard commit protocol is
+ * in its default value of '1pc', then a notice message indicating that '2pc' might be
+ * used for extra safety. In the commit protocol, a BEGIN is sent after connection to
+ * each shard placement and COMMIT/ROLLBACK is handled by
+ * CompleteShardPlacementTransactions function.
  */
 static void
-ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString)
+ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString,
+							 bool isTopLevel)
 {
-	List *failedPlacementList = NIL;
-	bool executionOK = false;
+	List *taskList = NIL;
+	bool shouldSyncMetadata = ShouldSyncTableMetadata(relationId);
 
-	bool allPlacementsAccessible = AllFinalizedPlacementsAccessible(relationId);
-	if (!allPlacementsAccessible)
+	if (XactModificationLevel == XACT_MODIFICATION_DATA)
 	{
-		ereport(ERROR, (errmsg("cannot execute command: %s", ddlCommandString),
-						errdetail("All finalized shard placements need to be accessible "
-								  "to execute DDL commands on distributed tables.")));
+		ereport(ERROR, (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+						errmsg("distributed DDL commands must not appear within "
+							   "transaction blocks containing single-shard data "
+							   "modifications")));
 	}
 
-	/* make sure we don't process cancel signals */
-	HOLD_INTERRUPTS();
+	EnsureCoordinator();
+	ShowNoticeIfNotUsing2PC();
 
-	executionOK = ExecuteCommandOnWorkerShards(relationId, ddlCommandString,
-											   &failedPlacementList);
-
-	/* if command could not be executed on any finalized shard placement, error out */
-	if (!executionOK)
+	if (shouldSyncMetadata)
 	{
-		ereport(ERROR, (errmsg("could not execute DDL command on worker node shards")));
-	}
-	else
-	{
-		/* else, mark failed placements as inactive */
-		ListCell *failedPlacementCell = NULL;
-		foreach(failedPlacementCell, failedPlacementList)
-		{
-			ShardPlacement *placement = (ShardPlacement *) lfirst(failedPlacementCell);
-			uint64 shardId = placement->shardId;
-			char *workerName = placement->nodeName;
-			uint32 workerPort = placement->nodePort;
-			uint64 oldShardLength = placement->shardLength;
-
-			DeleteShardPlacementRow(shardId, workerName, workerPort);
-			InsertShardPlacementRow(shardId, FILE_INACTIVE, oldShardLength,
-									workerName, workerPort);
-		}
+		SendCommandToWorkers(WORKERS_WITH_METADATA, DISABLE_DDL_PROPAGATION);
+		SendCommandToWorkers(WORKERS_WITH_METADATA, (char *) ddlCommandString);
 	}
 
-	if (QueryCancelPending)
-	{
-		ereport(WARNING, (errmsg("cancel requests are ignored during DDL commands")));
-		QueryCancelPending = false;
-	}
+	taskList = DDLTaskList(relationId, ddlCommandString);
 
-	RESUME_INTERRUPTS();
+	ExecuteModifyTasksWithoutResults(taskList);
 }
 
 
 /*
- * ExecuteCommandOnWorkerShards executes a given command on all the finalized
- * shard placements of the given table. If the remote command errors out on the
- * first attempted placement, the function returns false. Otherwise, it returns
- * true.
+ * ExecuteDistributedForeignKeyCommand applies a given foreign key command to the given
+ * distributed table in a distributed transaction. If the multi shard commit protocol is
+ * in its default value of '1pc', then a notice message indicating that '2pc' might be
+ * used for extra safety. In the commit protocol, a BEGIN is sent after connection to
+ * each shard placement and COMMIT/ROLLBACK is handled by
+ * CompleteShardPlacementTransactions function.
  *
- * If the remote query errors out on the first attempted placement, it is very
- * likely that the command is going to fail on other placements too. This is
- * because most errors here will be PostgreSQL errors. Hence, the function fails
- * fast to avoid marking a high number of placements as failed. If the command
- * succeeds on at least one placement before failing on others, then the list of
- * failed placements is returned in failedPlacementList.
- *
- * Note: There are certain errors which would occur on few nodes and not on the
- * others. For example, adding a column with a type which exists on some nodes
- * and not on the others. In that case, this function might still end up returning
- * a large number of placements as failed.
+ * leftRelationId is the relation id of actual distributed table which given foreign key
+ * command is applied. rightRelationId is the relation id of distributed table which
+ * foreign key refers to.
  */
-static bool
-ExecuteCommandOnWorkerShards(Oid relationId, const char *commandString,
-							 List **failedPlacementList)
+static void
+ExecuteDistributedForeignKeyCommand(Oid leftRelationId, Oid rightRelationId,
+									const char *ddlCommandString, bool isTopLevel)
 {
-	bool isFirstPlacement = true;
-	ListCell *shardCell = NULL;
-	List *shardList = NIL;
-	char *relationOwner = TableOwner(relationId);
+	List *taskList = NIL;
+	bool shouldSyncMetadata = false;
 
-	shardList = LoadShardList(relationId);
-	foreach(shardCell, shardList)
+	if (XactModificationLevel == XACT_MODIFICATION_DATA)
 	{
-		List *shardPlacementList = NIL;
-		ListCell *shardPlacementCell = NULL;
-		uint64 *shardIdPointer = (uint64 *) lfirst(shardCell);
-		uint64 shardId = (*shardIdPointer);
+		ereport(ERROR, (errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+						errmsg("distributed DDL commands must not appear within "
+							   "transaction blocks containing single-shard data "
+							   "modifications")));
+	}
 
-		/* build the shard ddl command */
-		char *escapedCommandString = quote_literal_cstr(commandString);
+	EnsureCoordinator();
+	ShowNoticeIfNotUsing2PC();
+
+	/*
+	 * It is sufficient to check only one of the tables for metadata syncing on workers,
+	 * since the colocation of two tables implies that either both or none of them have
+	 * metadata on workers.
+	 */
+	shouldSyncMetadata = ShouldSyncTableMetadata(leftRelationId);
+	if (shouldSyncMetadata)
+	{
+		SendCommandToWorkers(WORKERS_WITH_METADATA, DISABLE_DDL_PROPAGATION);
+		SendCommandToWorkers(WORKERS_WITH_METADATA, (char *) ddlCommandString);
+	}
+
+	taskList = ForeignKeyTaskList(leftRelationId, rightRelationId, ddlCommandString);
+
+	ExecuteModifyTasksWithoutResults(taskList);
+}
+
+
+/*
+ * ShowNoticeIfNotUsing2PC shows a notice message about using 2PC by setting
+ * citus.multi_shard_commit_protocol to 2PC. The notice message is shown only once in a
+ * session
+ */
+static void
+ShowNoticeIfNotUsing2PC(void)
+{
+	if (MultiShardCommitProtocol != COMMIT_PROTOCOL_2PC && !warnedUserAbout2PC)
+	{
+		ereport(NOTICE, (errmsg("using one-phase commit for distributed DDL commands"),
+						 errhint("You can enable two-phase commit for extra safety with: "
+								 "SET citus.multi_shard_commit_protocol TO '2pc'")));
+
+		warnedUserAbout2PC = true;
+	}
+}
+
+
+/*
+ * DDLTaskList builds a list of tasks to execute a DDL command on a
+ * given list of shards.
+ */
+static List *
+DDLTaskList(Oid relationId, const char *commandString)
+{
+	List *taskList = NIL;
+	List *shardIntervalList = LoadShardIntervalList(relationId);
+	ListCell *shardIntervalCell = NULL;
+	Oid schemaId = get_rel_namespace(relationId);
+	char *schemaName = get_namespace_name(schemaId);
+	char *escapedSchemaName = quote_literal_cstr(schemaName);
+	char *escapedCommandString = quote_literal_cstr(commandString);
+	uint64 jobId = INVALID_JOB_ID;
+	int taskId = 1;
+
+	/* lock metadata before getting placement lists */
+	LockShardListMetadata(shardIntervalList, ShareLock);
+
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		uint64 shardId = shardInterval->shardId;
 		StringInfo applyCommand = makeStringInfo();
+		Task *task = NULL;
+
+		/*
+		 * If rightRelationId is not InvalidOid, instead of worker_apply_shard_ddl_command
+		 * we use worker_apply_inter_shard_ddl_command.
+		 */
 		appendStringInfo(applyCommand, WORKER_APPLY_SHARD_DDL_COMMAND, shardId,
-						 escapedCommandString);
+						 escapedSchemaName, escapedCommandString);
 
-		shardPlacementList = FinalizedShardPlacementList(shardId);
-		foreach(shardPlacementCell, shardPlacementList)
-		{
-			ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
-			char *workerName = placement->nodeName;
-			uint32 workerPort = placement->nodePort;
+		task = CitusMakeNode(Task);
+		task->jobId = jobId;
+		task->taskId = taskId++;
+		task->taskType = DDL_TASK;
+		task->queryString = applyCommand->data;
+		task->replicationModel = REPLICATION_MODEL_INVALID;
+		task->dependedTaskList = NULL;
+		task->anchorShardId = shardId;
+		task->taskPlacementList = FinalizedShardPlacementList(shardId);
 
-			List *queryResultList = ExecuteRemoteQuery(workerName, workerPort,
-													   relationOwner, applyCommand);
-			if (queryResultList == NIL)
-			{
-				/*
-				 * If we failed on the first placement, return false. We return
-				 * here instead of exiting at the end to avoid breaking through
-				 * multiple loops.
-				 */
-				if (isFirstPlacement)
-				{
-					return false;
-				}
-
-				ereport(WARNING, (errmsg("could not apply command on shard "
-										 UINT64_FORMAT " on node %s:%d", shardId,
-										 workerName, workerPort),
-								  errdetail("Shard placement will be marked as "
-											"inactive.")));
-
-				*failedPlacementList = lappend(*failedPlacementList, placement);
-			}
-			else
-			{
-				ereport(DEBUG2, (errmsg("applied command on shard " UINT64_FORMAT
-										" on node %s:%d", shardId, workerName,
-										workerPort)));
-			}
-
-			isFirstPlacement = false;
-		}
-
-		FreeStringInfo(applyCommand);
+		taskList = lappend(taskList, task);
 	}
 
-	return true;
+	return taskList;
 }
 
 
 /*
- * AllFinalizedPlacementsAccessible returns true if all the finalized shard
- * placements for a given relation are accessible. Otherwise, the function
- * returns false. To do so, the function first gets a list of responsive
- * worker nodes and then checks if all the finalized shard placements lie
- * on those worker nodes.
+ * ForeignKeyTaskList builds a list of tasks to execute a foreign key command on a
+ * shards of given list of distributed table.
+ *
+ * leftRelationId is the relation id of actual distributed table which given foreign key
+ * command is applied. rightRelationId is the relation id of distributed table which
+ * foreign key refers to.
  */
-static bool
-AllFinalizedPlacementsAccessible(Oid relationId)
+static List *
+ForeignKeyTaskList(Oid leftRelationId, Oid rightRelationId,
+				   const char *commandString)
 {
-	bool allPlacementsAccessible = true;
-	ListCell *shardCell = NULL;
-	List *responsiveNodeList = ResponsiveWorkerNodeList();
+	List *taskList = NIL;
 
-	List *shardList = LoadShardList(relationId);
-	foreach(shardCell, shardList)
+	List *leftShardList = LoadShardIntervalList(leftRelationId);
+	ListCell *leftShardCell = NULL;
+	Oid leftSchemaId = get_rel_namespace(leftRelationId);
+	char *leftSchemaName = get_namespace_name(leftSchemaId);
+	char *escapedLeftSchemaName = quote_literal_cstr(leftSchemaName);
+
+	List *rightShardList = LoadShardIntervalList(rightRelationId);
+	ListCell *rightShardCell = NULL;
+	Oid rightSchemaId = get_rel_namespace(rightRelationId);
+	char *rightSchemaName = get_namespace_name(rightSchemaId);
+	char *escapedRightSchemaName = quote_literal_cstr(rightSchemaName);
+
+	char *escapedCommandString = quote_literal_cstr(commandString);
+	uint64 jobId = INVALID_JOB_ID;
+	int taskId = 1;
+
+	/* lock metadata before getting placement lists */
+	LockShardListMetadata(leftShardList, ShareLock);
+
+	forboth(leftShardCell, leftShardList, rightShardCell, rightShardList)
 	{
-		List *shardPlacementList = NIL;
-		ListCell *shardPlacementCell = NULL;
-		uint64 *shardIdPointer = (uint64 *) lfirst(shardCell);
-		uint64 shardId = (*shardIdPointer);
+		ShardInterval *leftShardInterval = (ShardInterval *) lfirst(leftShardCell);
+		uint64 leftShardId = leftShardInterval->shardId;
+		StringInfo applyCommand = makeStringInfo();
+		Task *task = NULL;
 
-		shardPlacementList = FinalizedShardPlacementList(shardId);
-		foreach(shardPlacementCell, shardPlacementList)
-		{
-			ListCell *responsiveNodeCell = NULL;
-			bool placementAccessible = false;
-			ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
+		ShardInterval *rightShardInterval = (ShardInterval *) lfirst(rightShardCell);
+		uint64 rightShardId = rightShardInterval->shardId;
 
-			/* verify that the placement lies on one of the responsive worker nodes */
-			foreach(responsiveNodeCell, responsiveNodeList)
-			{
-				WorkerNode *node = (WorkerNode *) lfirst(responsiveNodeCell);
-				if (strncmp(node->workerName, placement->nodeName, WORKER_LENGTH) == 0 &&
-					node->workerPort == placement->nodePort)
-				{
-					placementAccessible = true;
-					break;
-				}
-			}
+		appendStringInfo(applyCommand, WORKER_APPLY_INTER_SHARD_DDL_COMMAND,
+						 leftShardId, escapedLeftSchemaName, rightShardId,
+						 escapedRightSchemaName, escapedCommandString);
 
-			if (!placementAccessible)
-			{
-				allPlacementsAccessible = false;
-				break;
-			}
-		}
+		task = CitusMakeNode(Task);
+		task->jobId = jobId;
+		task->taskId = taskId++;
+		task->taskType = DDL_TASK;
+		task->queryString = applyCommand->data;
+		task->dependedTaskList = NULL;
+		task->replicationModel = REPLICATION_MODEL_INVALID;
+		task->anchorShardId = leftShardId;
+		task->taskPlacementList = FinalizedShardPlacementList(leftShardId);
 
-		if (!allPlacementsAccessible)
-		{
-			break;
-		}
+		taskList = lappend(taskList, task);
 	}
 
-	return allPlacementsAccessible;
+	return taskList;
 }
 
 
@@ -1311,11 +2338,7 @@ CheckCopyPermissions(CopyStmt *copyStatement)
 
 		if (is_from)
 		{
-#if (PG_VERSION_NUM >= 90500)
 			rte->insertedCols = bms_add_member(rte->insertedCols, attno);
-#else
-			rte->modifiedCols = bms_add_member(rte->modifiedCols, attno);
-#endif
 		}
 		else
 		{
@@ -1430,7 +2453,6 @@ ReplicateGrantStmt(Node *parsetree)
 	StringInfoData ddlString;
 	ListCell *granteeCell = NULL;
 	ListCell *objectCell = NULL;
-	ListCell *privilegeCell = NULL;
 	bool isFirst = true;
 
 	initStringInfo(&privsString);
@@ -1455,6 +2477,8 @@ ReplicateGrantStmt(Node *parsetree)
 	}
 	else
 	{
+		ListCell *privilegeCell = NULL;
+
 		isFirst = true;
 		foreach(privilegeCell, grantStmt->privileges)
 		{
@@ -1477,11 +2501,7 @@ ReplicateGrantStmt(Node *parsetree)
 	isFirst = true;
 	foreach(granteeCell, grantStmt->grantees)
 	{
-#if (PG_VERSION_NUM >= 90500)
 		RoleSpec *spec = lfirst(granteeCell);
-#else
-		PrivGrantee *spec = lfirst(granteeCell);
-#endif
 
 		if (!isFirst)
 		{
@@ -1489,7 +2509,6 @@ ReplicateGrantStmt(Node *parsetree)
 		}
 		isFirst = false;
 
-#if (PG_VERSION_NUM >= 90500)
 		if (spec->roletype == ROLESPEC_CSTRING)
 		{
 			appendStringInfoString(&granteesString, quote_identifier(spec->rolename));
@@ -1506,16 +2525,6 @@ ReplicateGrantStmt(Node *parsetree)
 		{
 			appendStringInfoString(&granteesString, "PUBLIC");
 		}
-#else
-		if (spec->rolname)
-		{
-			appendStringInfoString(&granteesString, quote_identifier(spec->rolname));
-		}
-		else
-		{
-			appendStringInfoString(&granteesString, "PUBLIC");
-		}
-#endif
 	}
 
 	/*
@@ -1529,6 +2538,7 @@ ReplicateGrantStmt(Node *parsetree)
 		RangeVar *relvar = (RangeVar *) lfirst(objectCell);
 		Oid relOid = RangeVarGetRelid(relvar, NoLock, false);
 		const char *grantOption = "";
+		bool isTopLevel = true;
 
 		if (!IsDistributedTable(relOid))
 		{
@@ -1561,7 +2571,7 @@ ReplicateGrantStmt(Node *parsetree)
 							 granteesString.data);
 		}
 
-		ExecuteDistributedDDLCommand(relOid, ddlString.data);
+		ExecuteDistributedDDLCommand(relOid, ddlString.data, isTopLevel);
 		resetStringInfo(&ddlString);
 	}
 }

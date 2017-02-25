@@ -50,8 +50,8 @@ SELECT set_config('citus.shard_replication_factor', '2', false);
  2
 (1 row)
 
-\STAGE multi_append_table_to_shard_left FROM '@abs_srcdir@/data/agg.data'
-\STAGE multi_append_table_to_shard_left FROM '@abs_srcdir@/data/agg.data'
+\copy multi_append_table_to_shard_left FROM '@abs_srcdir@/data/agg.data'
+\copy multi_append_table_to_shard_left FROM '@abs_srcdir@/data/agg.data'
 -- Place 'right' table only on the primary worker
 SELECT set_config('citus.shard_replication_factor', '1', false);
  set_config 
@@ -59,7 +59,7 @@ SELECT set_config('citus.shard_replication_factor', '1', false);
  1
 (1 row)
 
-\STAGE multi_append_table_to_shard_right FROM '@abs_srcdir@/data/agg.data'
+\copy multi_append_table_to_shard_right FROM '@abs_srcdir@/data/agg.data'
 -- Reset shard replication factor to ensure tasks will be assigned to both workers
 SELECT set_config('citus.shard_replication_factor', '2', false);
  set_config 
@@ -134,7 +134,7 @@ FROM
 		pg_dist_shard
 WHERE	'multi_append_table_to_shard_right_hash'::regclass::oid = logicalrelid;
 ERROR:  cannot append to shardId 230000
-DETAIL:  We currently don't support appending to shards in hash-partitioned tables
+DETAIL:  We currently don't support appending to shards in hash-partitioned or reference tables
 -- Clean up after test
 SELECT master_apply_delete_command('DELETE FROM multi_append_table_to_shard_right');
  master_apply_delete_command 
@@ -151,3 +151,102 @@ SELECT master_apply_delete_command('DELETE FROM multi_append_table_to_shard_left
 DROP TABLE multi_append_table_to_shard_stage;
 DROP TABLE multi_append_table_to_shard_right;
 DROP TABLE multi_append_table_to_shard_left;
+-- Check partitioning by date
+CREATE TABLE multi_append_table_to_shard_date
+(
+	event_date DATE,
+	value INT
+);
+SELECT master_create_distributed_table('multi_append_table_to_shard_date', 'event_date', 'append');
+ master_create_distributed_table 
+---------------------------------
+ 
+(1 row)
+
+-- Create an empty shard and check that we can query the table
+SELECT master_create_empty_shard('multi_append_table_to_shard_date');
+ master_create_empty_shard 
+---------------------------
+                    230004
+(1 row)
+
+SELECT * FROM multi_append_table_to_shard_date;
+ event_date | value 
+------------+-------
+(0 rows)
+
+-- Create an empty distributed table and check that we can query it
+CREATE TABLE multi_append_table_to_shard_stage (LIKE multi_append_table_to_shard_date);
+SELECT	master_append_table_to_shard(shardid, 'multi_append_table_to_shard_stage', 'localhost', 57636)
+FROM
+		pg_dist_shard
+WHERE	'multi_append_table_to_shard_date'::regclass::oid = logicalrelid;
+ master_append_table_to_shard 
+------------------------------
+                            0
+(1 row)
+
+SELECT * FROM multi_append_table_to_shard_date;
+ event_date | value 
+------------+-------
+(0 rows)
+
+-- INSERT NULL values and check that we can query the table
+INSERT INTO multi_append_table_to_shard_stage VALUES (NULL, NULL);
+SELECT	master_append_table_to_shard(shardid, 'multi_append_table_to_shard_stage', 'localhost', 57636)
+FROM
+		pg_dist_shard
+WHERE	'multi_append_table_to_shard_date'::regclass::oid = logicalrelid;
+ master_append_table_to_shard 
+------------------------------
+                    0.0266667
+(1 row)
+
+SELECT * FROM multi_append_table_to_shard_date;
+ event_date | value 
+------------+-------
+            |      
+(1 row)
+
+-- INSERT regular values and check that we can query the table
+INSERT INTO multi_append_table_to_shard_stage VALUES ('2016-01-01', 3);
+SELECT	master_append_table_to_shard(shardid, 'multi_append_table_to_shard_stage', 'localhost', 57636)
+FROM
+		pg_dist_shard
+WHERE	'multi_append_table_to_shard_date'::regclass::oid = logicalrelid;
+ master_append_table_to_shard 
+------------------------------
+                    0.0266667
+(1 row)
+
+SELECT * FROM multi_append_table_to_shard_date;
+ event_date | value 
+------------+-------
+            |      
+            |      
+ 01-01-2016 |     3
+(3 rows)
+
+-- When run inside aborted transaction does not persist changes
+INSERT INTO multi_append_table_to_shard_stage VALUES ('2016-02-02', 4);
+BEGIN;
+SELECT	master_append_table_to_shard(shardid, 'multi_append_table_to_shard_stage', 'localhost', 57636)
+FROM
+		pg_dist_shard
+WHERE	'multi_append_table_to_shard_date'::regclass::oid = logicalrelid;
+ master_append_table_to_shard 
+------------------------------
+                    0.0266667
+(1 row)
+
+ROLLBACK;
+SELECT * FROM multi_append_table_to_shard_date;
+ event_date | value 
+------------+-------
+            |      
+            |      
+ 01-01-2016 |     3
+(3 rows)
+
+DROP TABLE multi_append_table_to_shard_stage;
+DROP TABLE multi_append_table_to_shard_date;

@@ -23,10 +23,6 @@ CREATE TABLE articles_single_shard (LIKE articles);
 SELECT master_create_distributed_table('articles', 'author_id', 'hash');
 SELECT master_create_distributed_table('articles_single_shard', 'author_id', 'hash');
 
-
--- test when a table is distributed but no shards created yet
-SELECT count(*) from articles;
-
 SELECT master_create_worker_shards('articles', 2, 1);
 SELECT master_create_worker_shards('articles_single_shard', 1, 1);
 
@@ -85,9 +81,6 @@ INSERT INTO articles VALUES (50, 10, 'anjanette', 19519);
 -- insert a single row for the test
 INSERT INTO articles_single_shard VALUES (50, 10, 'anjanette', 19519);
 
--- first, test zero-shard SELECT, which should return an empty row
-SELECT COUNT(*) FROM articles WHERE author_id = 1 AND author_id = 2;
-
 -- zero-shard modifications should fail
 UPDATE articles SET title = '' WHERE author_id = 1 AND author_id = 2;
 DELETE FROM articles WHERE author_id = 1 AND author_id = 2;
@@ -116,17 +109,16 @@ SELECT title, author_id FROM articles
 	WHERE author_id = 7 OR author_id = 8
 	ORDER BY author_id ASC, id;
 
--- add in some grouping expressions, still on same shard
--- having queries unsupported in Citus
+-- add in some grouping expressions
 SELECT author_id, sum(word_count) AS corpus_size FROM articles
-	WHERE author_id = 1 OR author_id = 7 OR author_id = 8 OR author_id = 10
+	WHERE author_id = 1 OR author_id = 2 OR author_id = 8 OR author_id = 10
 	GROUP BY author_id
 	HAVING sum(word_count) > 40000
 	ORDER BY sum(word_count) DESC;
 
--- UNION/INTERSECT queries are unsupported
+-- UNION/INTERSECT queries are unsupported if on multiple shards
 SELECT * FROM articles WHERE author_id = 10 UNION
-SELECT * FROM articles WHERE author_id = 1; 
+SELECT * FROM articles WHERE author_id = 2; 
 
 -- queries using CTEs are unsupported
 WITH long_names AS ( SELECT id FROM authors WHERE char_length(name) > 15 )
@@ -144,7 +136,7 @@ FROM articles, (SELECT id, word_count FROM articles) AS test WHERE test.id = art
 ORDER BY articles.id;
 
 -- subqueries are not supported in SELECT clause
-SELECT a.title AS name, (SELECT a2.id FROM authors a2 WHERE a.id = a2.id  LIMIT 1)
+SELECT a.title AS name, (SELECT a2.id FROM articles_single_shard a2 WHERE a.id = a2.id  LIMIT 1)
 						 AS special_price FROM articles a;
 
 -- joins are not supported between local and distributed tables
@@ -178,18 +170,43 @@ SELECT FROM articles WHERE author_id = 3737;
 
 SELECT FROM articles WHERE word_count = 65500;
 
--- having queries unsupported in Citus
+-- having queries supported in Citus
 SELECT author_id, sum(word_count) AS corpus_size FROM articles
 	GROUP BY author_id
 	HAVING sum(word_count) > 25000
 	ORDER BY sum(word_count) DESC
 	LIMIT 5;
 
--- more proof Citus doesn't support having clauses
 SELECT author_id FROM articles
 	GROUP BY author_id
 	HAVING sum(word_count) > 50000
 	ORDER BY author_id;
+
+SELECT author_id FROM articles
+	GROUP BY author_id
+	HAVING sum(word_count) > 50000 AND author_id < 5
+	ORDER BY author_id;
+
+SELECT author_id FROM articles
+	GROUP BY author_id
+	HAVING sum(word_count) > 50000 OR author_id < 5
+	ORDER BY author_id;
+
+SELECT author_id FROM articles
+	GROUP BY author_id
+	HAVING author_id <= 2 OR author_id = 8
+	ORDER BY author_id;
+
+SELECT o_orderstatus, count(*), avg(o_totalprice) FROM orders 
+	GROUP BY o_orderstatus
+	HAVING count(*) > 1450 OR avg(o_totalprice) > 150000
+	ORDER BY o_orderstatus;
+
+SELECT o_orderstatus, sum(l_linenumber), avg(l_linenumber) FROM lineitem, orders
+	WHERE l_orderkey = o_orderkey AND l_orderkey > 9030
+	GROUP BY o_orderstatus
+	HAVING sum(l_linenumber) > 1000
+	ORDER BY o_orderstatus;
 
 -- now, test the cases where Citus do or do not need to create
 -- the master queries
@@ -243,7 +260,8 @@ SELECT *
 SELECT id
 	FROM articles
 	WHERE author_id = 1
-	GROUP BY id;
+	GROUP BY id
+	ORDER BY id;
 
 -- copying from a single shard table does not require the master query
 COPY articles_single_shard TO stdout;
@@ -264,5 +282,17 @@ SELECT max(word_count) as max, min(word_count) as min,
 SELECT *
 	FROM articles a, articles b
 	WHERE a.id = b.id  AND a.author_id = 1;
+
+-- system columns from shard tables can be queried and retrieved
+SELECT count(*) FROM (
+    SELECT tableoid, ctid, cmin, cmax, xmin, xmax
+        FROM articles
+        WHERE tableoid IS NOT NULL OR
+                  ctid IS NOT NULL OR
+                  cmin IS NOT NULL OR
+                  cmax IS NOT NULL OR
+                  xmin IS NOT NULL OR
+                  xmax IS NOT NULL
+) x;
 
 SET client_min_messages to 'NOTICE';

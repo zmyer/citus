@@ -100,7 +100,7 @@ task_tracker_assign_task(PG_FUNCTION_ARGS)
 		UnlockJobResource(jobId, AccessExclusiveLock);
 	}
 
-	LWLockAcquire(WorkerTasksSharedState->taskHashLock, LW_EXCLUSIVE);
+	LWLockAcquire(&WorkerTasksSharedState->taskHashLock, LW_EXCLUSIVE);
 
 	/* check if we already have the task in our shared hash */
 	workerTask = WorkerTasksHashFind(jobId, taskId);
@@ -113,7 +113,7 @@ task_tracker_assign_task(PG_FUNCTION_ARGS)
 		UpdateTask(workerTask, taskCallString);
 	}
 
-	LWLockRelease(WorkerTasksSharedState->taskHashLock);
+	LWLockRelease(&WorkerTasksSharedState->taskHashLock);
 
 	PG_RETURN_VOID();
 }
@@ -132,7 +132,7 @@ task_tracker_task_status(PG_FUNCTION_ARGS)
 	bool taskTrackerRunning = TaskTrackerRunning();
 	if (taskTrackerRunning)
 	{
-		LWLockAcquire(WorkerTasksSharedState->taskHashLock, LW_SHARED);
+		LWLockAcquire(&WorkerTasksSharedState->taskHashLock, LW_SHARED);
 
 		workerTask = WorkerTasksHashFind(jobId, taskId);
 		if (workerTask == NULL)
@@ -144,7 +144,7 @@ task_tracker_task_status(PG_FUNCTION_ARGS)
 
 		taskStatus = (uint32) workerTask->taskStatus;
 
-		LWLockRelease(WorkerTasksSharedState->taskHashLock);
+		LWLockRelease(&WorkerTasksSharedState->taskHashLock);
 	}
 	else
 	{
@@ -174,7 +174,7 @@ task_tracker_cleanup_job(PG_FUNCTION_ARGS)
 	 * We first clean up any open connections, and remove tasks belonging to
 	 * this job from the shared hash.
 	 */
-	LWLockAcquire(WorkerTasksSharedState->taskHashLock, LW_EXCLUSIVE);
+	LWLockAcquire(&WorkerTasksSharedState->taskHashLock, LW_EXCLUSIVE);
 
 	hash_seq_init(&status, WorkerTasksSharedState->taskHash);
 
@@ -189,7 +189,7 @@ task_tracker_cleanup_job(PG_FUNCTION_ARGS)
 		currentTask = (WorkerTask *) hash_seq_search(&status);
 	}
 
-	LWLockRelease(WorkerTasksSharedState->taskHashLock);
+	LWLockRelease(&WorkerTasksSharedState->taskHashLock);
 
 	/*
 	 * We then delete the job directory and schema, if they exist. This cleans
@@ -233,7 +233,7 @@ TaskTrackerRunning(void)
 	 * marker task to the shared hash. We need to look up this marker task since
 	 * the postmaster doesn't send a terminate signal to running backends.
 	 */
-	LWLockAcquire(WorkerTasksSharedState->taskHashLock, LW_SHARED);
+	LWLockAcquire(&WorkerTasksSharedState->taskHashLock, LW_SHARED);
 
 	workerTask = WorkerTasksHashFind(RESERVED_JOB_ID, SHUTDOWN_MARKER_TASK_ID);
 	if (workerTask != NULL)
@@ -241,7 +241,7 @@ TaskTrackerRunning(void)
 		taskTrackerRunning = false;
 	}
 
-	LWLockRelease(WorkerTasksSharedState->taskHashLock);
+	LWLockRelease(&WorkerTasksSharedState->taskHashLock);
 
 	return taskTrackerRunning;
 }
@@ -261,16 +261,8 @@ CreateJobSchema(StringInfo schemaName)
 
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
-
-	/* build a CREATE SCHEMA statement */
-	CreateSchemaStmt *createSchemaStmt = makeNode(CreateSchemaStmt);
-	createSchemaStmt->schemaname = schemaName->data;
-#if (PG_VERSION_NUM >= 90500)
-	createSchemaStmt->authrole = NULL;
-#else
-	createSchemaStmt->authid = NULL;
-#endif
-	createSchemaStmt->schemaElts = NIL;
+	CreateSchemaStmt *createSchemaStmt = NULL;
+	RoleSpec currentUserRole = { 0 };
 
 	/* allow schema names that start with pg_ */
 	oldAllowSystemTableMods = allowSystemTableMods;
@@ -280,7 +272,18 @@ CreateJobSchema(StringInfo schemaName)
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
 
-	/* actually create schema, and make it visible */
+	/* build a CREATE SCHEMA statement */
+	currentUserRole.type = T_RoleSpec;
+	currentUserRole.roletype = ROLESPEC_CSTRING;
+	currentUserRole.rolename = GetUserNameFromId(savedUserId, false);
+	currentUserRole.location = -1;
+
+	createSchemaStmt = makeNode(CreateSchemaStmt);
+	createSchemaStmt->schemaname = schemaName->data;
+	createSchemaStmt->authrole = (Node *) &currentUserRole;
+	createSchemaStmt->schemaElts = NIL;
+
+	/* actually create schema with the current user as owner */
 	CreateSchemaCommand(createSchemaStmt, queryString);
 	CommandCounterIncrement();
 
@@ -313,13 +316,13 @@ CreateTask(uint64 jobId, uint32 taskId, char *taskCallString)
 	/* enter the worker task into shared hash and initialize the task */
 	workerTask = WorkerTasksHashEnter(jobId, taskId);
 	workerTask->assignedAt = assignmentTime;
-	strncpy(workerTask->taskCallString, taskCallString, TASK_CALL_STRING_SIZE);
+	strlcpy(workerTask->taskCallString, taskCallString, TASK_CALL_STRING_SIZE);
 
 	workerTask->taskStatus = TASK_ASSIGNED;
 	workerTask->connectionId = INVALID_CONNECTION_ID;
 	workerTask->failureCount = 0;
-	strncpy(workerTask->databaseName, databaseName, NAMEDATALEN);
-	strncpy(workerTask->userName, userName, NAMEDATALEN);
+	strlcpy(workerTask->databaseName, databaseName, NAMEDATALEN);
+	strlcpy(workerTask->userName, userName, NAMEDATALEN);
 }
 
 
@@ -350,13 +353,13 @@ UpdateTask(WorkerTask *workerTask, char *taskCallString)
 	}
 	else if (taskStatus == TASK_PERMANENTLY_FAILED)
 	{
-		strncpy(workerTask->taskCallString, taskCallString, TASK_CALL_STRING_SIZE);
+		strlcpy(workerTask->taskCallString, taskCallString, TASK_CALL_STRING_SIZE);
 		workerTask->failureCount = 0;
 		workerTask->taskStatus = TASK_ASSIGNED;
 	}
 	else
 	{
-		strncpy(workerTask->taskCallString, taskCallString, TASK_CALL_STRING_SIZE);
+		strlcpy(workerTask->taskCallString, taskCallString, TASK_CALL_STRING_SIZE);
 		workerTask->failureCount = 0;
 	}
 }

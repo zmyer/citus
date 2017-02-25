@@ -14,6 +14,13 @@ CREATE TABLE articles_hash (
 	word_count integer
 );
 
+CREATE TABLE articles_range (
+	id bigint NOT NULL,
+	author_id bigint NOT NULL,
+	title varchar(20) NOT NULL,
+	word_count integer
+);
+
 -- Check for the existence of line 'DEBUG:  Creating router plan'
 -- to determine if router planner is used.
 
@@ -25,7 +32,6 @@ CREATE TABLE articles_single_shard_hash (LIKE articles_hash);
 
 SELECT master_create_distributed_table('articles_hash', 'author_id', 'hash');
 SELECT master_create_distributed_table('articles_single_shard_hash', 'author_id', 'hash');
-
 
 -- test when a table is distributed but no shards created yet
 SELECT count(*) from articles_hash;
@@ -94,9 +100,6 @@ SET client_min_messages TO 'DEBUG2';
 -- insert a single row for the test
 INSERT INTO articles_single_shard_hash VALUES (50, 10, 'anjanette', 19519);
 
--- first, test zero-shard SELECT, which should return an empty row
-SELECT COUNT(*) FROM articles_hash WHERE author_id = 1 AND author_id = 2;
-
 -- single-shard tests
 
 -- test simple select for a single row
@@ -141,34 +144,158 @@ SELECT author_id, sum(word_count) AS corpus_size FROM articles_hash
 	HAVING sum(word_count) > 1000
 	ORDER BY sum(word_count) DESC;
 
-
--- UNION/INTERSECT queries are unsupported
--- this is rejected by router planner and handled by multi_logical_planner
-SELECT * FROM articles_hash WHERE author_id = 10 UNION
-SELECT * FROM articles_hash WHERE author_id = 1; 
-
 -- query is a single shard query but can't do shard pruning,
 -- not router-plannable due to <= and IN
 SELECT * FROM articles_hash WHERE author_id <= 1; 
 SELECT * FROM articles_hash WHERE author_id IN (1, 3); 
 
--- queries using CTEs are unsupported
+-- queries with CTEs are supported
+WITH first_author AS ( SELECT id FROM articles_hash WHERE author_id = 1)
+SELECT * FROM first_author;
+
+-- queries with CTEs are supported even if CTE is not referenced inside query
 WITH first_author AS ( SELECT id FROM articles_hash WHERE author_id = 1)
 SELECT title FROM articles_hash WHERE author_id = 1;
 
--- queries which involve functions in FROM clause are unsupported.
+-- two CTE joins are supported if they go to the same worker
+WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
+id_title AS (SELECT id, title from articles_hash WHERE author_id = 1)
+SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
+
+WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
+id_title AS (SELECT id, title from articles_hash WHERE author_id = 3)
+SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
+
+-- CTE joins are not supported if table shards are at different workers
+WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
+id_title AS (SELECT id, title from articles_hash WHERE author_id = 2)
+SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
+
+-- recursive CTEs are supported when filtered on partition column
+CREATE TABLE company_employees (company_id int, employee_id int, manager_id int); 
+SELECT master_create_distributed_table('company_employees', 'company_id', 'hash');
+SELECT master_create_worker_shards('company_employees', 4, 1);
+
+INSERT INTO company_employees values(1, 1, 0);
+INSERT INTO company_employees values(1, 2, 1);
+INSERT INTO company_employees values(1, 3, 1);
+INSERT INTO company_employees values(1, 4, 2);
+INSERT INTO company_employees values(1, 5, 4);
+
+INSERT INTO company_employees values(3, 1, 0);
+INSERT INTO company_employees values(3, 15, 1);
+INSERT INTO company_employees values(3, 3, 1);
+
+-- find employees at top 2 level within company hierarchy
+WITH RECURSIVE hierarchy as (
+	SELECT *, 1 AS level
+		FROM company_employees
+		WHERE company_id = 1 and manager_id = 0 
+	UNION
+	SELECT ce.*, (h.level+1)
+		FROM hierarchy h JOIN company_employees ce
+			ON (h.employee_id = ce.manager_id AND
+				h.company_id = ce.company_id AND
+				ce.company_id = 1))
+SELECT * FROM hierarchy WHERE LEVEL <= 2;
+
+-- query becomes not router plannble and gets rejected
+-- if filter on company is dropped
+WITH RECURSIVE hierarchy as (
+	SELECT *, 1 AS level
+		FROM company_employees
+		WHERE company_id = 1 and manager_id = 0 
+	UNION
+	SELECT ce.*, (h.level+1)
+		FROM hierarchy h JOIN company_employees ce
+			ON (h.employee_id = ce.manager_id AND
+				h.company_id = ce.company_id))
+SELECT * FROM hierarchy WHERE LEVEL <= 2;
+
+-- logically wrong query, query involves different shards
+-- from the same table
+WITH RECURSIVE hierarchy as (
+	SELECT *, 1 AS level
+		FROM company_employees
+		WHERE company_id = 3 and manager_id = 0 
+	UNION
+	SELECT ce.*, (h.level+1)
+		FROM hierarchy h JOIN company_employees ce
+			ON (h.employee_id = ce.manager_id AND
+				h.company_id = ce.company_id AND
+				ce.company_id = 2))
+SELECT * FROM hierarchy WHERE LEVEL <= 2;
+
+-- CTE with queries other than SELECT is not supported
+WITH new_article AS (
+    INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572) RETURNING *
+)
+SELECT * FROM new_article;
+
+-- Modifying statement in nested CTE case is covered by PostgreSQL itself
+WITH new_article AS (
+    WITH nested_cte AS (
+        INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572) RETURNING *
+    )
+    SELECT * FROM nested_cte
+)
+SELECT * FROM new_article;
+
+-- Modifying statement in a CTE in subquwey is also covered by PostgreSQL
+SELECT * FROM (
+    WITH new_article AS (
+        INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572) RETURNING *
+    )
+    SELECT * FROM new_article
+) AS subquery_cte;
+
+-- grouping sets are supported on single shard
+SELECT
+	id, substring(title, 2, 1) AS subtitle, count(*)
+	FROM articles_hash
+	WHERE author_id = 1 or author_id = 3
+	GROUP BY GROUPING SETS ((id),(subtitle));
+
+-- grouping sets are not supported on multiple shards
+SELECT
+	id, substring(title, 2, 1) AS subtitle, count(*)
+	FROM articles_hash
+	WHERE author_id = 1 or author_id = 2
+	GROUP BY GROUPING SETS ((id),(subtitle));
+
+-- queries which involve functions in FROM clause are supported if it goes to a single worker.
 SELECT * FROM articles_hash, position('om' in 'Thomas') WHERE author_id = 1;
+
+SELECT * FROM articles_hash, position('om' in 'Thomas') WHERE author_id = 1 or author_id = 3;
+
+-- they are not supported if multiple workers are involved
+SELECT * FROM articles_hash, position('om' in 'Thomas') WHERE author_id = 1 or author_id = 2;
 
 -- subqueries are not supported in WHERE clause in Citus
 SELECT * FROM articles_hash WHERE author_id IN (SELECT id FROM authors_hash WHERE name LIKE '%a');
+
+SELECT * FROM articles_hash WHERE author_id IN (SELECT author_id FROM articles_hash WHERE author_id = 1 or author_id = 3);
+
+SELECT * FROM articles_hash WHERE author_id = (SELECT 1);
+
+-- unless the query can be transformed into a join
+SELECT * FROM articles_hash
+WHERE author_id IN (SELECT author_id FROM articles_hash WHERE author_id = 2)
+ORDER BY articles_hash.id;
 
 -- subqueries are supported in FROM clause but they are not router plannable
 SELECT articles_hash.id,test.word_count
 FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test WHERE test.id = articles_hash.id
 ORDER BY articles_hash.id;
 
+
+SELECT articles_hash.id,test.word_count
+FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test 
+WHERE test.id = articles_hash.id and articles_hash.author_id = 1
+ORDER BY articles_hash.id;
+
 -- subqueries are not supported in SELECT clause
-SELECT a.title AS name, (SELECT a2.id FROM authors_hash a2 WHERE a.id = a2.id  LIMIT 1)
+SELECT a.title AS name, (SELECT a2.id FROM articles_single_shard_hash a2 WHERE a.id = a2.id  LIMIT 1)
 						 AS special_price FROM articles_hash a;
 
 -- simple lookup query
@@ -176,8 +303,7 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1;
 
--- below query hits a single shard, but it is not router plannable
--- still router executable
+-- below query hits a single shard, router plannable
 SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 OR author_id = 17;
@@ -194,17 +320,25 @@ SELECT id as article_id, word_count * id as random_value
 	WHERE author_id = 1;
 
 -- we can push down co-located joins to a single worker
--- this is not router plannable but router executable
--- handled by real-time executor
 SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles_hash a, articles_hash b
 	WHERE a.author_id = 10 and a.author_id = b.author_id
 	LIMIT 3;
 
--- following join is neither router plannable, nor router executable
+-- following join is router plannable since the same worker 
+-- has both shards
 SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles_hash a, articles_single_shard_hash b
 	WHERE a.author_id = 10 and a.author_id = b.author_id
+	LIMIT 3;
+	
+-- following join is not router plannable since there are no
+-- workers containing both shards, added a CTE to make this fail
+-- at logical planner
+WITH single_shard as (SELECT * FROM articles_single_shard_hash)
+SELECT a.author_id as first_author, b.word_count as second_word_count
+	FROM articles_hash a, single_shard b
+	WHERE a.author_id = 2 and a.author_id = b.author_id
 	LIMIT 3;
 
 -- single shard select with limit is router plannable
@@ -232,12 +366,14 @@ SELECT *
 SELECT id
 	FROM articles_hash
 	WHERE author_id = 1
-	GROUP BY id;
+	GROUP BY id
+	ORDER BY id;
 
 -- single shard select with distinct is router plannable
-SELECT distinct id
+SELECT DISTINCT id
 	FROM articles_hash
-	WHERE author_id = 1;
+	WHERE author_id = 1
+	ORDER BY id;
 
 -- single shard aggregate is router plannable
 SELECT avg(word_count)
@@ -257,7 +393,45 @@ SELECT max(word_count)
 	WHERE author_id = 1
 	GROUP BY author_id;
 
+	
+-- router plannable union queries are supported
+(SELECT * FROM articles_hash WHERE author_id = 1)
+UNION
+(SELECT * FROM articles_hash WHERE author_id = 3);
+
+SELECT * FROM (
+	(SELECT * FROM articles_hash WHERE author_id = 1)
+	UNION
+	(SELECT * FROM articles_hash WHERE author_id = 3)) uu;
+
+(SELECT LEFT(title, 1) FROM articles_hash WHERE author_id = 1)
+UNION
+(SELECT LEFT(title, 1) FROM articles_hash WHERE author_id = 3);
+
+(SELECT LEFT(title, 1) FROM articles_hash WHERE author_id = 1)
+INTERSECT
+(SELECT LEFT(title, 1) FROM articles_hash WHERE author_id = 3);
+
+(SELECT LEFT(title, 2) FROM articles_hash WHERE author_id = 1)
+EXCEPT
+(SELECT LEFT(title, 2) FROM articles_hash WHERE author_id = 3);
+
+-- union queries are not supported if not router plannable
+-- there is an inconsistency on shard pruning between
+-- ubuntu/mac disabling log messages for this queries only
+
 SET client_min_messages to 'NOTICE';
+
+(SELECT * FROM articles_hash WHERE author_id = 1)
+UNION
+(SELECT * FROM articles_hash WHERE author_id = 2);
+
+
+SELECT * FROM (
+	(SELECT * FROM articles_hash WHERE author_id = 1)
+	UNION
+	(SELECT * FROM articles_hash WHERE author_id = 2)) uu;
+
 -- error out for queries with repartition jobs
 SELECT *
 	FROM articles_hash a, articles_hash b
@@ -275,7 +449,7 @@ SET citus.task_executor_type TO 'real-time';
 SET client_min_messages to 'DEBUG2';
 
 -- this is definitely single shard
--- but not router plannable
+-- and router plannable
 SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and author_id >= 1;
@@ -387,11 +561,221 @@ SELECT id, MIN(id) over (order by word_count)
 	FROM articles_hash
 	WHERE author_id = 1 or author_id = 2;
 
-	
--- but they are not supported for not router plannable queries
 SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count 
 	FROM articles_hash
-	WHERE author_id = 5 or author_id = 1;
+	WHERE author_id = 5 or author_id = 2;
+
+-- where false queries are router plannable
+SELECT * 
+	FROM articles_hash
+	WHERE false;
+
+SELECT * 
+	FROM articles_hash
+	WHERE author_id = 1 and false;
+
+SELECT * 
+	FROM articles_hash
+	WHERE author_id = 1 and 1=0;
+
+SELECT a.author_id as first_author, b.word_count as second_word_count
+	FROM articles_hash a, articles_single_shard_hash b
+	WHERE a.author_id = 10 and a.author_id = b.author_id and false;
+
+SELECT * 
+	FROM articles_hash
+	WHERE null;
+
+-- where false with immutable function returning false
+SELECT * 
+	FROM articles_hash a
+	WHERE a.author_id = 10 and int4eq(1, 2);
+
+SELECT * 
+	FROM articles_hash a
+	WHERE int4eq(1, 2);
+
+SELECT a.author_id as first_author, b.word_count as second_word_count
+	FROM articles_hash a, articles_single_shard_hash b
+	WHERE a.author_id = 10 and a.author_id = b.author_id and int4eq(1, 1);
+
+SELECT a.author_id as first_author, b.word_count as second_word_count
+	FROM articles_hash a, articles_single_shard_hash b
+	WHERE a.author_id = 10 and a.author_id = b.author_id and int4eq(1, 2);
+
+-- partition_column is null clause does not prune out any shards,
+-- all shards remain after shard pruning, not router plannable
+SELECT * 
+	FROM articles_hash a
+	WHERE a.author_id is null;
+
+-- partition_column equals to null clause prunes out all shards
+-- no shards after shard pruning, router plannable
+SELECT * 
+	FROM articles_hash a
+	WHERE a.author_id = null;
+
+-- stable function returning bool
+SELECT * 
+	FROM articles_hash a
+	WHERE date_ne_timestamp('1954-04-11', '1954-04-11'::timestamp);
+
+SELECT a.author_id as first_author, b.word_count as second_word_count
+	FROM articles_hash a, articles_single_shard_hash b
+	WHERE a.author_id = 10 and a.author_id = b.author_id and
+		date_ne_timestamp('1954-04-11', '1954-04-11'::timestamp);
+-- union/difference /intersection with where false
+-- this query was not originally router plannable, addition of 1=0
+-- makes it router plannable
+(SELECT * FROM articles_hash WHERE author_id = 1)
+UNION
+(SELECT * FROM articles_hash WHERE author_id = 2 and 1=0);
+
+(SELECT * FROM articles_hash WHERE author_id = 1)
+EXCEPT
+(SELECT * FROM articles_hash WHERE author_id = 2 and 1=0);
+
+(SELECT * FROM articles_hash WHERE author_id = 1)
+INTERSECT
+(SELECT * FROM articles_hash WHERE author_id = 2 and 1=0);
+
+-- CTEs with where false
+WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
+id_title AS (SELECT id, title from articles_hash WHERE author_id = 1 and 1=0)
+SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
+
+WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
+id_title AS (SELECT id, title from articles_hash WHERE author_id = 1)
+SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id and 1=0;
+
+WITH RECURSIVE hierarchy as (
+	SELECT *, 1 AS level
+		FROM company_employees
+		WHERE company_id = 1 and manager_id = 0 
+	UNION
+	SELECT ce.*, (h.level+1)
+		FROM hierarchy h JOIN company_employees ce
+			ON (h.employee_id = ce.manager_id AND
+				h.company_id = ce.company_id AND
+				ce.company_id = 1))
+SELECT * FROM hierarchy WHERE LEVEL <= 2 and 1=0;
+
+WITH RECURSIVE hierarchy as (
+	SELECT *, 1 AS level
+		FROM company_employees
+		WHERE company_id = 1 and manager_id = 0 
+	UNION
+	SELECT ce.*, (h.level+1)
+		FROM hierarchy h JOIN company_employees ce
+			ON (h.employee_id = ce.manager_id AND
+				h.company_id = ce.company_id AND
+				ce.company_id = 1 AND 1=0))
+SELECT * FROM hierarchy WHERE LEVEL <= 2;
+
+WITH RECURSIVE hierarchy as (
+	SELECT *, 1 AS level
+		FROM company_employees
+		WHERE company_id = 1 and manager_id = 0 AND 1=0
+	UNION
+	SELECT ce.*, (h.level+1)
+		FROM hierarchy h JOIN company_employees ce
+			ON (h.employee_id = ce.manager_id AND
+				h.company_id = ce.company_id AND
+				ce.company_id = 1))
+SELECT * FROM hierarchy WHERE LEVEL <= 2;
+
+
+-- window functions with where false
+SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)  
+	FROM articles_hash 
+	WHERE author_id = 1 and 1=0;
+
+-- function calls in WHERE clause with non-relational arguments
+SELECT author_id FROM articles_hash
+	WHERE 
+		substring('hello world', 1, 5) = 'hello'
+	ORDER BY
+		author_id
+	LIMIT 1;
+
+-- when expression evaluates to false
+SELECT author_id FROM articles_hash
+	WHERE 
+		substring('hello world', 1, 4) = 'hello'
+	ORDER BY
+		author_id
+	LIMIT 1;
+
+-- following is a bug, function should have been
+-- evaluated at master before going to worker
+
+-- need to use a range distributed table here
+SELECT master_create_distributed_table('articles_range', 'author_id', 'range');
+SET citus.shard_replication_factor TO 1;
+SELECT master_create_empty_shard('articles_range') AS shard_id \gset
+UPDATE pg_dist_shard SET shardmaxvalue = 100, shardminvalue=1 WHERE shardid = :shard_id;
+
+SELECT author_id FROM articles_range
+	WHERE 
+		substring('articles_range'::regclass::text, 1, 5) = 'hello'
+	ORDER BY
+		author_id
+	LIMIT 1;
+
+-- same query with where false but evaluation left to worker
+SELECT author_id FROM articles_range
+	WHERE 
+		substring('articles_range'::regclass::text, 1, 4) = 'hello'
+	ORDER BY
+		author_id
+	LIMIT 1;
+
+-- same query on router planner with where false but evaluation left to worker
+SELECT author_id FROM articles_single_shard_hash
+	WHERE 
+		substring('articles_single_shard_hash'::regclass::text, 1, 4) = 'hello'
+	ORDER BY
+		author_id
+	LIMIT 1;
+
+SELECT author_id FROM articles_hash
+	WHERE 
+		author_id = 1
+		AND substring('articles_hash'::regclass::text, 1, 5) = 'hello'
+	ORDER BY
+		author_id
+	LIMIT 1;
+
+-- create a dummy function to be used in filtering
+CREATE OR REPLACE FUNCTION someDummyFunction(regclass)
+    RETURNS text AS
+$$
+BEGIN
+    RETURN md5($1::text);
+END;
+$$ LANGUAGE 'plpgsql' IMMUTABLE;
+
+-- not router plannable, returns all rows 
+SELECT * FROM articles_hash
+	WHERE
+		someDummyFunction('articles_hash') = md5('articles_hash')
+	ORDER BY
+		author_id, id
+	LIMIT 5;
+
+-- router plannable, errors
+SELECT * FROM articles_hash
+	WHERE
+		someDummyFunction('articles_hash') = md5('articles_hash') AND author_id = 1
+	ORDER BY
+		author_id, id
+	LIMIT 5;
+
+-- temporarily turn off debug messages before dropping the function
+SET client_min_messages TO 'NOTICE';
+DROP FUNCTION someDummyFunction(regclass);
+
+SET client_min_messages TO 'DEBUG2';
 
 -- complex query hitting a single shard 	
 SELECT
@@ -439,7 +823,8 @@ DECLARE test_cursor CURSOR FOR
 		WHERE author_id = 1
 		ORDER BY id;
 FETCH test_cursor;
-FETCH test_cursor;
+FETCH ALL test_cursor;
+FETCH test_cursor; -- fetch one row after the last
 END;
 
 -- queries inside copy can be router plannable
@@ -461,7 +846,7 @@ SELECT count(*), count(*) FILTER (WHERE id < 3)
 	FROM articles_hash
 	WHERE author_id = 1;
 
--- non-router plannable queries do not support filters
+-- non-router plannable queries also support filters
 SELECT count(*), count(*) FILTER (WHERE id < 3)
 	FROM articles_hash
 	WHERE author_id = 1 or author_id = 2;
@@ -496,7 +881,7 @@ $$ LANGUAGE plpgsql;
 
 SELECT author_articles_max_id();
 
--- plpgsql function that return query results are not router plannable
+-- check that function returning setof query are router plannable
 CREATE OR REPLACE FUNCTION author_articles_id_word_count() RETURNS TABLE(id bigint, word_count int) AS $$
 DECLARE
 BEGIN
@@ -510,8 +895,16 @@ $$ LANGUAGE plpgsql;
 
 SELECT * FROM author_articles_id_word_count();
 
--- router planner/executor is disabled for task-tracker executor
--- following query is router plannable, but router planner is disabled
+-- materialized views can be created for router plannable queries
+CREATE MATERIALIZED VIEW mv_articles_hash AS
+	SELECT * FROM articles_hash WHERE author_id = 1;
+
+SELECT * FROM mv_articles_hash;
+
+CREATE MATERIALIZED VIEW mv_articles_hash_error AS
+	SELECT * FROM articles_hash WHERE author_id in (1,2);
+	
+-- router planner/executor is now enabled for task-tracker executor
 SET citus.task_executor_type to 'task-tracker';
 SELECT id
 	FROM articles_hash
@@ -527,9 +920,51 @@ SELECT id
 
 SET client_min_messages to 'NOTICE';
 
+-- test that a connection failure marks placements invalid
+SET citus.shard_replication_factor TO 2;
+CREATE TABLE failure_test (a int, b int);
+SELECT master_create_distributed_table('failure_test', 'a', 'hash');
+SELECT master_create_worker_shards('failure_test', 2);
+
+CREATE USER router_user;
+GRANT INSERT ON ALL TABLES IN SCHEMA public TO router_user;
+\c - - - :worker_1_port
+CREATE USER router_user;
+GRANT INSERT ON ALL TABLES IN SCHEMA public TO router_user;
+\c - router_user - :master_port
+-- first test that it is marked invalid inside a transaction block
+-- we will fail to connect to worker 2, since the user does not exist
+BEGIN;
+INSERT INTO failure_test VALUES (1, 1);
+SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement
+	WHERE shardid IN (
+		SELECT shardid FROM pg_dist_shard
+		WHERE logicalrelid = 'failure_test'::regclass
+	)
+	ORDER BY placementid;
+ROLLBACK;
+INSERT INTO failure_test VALUES (2, 1);
+SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement
+	WHERE shardid IN (
+		SELECT shardid FROM pg_dist_shard
+		WHERE logicalrelid = 'failure_test'::regclass
+	)
+	ORDER BY placementid;
+\c - postgres - :worker_1_port
+DROP OWNED BY router_user;
+DROP USER router_user;
+\c - - - :master_port
+DROP OWNED BY router_user;
+DROP USER router_user;
+DROP TABLE failure_test;
+
 DROP FUNCTION author_articles_max_id();
 DROP FUNCTION author_articles_id_word_count();
+
+DROP MATERIALIZED VIEW mv_articles_hash;
 
 DROP TABLE articles_hash;
 DROP TABLE articles_single_shard_hash;
 DROP TABLE authors_hash;
+DROP TABLE company_employees;
+DROP TABLE articles_range;

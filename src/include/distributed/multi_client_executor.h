@@ -15,10 +15,8 @@
 #define MULTI_CLIENT_EXECUTOR_H
 
 #define INVALID_CONNECTION_ID -1  /* identifies an invalid connection */
-#define CLIENT_CONNECT_TIMEOUT 5  /* connection timeout in seconds */
 #define MAX_CONNECTION_COUNT 2048 /* simultaneous client connection count */
 #define STRING_BUFFER_SIZE 1024   /* buffer size for character arrays */
-#define CONN_INFO_TEMPLATE "host=%s port=%u dbname=%s user=%s connect_timeout=%u"
 
 
 /* Enumeration to track one client connection's status */
@@ -104,6 +102,8 @@ extern int32 MultiClientConnectStart(const char *nodeName, uint32 nodePort,
 extern ConnectStatus MultiClientConnectPoll(int32 connectionId);
 extern void MultiClientDisconnect(int32 connectionId);
 extern bool MultiClientConnectionUp(int32 connectionId);
+extern bool MultiClientExecute(int32 connectionId, const char *query, void **queryResult,
+							   int *rowCount, int *columnCount);
 extern bool MultiClientSendQuery(int32 connectionId, const char *query);
 extern bool MultiClientCancel(int32 connectionId);
 extern ResultStatus MultiClientResultStatus(int32 connectionId);
@@ -114,6 +114,7 @@ extern bool MultiClientQueryResult(int32 connectionId, void **queryResult,
 extern BatchQueryStatus MultiClientBatchResult(int32 connectionId, void **queryResult,
 											   int *rowCount, int *columnCount);
 extern char * MultiClientGetValue(void *queryResult, int rowIndex, int columnIndex);
+extern bool MultiClientValueIsNull(void *queryResult, int rowIndex, int columnIndex);
 extern void MultiClientClearResult(void *queryResult);
 extern WaitInfo * MultiClientCreateWaitInfo(int maxConnections);
 

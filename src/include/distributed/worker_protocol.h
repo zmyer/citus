@@ -26,6 +26,7 @@
 
 /* Directory, file, table name, and UDF related defines for distributed tasks */
 #define PG_JOB_CACHE_DIR "pgsql_job_cache"
+#define MASTER_JOB_DIRECTORY_PREFIX "master_job_"
 #define JOB_DIRECTORY_PREFIX "job_"
 #define JOB_SCHEMA_PREFIX "pg_merge_job_"
 #define TASK_FILE_PREFIX "task_"
@@ -50,7 +51,7 @@
 #define FOREIGN_CACHED_FILE_PATH "pg_foreign_file/cached/%s"
 #define GET_TABLE_OWNER \
 	"SELECT rolname FROM pg_class JOIN pg_roles ON (pg_roles.oid = pg_class.relowner) " \
-	"WHERE pg_class.oid = %s::regclass"
+	"WHERE pg_class.oid = '%s'::regclass"
 #define GET_TABLE_DDL_EVENTS "SELECT master_get_table_ddl_events('%s')"
 #define SET_FOREIGN_TABLE_FILENAME "ALTER FOREIGN TABLE %s OPTIONS (SET filename '%s')"
 #define FOREIGN_FILE_PATH_COMMAND "SELECT worker_foreign_file_path('%s')"
@@ -107,6 +108,7 @@ extern StringInfo JobSchemaName(uint64 jobId);
 extern StringInfo TaskTableName(uint32 taskId);
 extern bool JobSchemaExists(StringInfo schemaName);
 extern StringInfo JobDirectoryName(uint64 jobId);
+extern StringInfo MasterJobDirectoryName(uint64 jobId);
 extern StringInfo TaskDirectoryName(uint64 jobId, uint32 taskId);
 extern StringInfo PartitionFilename(StringInfo directoryName, uint32 partitionId);
 extern bool CacheDirectoryElement(const char *filename);
@@ -120,11 +122,13 @@ extern Datum * DeconstructArrayObject(ArrayType *arrayObject);
 extern int32 ArrayObjectCount(ArrayType *arrayObject);
 extern FmgrInfo * GetFunctionInfo(Oid typeId, Oid accessMethodId, int16 procedureId);
 extern List * TableDDLCommandList(const char *nodeName, uint32 nodePort,
-								  StringInfo tableName);
+								  const char *tableName);
 
 /* Function declarations shared with the master planner */
 extern StringInfo TaskFilename(StringInfo directoryName, uint32 taskId);
 extern List * ExecuteRemoteQuery(const char *nodeName, uint32 nodePort, char *runAsUser,
+								 StringInfo queryString);
+extern bool ExecuteRemoteCommand(const char *nodeName, uint32 nodePort,
 								 StringInfo queryString);
 extern List * ColumnDefinitionList(List *columnNameList, List *columnTypeList);
 extern CreateStmt * CreateStatement(RangeVar *relation, List *columnDefinitionList);
@@ -150,6 +154,9 @@ extern Datum worker_fetch_regular_table(PG_FUNCTION_ARGS);
 extern Datum worker_append_table_to_shard(PG_FUNCTION_ARGS);
 extern Datum worker_foreign_file_path(PG_FUNCTION_ARGS);
 extern Datum worker_find_block_local_path(PG_FUNCTION_ARGS);
+
+/* Function declaration for calculating hashed value */
+extern Datum worker_hash(PG_FUNCTION_ARGS);
 
 
 #endif   /* WORKER_PROTOCOL_H */

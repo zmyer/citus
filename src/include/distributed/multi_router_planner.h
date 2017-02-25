@@ -14,24 +14,38 @@
 
 #include "c.h"
 
+#include "distributed/errormessage.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
-#include "distributed/multi_server_executor.h"
+#include "distributed/multi_planner.h"
 #include "nodes/parsenodes.h"
 
 
-/* values used by jobs and tasks which do not require identifiers */
-#define INVALID_JOB_ID 0
-#define INVALID_TASK_ID 0
-
-#if (PG_VERSION_NUM >= 90500)
+/* reserved parameted id, we chose a negative number since it is not assigned by postgres */
+#define UNINSTANTIATED_PARAMETER_ID INT_MIN
 
 /* reserved alias name for UPSERTs */
-#define UPSERT_ALIAS "citus_table_alias"
-#endif
+#define CITUS_TABLE_ALIAS "citus_table_alias"
 
-extern MultiPlan * MultiRouterPlanCreate(Query *query,
-										 MultiExecutorType taskExecutorType);
-extern void ErrorIfModifyQueryNotSupported(Query *queryTree);
+extern bool EnableRouterExecution;
+
+extern MultiPlan * CreateRouterPlan(Query *originalQuery, Query *query,
+									RelationRestrictionContext *restrictionContext);
+extern MultiPlan * CreateModifyPlan(Query *originalQuery, Query *query,
+									RelationRestrictionContext *restrictionContext);
+
+extern void AddUninstantiatedPartitionRestriction(Query *originalQuery);
+extern DeferredErrorMessage * ModifyQuerySupported(Query *queryTree);
+extern Query * ReorderInsertSelectTargetLists(Query *originalQuery,
+											  RangeTblEntry *insertRte,
+											  RangeTblEntry *subqueryRte);
+extern bool InsertSelectQuery(Query *query);
+extern Oid ExtractFirstDistributedTableId(Query *query);
+extern RangeTblEntry * ExtractSelectRangeTableEntry(Query *query);
+extern RangeTblEntry * ExtractInsertRangeTableEntry(Query *query);
+extern void AddShardIntervalRestrictionToSelect(Query *subqery,
+												ShardInterval *shardInterval);
+extern ShardInterval * FastShardPruning(Oid distributedTableId, Datum partitionValue);
+
 
 #endif /* MULTI_ROUTER_PLANNER_H */

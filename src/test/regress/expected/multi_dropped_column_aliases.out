@@ -16,6 +16,8 @@ SELECT * FROM customer LIMIT 2;
 (2 rows)
 
 ALTER TABLE customer ADD COLUMN new_column1 INTEGER;
+NOTICE:  using one-phase commit for distributed DDL commands
+HINT:  You can enable two-phase commit for extra safety with: SET citus.multi_shard_commit_protocol TO '2pc'
 ALTER TABLE customer ADD COLUMN new_column2 INTEGER;
 SELECT count(*) FROM customer;
  count 
@@ -60,5 +62,5 @@ FROM   (customer LEFT OUTER JOIN orders ON (c_custkey = o_custkey)) AS
        test(c_custkey, c_nationkey)
        INNER JOIN lineitem ON (test.c_custkey = l_orderkey)
 LIMIT 10;
-ERROR:  cannot perform distributed planning on this query
-DETAIL:  Shards of relations in outer join queries must have 1-to-1 shard partitioning
+ERROR:  cannot run outer join query if join is not on the partition column
+DETAIL:  Outer joins requiring repartitioning are not supported.
